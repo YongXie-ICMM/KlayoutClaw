@@ -225,7 +225,7 @@ pytest tests/test_flakedetect.py tests/test_gdsalign.py -v
 
 ## Community
 
-Built for the device physics community. Interested in contributing? See [DEVELOPMENT.md](DEVELOPMENT.md) or contact **caidish1234@gmail.com**.
+Built for the device physics community. Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) or contact **caidish1234@gmail.com**.
 
 ## License
 
