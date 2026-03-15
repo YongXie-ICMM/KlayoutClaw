@@ -1,102 +1,29 @@
-#!/usr/bin/env python
-"""
-Subprocess routing engine for KlayoutClaw auto_route MCP tool.
+# route_worker.py Routing Quality Enhancement — Implementation Plan
 
-Accepts a config JSON file path as CLI arg. Loads a GDS file using klayout.db,
-extracts pin locations, rasterizes obstacles into a 2D numpy cost grid, uses
-scipy Hungarian matching for optimal pin pairing, and scikit-image MCP_Geometric
-for Dijkstra-based minimum-cost pathfinding.
+> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Usage:
-    python route_worker.py config.json
-"""
+**Goal:** Port graduated damping, pin-aware cost fields, sorted routing order, and kdb-native rasterization from Klayout-Router into `tools/route_worker.py`.
 
-import json
-import sys
-import math
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-from skimage.graph import MCP_Geometric
-import klayout.db as kdb
+**Architecture:** Replace binary obstacle model with negative-sentinel cost convention (-1/-2/-3 for obstacles/pins/paths), graduated damping via iterated `kdb.Region.rasterize()`, per-pair pin recovery cycle, and distance-sorted routing order. All changes confined to a single file with backward-compatible config.
 
+**Tech Stack:** Python, klayout.db, numpy, scipy.optimize, scikit-image (MCP_Geometric)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+**Spec:** `docs/superpowers/specs/2026-03-14-route-worker-quality-design.md`
 
-def parse_layer(spec: str) -> tuple[int, int]:
-    """Parse a layer spec like '102/0' or '5' into (layer, datatype)."""
-    parts = spec.strip().split("/")
-    layer = int(parts[0])
-    datatype = int(parts[1]) if len(parts) > 1 else 0
-    return (layer, datatype)
+---
 
+## Chunk 1: Foundation — Rasterization, Cost Convention, Helpers
 
-def compress_path(points: list[list[int]]) -> list[list[int]]:
-    """Remove collinear waypoints from a path.
+### Task 1: Replace matplotlib rasterization with kdb.Region.rasterize()
 
-    Keeps the first and last point, and any point where the direction changes
-    (cross product of consecutive direction vectors is non-zero).
-    """
-    if len(points) <= 2:
-        return list(points)
+**Files:**
+- Modify: `tools/route_worker.py:100-138` (replace `rasterize_region`)
 
-    result = [points[0]]
-    for i in range(1, len(points) - 1):
-        # Direction vectors
-        dx1 = points[i][0] - points[i - 1][0]
-        dy1 = points[i][1] - points[i - 1][1]
-        dx2 = points[i + 1][0] - points[i][0]
-        dy2 = points[i + 1][1] - points[i][1]
-        # Cross product
-        cross = dx1 * dy2 - dy1 * dx2
-        if cross != 0:
-            result.append(points[i])
-    result.append(points[-1])
-    return result
+- [ ] **Step 1: Write the new `rasterize_region_kdb()` function**
 
+Replace the entire `rasterize_region()` function (lines 100-138) with:
 
-# ---------------------------------------------------------------------------
-# Pin extraction
-# ---------------------------------------------------------------------------
-
-def extract_pin_centers(cell: kdb.Cell, layout: kdb.Layout, layer_num: int,
-                        datatype: int) -> list[tuple[int, int]]:
-    """Extract center points (in dbu) of all shapes on a given layer."""
-    layer_idx = layout.find_layer(layer_num, datatype)
-    if layer_idx is None:
-        return []
-
-    centers = []
-    for shape in cell.shapes(layer_idx).each():
-        bbox = shape.bbox()
-        cx = (bbox.left + bbox.right) // 2
-        cy = (bbox.bottom + bbox.top) // 2
-        centers.append((cx, cy))
-    return centers
-
-
-# ---------------------------------------------------------------------------
-# Obstacle rasterization
-# ---------------------------------------------------------------------------
-
-def build_obstacle_region(cell: kdb.Cell, layout: kdb.Layout,
-                          obstacle_layers: list[str],
-                          safe_distance_dbu: int) -> kdb.Region:
-    """Merge all obstacle layer shapes into one Region, expanded by safe distance."""
-    region = kdb.Region()
-    for spec in obstacle_layers:
-        ln, dt = parse_layer(spec)
-        li = layout.find_layer(ln, dt)
-        if li is None:
-            continue
-        region += kdb.Region(cell.shapes(li))
-    if safe_distance_dbu > 0:
-        region = region.sized(safe_distance_dbu)
-    region.merge()
-    return region
-
-
+```python
 def rasterize_region_kdb(region: kdb.Region, bbox: kdb.Box,
                          resolution_dbu: int) -> np.ndarray:
     """Rasterize a kdb.Region into a 2D boolean numpy array using KLayout's native rasterizer.
@@ -109,28 +36,42 @@ def rasterize_region_kdb(region: kdb.Region, bbox: kdb.Box,
     step = kdb.Vector(resolution_dbu, resolution_dbu)
     raster = np.array(region.rasterize(origin, step, ncols, nrows))
     return raster > 0
+```
 
+Also remove the `from matplotlib.path import Path as MplPath` import (line 108 inside the old function).
 
-# ---------------------------------------------------------------------------
-# Coordinate conversion helpers
-# ---------------------------------------------------------------------------
+- [ ] **Step 2: Update the call site in `route()`**
 
-def dbu_to_grid(x_dbu: int, y_dbu: int, bbox: kdb.Box,
-                resolution_dbu: int) -> tuple[int, int]:
-    """Convert dbu coordinates to grid (row, col)."""
-    col = (x_dbu - bbox.left) // resolution_dbu
-    row = (y_dbu - bbox.bottom) // resolution_dbu
-    return (row, col)
+In `route()` (line 358), change:
+```python
+obs_grid = rasterize_region(obs_region, bbox, resolution_dbu)
+```
+to:
+```python
+obs_grid = rasterize_region_kdb(obs_region, bbox, resolution_dbu)
+```
 
+- [ ] **Step 3: Run existing tests to verify no regression**
 
-def grid_to_dbu(row: int, col: int, bbox: kdb.Box,
-                resolution_dbu: int) -> tuple[int, int]:
-    """Convert grid (row, col) back to dbu coordinates (center of grid cell)."""
-    x = bbox.left + col * resolution_dbu + resolution_dbu // 2
-    y = bbox.bottom + row * resolution_dbu + resolution_dbu // 2
-    return (x, y)
+Run: `cd /Users/andrewwayne/testFolder/KlayoutClaw && python tools/route_worker.py --help 2>&1 || echo "no --help, checking import"` and `python -c "import tools.route_worker"` to verify imports work.
 
+- [ ] **Step 4: Commit**
 
+```bash
+git add tools/route_worker.py
+git commit -m "refactor: replace matplotlib rasterization with kdb.Region.rasterize()"
+```
+
+### Task 2: Add conditional_overwrite() and get_damping_raster() helpers
+
+**Files:**
+- Modify: `tools/route_worker.py` (add two new functions after coordinate conversion helpers, ~line 158)
+
+- [ ] **Step 1: Add `conditional_overwrite()` helper**
+
+Add after the `grid_to_dbu()` function (after line 158):
+
+```python
 def conditional_overwrite(cost: np.ndarray, content: np.ndarray,
                           content_mask: np.ndarray,
                           r0: int, c0: int,
@@ -169,8 +110,13 @@ def conditional_overwrite(cost: np.ndarray, content: np.ndarray,
     else:
         mask = mask_slice
     region[mask] = content_slice[mask]
+```
 
+- [ ] **Step 2: Add `get_damping_raster()` helper**
 
+Add immediately after `conditional_overwrite()`:
+
+```python
 def get_damping_raster(region: kdb.Region, bbox: kdb.Box,
                        resolution_dbu: int, safe_distance_dbu: int,
                        hardness: float,
@@ -223,12 +169,31 @@ def get_damping_raster(region: kdb.Region, bbox: kdb.Box,
     r0 = (origin_y - bbox.bottom) // resolution_dbu
     c0 = (origin_x - bbox.left) // resolution_dbu
     return r0, c0, damping
+```
 
+- [ ] **Step 3: Verify import still works**
 
-# ---------------------------------------------------------------------------
-# Cost grid construction
-# ---------------------------------------------------------------------------
+Run: `python -c "from tools.route_worker import conditional_overwrite, get_damping_raster; print('OK')"`
 
+- [ ] **Step 4: Commit**
+
+```bash
+git add tools/route_worker.py
+git commit -m "feat: add conditional_overwrite and get_damping_raster helpers"
+```
+
+### Task 3: Add build_cost_grid_graduated() alongside old functions
+
+**Files:**
+- Modify: `tools/route_worker.py` (add new function after `build_cost_grid`, keep old functions alive)
+
+**Note:** The old `build_cost_grid()` and `add_path_damping()` are NOT removed yet. They remain in the file until Task 5 rewrites the routing loop to use the new functions. This avoids a broken intermediate state.
+
+- [ ] **Step 1: Add `build_cost_grid_graduated()` after the existing `build_cost_grid()`**
+
+Add the new function after the existing `add_path_damping()` (do NOT delete the old functions yet):
+
+```python
 def build_cost_grid_graduated(obstacle_grid: np.ndarray,
                               obs_region: kdb.Region,
                               bbox: kdb.Box,
@@ -259,12 +224,27 @@ def build_cost_grid_graduated(obstacle_grid: np.ndarray,
                 condition_fn=lambda existing, new: existing >= 0)
 
     return cost
+```
 
+- [ ] **Step 2: Commit**
 
-# ---------------------------------------------------------------------------
-# Pathfinding
-# ---------------------------------------------------------------------------
+```bash
+git add tools/route_worker.py
+git commit -m "feat: add build_cost_grid_graduated with stepped damping"
+```
 
+## Chunk 2: Pin-Aware Routing and find_path Updates
+
+### Task 4: Update find_path() for negative sentinel convention
+
+**Files:**
+- Modify: `tools/route_worker.py` (`find_path` function)
+
+- [ ] **Step 1: Update `find_path()` to use negative sentinel checks**
+
+Replace the `find_path()` function with:
+
+```python
 def find_path(cost: np.ndarray, start: tuple[int, int],
               end: tuple[int, int]) -> list[tuple[int, int]] | None:
     """Find minimum-cost path using MCP_Geometric (Dijkstra on grid).
@@ -299,28 +279,25 @@ def find_path(cost: np.ndarray, start: tuple[int, int],
     finally:
         cost[sr, sc] = orig_start
         cost[er, ec] = orig_end
+```
 
+- [ ] **Step 2: Commit**
 
-# ---------------------------------------------------------------------------
-# Main routing logic
-# ---------------------------------------------------------------------------
+```bash
+git add tools/route_worker.py
+git commit -m "fix: update find_path for negative sentinel cost convention"
+```
 
-def route(config: dict) -> dict:
-    """Execute the full routing pipeline. Returns result dict."""
-    errors = []
+### Task 5: Add pin cost field and per-pair recovery to route()
 
-    # Parse config
-    gds_path = config["gds_path"]
-    cell_name = config.get("cell_name", "TOP")
-    dbu = config.get("dbu", 0.001)
-    pin_layer_a = config["pin_layer_a"]
-    pin_layer_b = config["pin_layer_b"]
-    obstacle_layers = config.get("obstacle_layers", [])
-    path_width_um = config.get("path_width_um", 1.0)
-    obs_safe_um = config.get("obs_safe_distance_um", 5.0)
-    path_safe_um = config.get("path_safe_distance_um", 5.0)
-    map_res_um = config.get("map_resolution_um", 1.0)
+**Files:**
+- Modify: `tools/route_worker.py` (the `route()` function)
 
+- [ ] **Step 1: Add new config parameters to `route()`**
+
+In the config parsing section of `route()`, add after the existing parameter parsing (after `map_res_um`):
+
+```python
     # New graduated damping parameters (backward compatible defaults)
     obs_hardness = config.get("obs_hardness", 20.0)
     obs_damping_step = config.get("obs_damping_step", 4)
@@ -332,48 +309,38 @@ def route(config: dict) -> dict:
     path_damping_step = config.get("path_damping_step", 5)
     sort_pairs = config.get("sort_pairs", True)
 
-    # Convert um to dbu
-    resolution_dbu = int(round(map_res_um / dbu))
-    obs_safe_dbu = int(round(obs_safe_um / dbu))
-    path_width_dbu = int(round(path_width_um / dbu))
-
     # Convert new um params to dbu
     pin_safe_a_dbu = int(round(pin_safe_a_um / dbu))
     pin_safe_b_dbu = int(round(pin_safe_b_um / dbu))
     path_safe_dbu = int(round(path_safe_um / dbu))
+```
 
-    # Load GDS
-    layout = kdb.Layout()
-    layout.read(gds_path)
-    layout.dbu = dbu
+- [ ] **Step 2: Remove pin exclusion logic and simplify obstacle region**
 
-    # Find cell
-    cell = None
-    for ci in range(layout.cells()):
-        c = layout.cell(ci)
-        if c.name == cell_name:
-            cell = c
-            break
-    if cell is None:
-        return {"status": "error", "routed_pairs": 0, "total_pins_a": 0,
-                "total_pins_b": 0, "paths": [],
-                "errors": [f"Cell '{cell_name}' not found"]}
+Remove the entire pin exclusion block (lines 320-347 in the current code — from `raw_obs_region = build_obstacle_region(...)` through `obs_region = obs_region - pin_exclusion`).
 
-    # Extract pins
-    la, da = parse_layer(pin_layer_a)
-    lb, db = parse_layer(pin_layer_b)
-    pins_a = extract_pin_centers(cell, layout, la, da)
-    pins_b = extract_pin_centers(cell, layout, lb, db)
+Also change the obstacle region construction to pass `0` for safe_distance — the graduated damping gradient now handles the full avoidance zone. Previously `build_obstacle_region` pre-sized the obstacles by `obs_safe_dbu`, and then `get_damping_raster` added another `obs_safe_dbu` on top (doubling the zone). Now the hard obstacle is just the raw shapes, and the damping provides the soft avoidance:
 
-    if not pins_a or not pins_b:
-        return {"status": "error", "routed_pairs": 0,
-                "total_pins_a": len(pins_a), "total_pins_b": len(pins_b),
-                "paths": [],
-                "errors": ["No pins found on one or both layers"]}
-
+```python
     obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
+```
 
-    # Build pin footprint regions (used for obstacle exclusion, cost marking, and damping)
+No pin subtraction needed — pins will be handled separately in the cost field.
+
+- [ ] **Step 3: Replace cost grid construction**
+
+Replace the call to `build_cost_grid()` with:
+
+```python
+    # Rasterize obstacles
+    obs_grid = rasterize_region_kdb(obs_region, bbox, resolution_dbu)
+
+    # Build graduated cost grid
+    cost = build_cost_grid_graduated(
+        obs_grid, obs_region, bbox, resolution_dbu,
+        obs_hardness, obs_damping_step, obs_safe_dbu)
+
+    # Add pin costs: mark pin cells as -2 with damping halos
     pin_radius = resolution_dbu  # half-width of pin footprint box
     pin_regions_a = kdb.Region()
     for px, py in pins_a:
@@ -386,47 +353,6 @@ def route(config: dict) -> dict:
         pin_regions_b.insert(kdb.Box(
             px - pin_radius, py - pin_radius,
             px + pin_radius, py + pin_radius))
-
-    # Subtract pin clearance from obstacles — pins often sit on device geometry
-    # (e.g. contact tips on mesa layer). Clear a corridor around each pin so
-    # paths can reach them through the obstacle field. The clearance must be
-    # large enough to cut through the full obstacle + damping zone.
-    all_pin_region = pin_regions_a + pin_regions_b
-    raw_obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
-    pin_exclusion = kdb.Region()
-    for pin_list in [pins_a, pins_b]:
-        for px, py in pin_list:
-            # Find the obstacle shape containing this pin
-            pt_box = kdb.Box(px - 1, py - 1, px + 1, py + 1)
-            touching = raw_obs_region.interacting(kdb.Region(pt_box))
-            if touching.is_empty():
-                clear_radius = obs_safe_dbu + resolution_dbu * 2
-            else:
-                obs_bbox = touching.bbox()
-                dx = max(abs(px - obs_bbox.left), abs(px - obs_bbox.right))
-                dy = max(abs(py - obs_bbox.bottom), abs(py - obs_bbox.top))
-                max_dist = int(math.sqrt(dx * dx + dy * dy))
-                clear_radius = max_dist + obs_safe_dbu + resolution_dbu * 2
-            pin_exclusion.insert(kdb.Box(
-                px - clear_radius, py - clear_radius,
-                px + clear_radius, py + clear_radius))
-    obs_region = obs_region - pin_exclusion
-
-    # Compute bounding box (cell bbox with margin)
-    cell_bbox = cell.bbox()
-    margin = max(obs_safe_dbu, resolution_dbu * 10)
-    bbox = kdb.Box(
-        cell_bbox.left - margin, cell_bbox.bottom - margin,
-        cell_bbox.right + margin, cell_bbox.top + margin,
-    )
-
-    # Rasterize obstacles
-    obs_grid = rasterize_region_kdb(obs_region, bbox, resolution_dbu)
-
-    # Build graduated cost grid
-    cost = build_cost_grid_graduated(
-        obs_grid, obs_region, bbox, resolution_dbu,
-        obs_hardness, obs_damping_step, obs_safe_dbu)
 
     # Rasterize pin footprints as -2 (overwrite everything)
     all_pin_region = pin_regions_a + pin_regions_b
@@ -452,20 +378,13 @@ def route(config: dict) -> dict:
             conditional_overwrite(
                 cost, damping, damping > 0, r0, c0,
                 condition_fn=lambda existing, new: (existing > 0) & (existing < new))
+```
 
-    # Hungarian matching: Euclidean distance cost matrix
-    n_a, n_b = len(pins_a), len(pins_b)
-    n = max(n_a, n_b)
-    dist_matrix = np.full((n, n), 1e18)
+- [ ] **Step 4: Add sorted pair ordering**
 
-    for i in range(n_a):
-        for j in range(n_b):
-            dx = pins_a[i][0] - pins_b[j][0]
-            dy = pins_a[i][1] - pins_b[j][1]
-            dist_matrix[i, j] = math.sqrt(dx * dx + dy * dy)
+After the Hungarian matching section, replace the routing loop setup with:
 
-    row_ind, col_ind = linear_sum_assignment(dist_matrix)
-
+```python
     # Build matched pairs and filter dummy assignments
     pairs = []
     for idx in range(len(row_ind)):
@@ -477,7 +396,13 @@ def route(config: dict) -> dict:
     # Sort pairs by ascending distance (short pairs first)
     if sort_pairs:
         pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
+```
 
+- [ ] **Step 5: Rewrite the routing loop with per-pair pin recovery**
+
+Replace the existing routing loop with:
+
+```python
     # Route each matched pair with per-pair pin recovery
     result_paths = []
     for pair_idx, (i, j) in enumerate(pairs):
@@ -487,36 +412,32 @@ def route(config: dict) -> dict:
         start_rc = dbu_to_grid(pa[0], pa[1], bbox, resolution_dbu)
         end_rc = dbu_to_grid(pb[0], pb[1], bbox, resolution_dbu)
 
-        # Step 1: Recover this pair's pin footprint regions to walkable (cost=1)
-        # Rasterize each pin's footprint box and save/restore all affected cells
-        pin_a_box = kdb.Box(pa[0] - pin_radius, pa[1] - pin_radius,
-                            pa[0] + pin_radius, pa[1] + pin_radius)
-        pin_b_box = kdb.Box(pb[0] - pin_radius, pb[1] - pin_radius,
-                            pb[0] + pin_radius, pb[1] + pin_radius)
-        pair_pin_region = kdb.Region(pin_a_box) + kdb.Region(pin_b_box)
-        pair_pin_grid = rasterize_region_kdb(pair_pin_region, bbox, resolution_dbu)
-        # Save original costs and set to walkable
-        saved_pin_costs = cost[pair_pin_grid].copy()
-        cost[pair_pin_grid] = 1.0
+        # Step 1: Recover this pair's pin cells to walkable (cost=1)
+        sr, sc = start_rc
+        er, ec = end_rc
+        sr = max(0, min(sr, cost.shape[0] - 1))
+        sc = max(0, min(sc, cost.shape[1] - 1))
+        er = max(0, min(er, cost.shape[0] - 1))
+        ec = max(0, min(ec, cost.shape[1] - 1))
+        orig_start_cost = cost[sr, sc]
+        orig_end_cost = cost[er, ec]
+        cost[sr, sc] = 1.0
+        cost[er, ec] = 1.0
 
         # Step 2: Find path
         path_rc = find_path(cost, start_rc, end_rc)
         if path_rc is None:
             errors.append(f"No path found for pin pair {i}->{j}")
             # Restore pin cells
-            cost[pair_pin_grid] = saved_pin_costs
+            cost[sr, sc] = orig_start_cost
+            cost[er, ec] = orig_end_cost
             continue
 
-        # Step 3: Convert grid path to dbu coordinates and snap endpoints to pins
+        # Step 3: Convert grid path to dbu coordinates
         path_dbu = []
         for r, c in path_rc:
             x, y = grid_to_dbu(r, c, bbox, resolution_dbu)
             path_dbu.append([x, y])
-        # Snap first/last waypoints to exact pin coordinates so paths
-        # visually connect to pins (grid cell centers are offset by up to
-        # half a resolution step from the actual pin position)
-        path_dbu[0] = list(pa)
-        path_dbu[-1] = list(pb)
         path_dbu = compress_path(path_dbu)
 
         result_paths.append({
@@ -546,45 +467,101 @@ def route(config: dict) -> dict:
                         cost, damping, damping > 0, r0, c0,
                         condition_fn=lambda existing, new: (existing > 0) & (existing < new))
 
-        # Step 5: Restore this pair's pin footprint to blocked (-2)
-        cost[pair_pin_grid] = -2.0
+        # Step 5: Restore this pair's pin cells to blocked (-2)
+        cost[sr, sc] = -2.0
+        cost[er, ec] = -2.0
+```
 
-    return {
-        "status": "success" if not errors else "partial",
-        "routed_pairs": len(result_paths),
-        "total_pins_a": n_a,
-        "total_pins_b": n_b,
-        "paths": result_paths,
-        "errors": errors,
-    }
+- [ ] **Step 6: Commit**
 
+```bash
+git add tools/route_worker.py
+git commit -m "feat: add pin-aware cost field, per-pair recovery, sorted routing"
+```
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+## Chunk 3: Cleanup and Final Integration
 
-def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <config.json>", file=sys.stderr)
-        sys.exit(1)
+### Task 6: Clean up unused imports and dead code
 
-    config_path = sys.argv[1]
-    with open(config_path) as f:
-        config = json.load(f)
+**Files:**
+- Modify: `tools/route_worker.py` (top-level imports and dead functions)
 
-    result = route(config)
+- [ ] **Step 1: Delete old functions that are now dead code**
 
-    output_path = config.get("output_path")
-    if output_path:
-        with open(output_path, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"Routes written to {output_path}")
-    else:
-        print(json.dumps(result, indent=2))
+Remove these functions entirely (they were kept alive through Task 5 to avoid broken intermediate states):
+- `rasterize_region()` (old matplotlib-based version, replaced by `rasterize_region_kdb()`)
+- `build_cost_grid()` (old distance_transform version, replaced by `build_cost_grid_graduated()`)
+- `add_path_damping()` (old per-pixel loop version, replaced by `get_damping_raster()` calls)
 
-    if result["status"] == "error":
-        sys.exit(1)
+- [ ] **Step 2: Remove unused imports and dead variables**
 
+At the top of the file, the `import math` is still needed for `math.sqrt` in the distance matrix. But remove `from scipy.ndimage import distance_transform_edt` — it was imported inside the now-deleted `build_cost_grid()`.
 
-if __name__ == "__main__":
-    main()
+In `route()`, remove these dead variables that were only used by the old functions:
+```python
+    obs_damping_px = int(round(obs_safe_um / map_res_um))     # DELETE
+    path_damping_px = int(round(path_safe_um / map_res_um))   # DELETE
+    path_width_px = max(1, int(round(path_width_um / map_res_um)))  # DELETE
+```
+
+Verify the import block is:
+
+```python
+import json
+import sys
+import math
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from skimage.graph import MCP_Geometric
+import klayout.db as kdb
+```
+
+- [ ] **Step 3: Verify no references to old functions remain**
+
+Search the file for `rasterize_region(`, `build_cost_grid(`, `add_path_damping(`, `obs_damping_px`, `path_damping_px`, `path_width_px` — none should be found.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tools/route_worker.py
+git commit -m "chore: remove old rasterize/cost/damping functions and dead variables"
+```
+
+### Task 7: End-to-end verification
+
+**Files:**
+- Read: `tools/route_worker.py` (final state)
+- Read: `tests/evaluate_routing.py`
+
+- [ ] **Step 1: Read the final route_worker.py and verify completeness**
+
+Read the entire file and verify:
+- `rasterize_region_kdb()` replaces old `rasterize_region()`
+- `conditional_overwrite()` is present with bounds clipping
+- `get_damping_raster()` is present with bbox clipping and offset return
+- `build_cost_grid_graduated()` replaces old `build_cost_grid()`
+- `find_path()` uses `< 0` checks (not `np.isinf`)
+- `route()` has new config params with defaults
+- `route()` has no pin exclusion logic
+- `route()` has pin region construction + rasterization to -2
+- `route()` has pin damping halos for A and B
+- `route()` sorts pairs by distance
+- `route()` has per-pair pin recovery (set to 1, route, mark path -3, restore to -2)
+- `route()` uses `get_damping_raster()` for path damping
+- No `matplotlib` imports remain
+- No `distance_transform_edt` imports remain
+- No `add_path_damping()` function remains
+- No `obs_damping_px`, `path_damping_px`, `path_width_px` dead variables remain
+- `build_obstacle_region()` is called with `0` for safe_distance (not `obs_safe_dbu`)
+- `get_damping_raster()` snaps origin to grid pixel boundaries
+
+- [ ] **Step 2: Run a syntax/import check**
+
+Run: `python -c "import sys; sys.path.insert(0, '.'); from tools.route_worker import route; print('Import OK')"`
+
+- [ ] **Step 3: Commit final state if any fixups were needed**
+
+```bash
+git add tools/route_worker.py
+git commit -m "fix: final integration fixups for route_worker quality enhancement"
+```
