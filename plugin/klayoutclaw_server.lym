@@ -230,6 +230,34 @@ TOOLS = [
             },
             "required": ["pin_layer_a", "pin_layer_b"]
         }
+    },
+    {
+        "name": "validate_pixel_size",
+        "description": "Validate a microscope pixel size value and optionally compute marker spacing from a GDS template. Returns validity, likely objective mapping, warnings, and marker spacing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pixel_size": {"type": "number", "description": "Pixel size in microns per pixel"},
+                "template_gds": {"type": "string", "description": "Optional path to a GDS file with L5/0 alignment markers"},
+                "image_path": {"type": "string", "description": "Optional path to a microscope image for reference"}
+            },
+            "required": ["pixel_size"]
+        }
+    },
+    {
+        "name": "evaluate_design",
+        "description": "Evaluate a device design against spatial quality checks. Runs 8 weighted checks in score mode (with reference GDS) or 6 DRC-only checks without reference. Returns per-check scores and weighted overall score.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference_gds": {"type": "string", "description": "Path to reference GDS with flake polygons (required for score mode)"},
+                "layer_map": {"type": "object", "description": "Map of component names to [layer, datatype] arrays. Required keys: mesa, contact_patch, topgate, contact_route, bonding_pad"},
+                "mode": {"type": "string", "enum": ["score", "drc"], "default": "score", "description": "Evaluation mode: score (all 8 checks, needs reference) or drc (checks 3-8 only)"},
+                "python_path": {"type": "string", "description": "Path to python binary with gdstk/shapely/numpy (overrides conda_env)"},
+                "conda_env": {"type": "string", "default": "base", "description": "Conda environment with gdstk/shapely/numpy"}
+            },
+            "required": ["layer_map"]
+        }
     }
 ]
 
@@ -377,7 +405,7 @@ def _tool_save_layout(args):
 
 
 def _tool_get_layout_info(args):
-    global _layout
+    global _layout, _top_cell
     if _layout is None:
         _get_or_create_view()
     cells = []
@@ -385,8 +413,45 @@ def _tool_get_layout_info(args):
         c = _layout.cell(ci)
         if c is not None:
             cells.append(c.name)
-    layer_count = len(list(_layout.layer_indices()))
-    return json.dumps({"status": "ok", "dbu": _layout.dbu, "num_cells": len(cells), "cells": cells, "num_layers": layer_count})
+    dbu = _layout.dbu
+    layers = {}
+    for li in _layout.layer_indices():
+        info = _layout.get_info(li)
+        layer_spec = "{}/{}".format(info.layer, info.datatype)
+        shape_count = 0
+        region = pya.Region()
+        # Use RecursiveShapeIterator for recursive shape collection across all cells
+        rsi = _top_cell.begin_shapes_rec(li)
+        while not rsi.at_end():
+            shape_count += 1
+            s = rsi.shape()
+            if not s.is_text():
+                region.insert(s.polygon)
+            rsi.next()
+        area_um2 = round(region.area() * dbu * dbu, 6)
+        bbox_um = None
+        if not region.is_empty():
+            bb = region.bbox()
+            bbox_um = [
+                round(bb.left * dbu, 6),
+                round(bb.bottom * dbu, 6),
+                round(bb.right * dbu, 6),
+                round(bb.top * dbu, 6),
+            ]
+        layers[layer_spec] = {
+            "shapes": shape_count,
+            "area_um2": area_um2,
+            "bbox_um": bbox_um,
+        }
+    num_layers = len(layers)
+    return json.dumps({
+        "status": "ok",
+        "dbu": dbu,
+        "num_cells": len(cells),
+        "cells": cells,
+        "num_layers": num_layers,
+        "layers": layers,
+    })
 
 
 def _tool_screenshot(args):
@@ -492,7 +557,17 @@ def _tool_auto_route(args):
     if python_path:
         cmd = "{} {} {}".format(python_path, worker_path, config_json)
     else:
-        cmd = 'source ~/miniforge3/etc/profile.d/conda.sh &amp;&amp; conda activate {} &amp;&amp; python {} {}'.format(
+        conda_sh = None
+        for p in [os.path.expanduser("~/miniforge3/etc/profile.d/conda.sh"),
+                   os.path.expanduser("~/anaconda3/etc/profile.d/conda.sh"),
+                   os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh")]:
+            if os.path.isfile(p):
+                conda_sh = p
+                break
+        if conda_sh is None:
+            raise ValueError("conda.sh not found. Checked miniforge3, anaconda3, miniconda3.")
+        cmd = 'source {} &amp;&amp; conda activate {} &amp;&amp; python {} {}'.format(
+            conda_sh,
             conda_env, worker_path, config_json
         )
     _log("auto_route: running: {}".format(cmd))
@@ -570,6 +645,244 @@ def _tool_auto_route(args):
     })
 
 
+def _tool_evaluate_design(args):
+    """Evaluate device design against spatial quality checks using external evaluate_worker.py."""
+    import tempfile
+    import subprocess
+
+    global _layout, _layout_view, _top_cell
+    if _layout is None:
+        _get_or_create_view()
+
+    layer_map = args.get("layer_map", {})
+    mode = args.get("mode", "score")
+    if mode not in ("score", "drc"):
+        raise ValueError("Invalid mode '{}'. Must be 'score' or 'drc'.".format(mode))
+    reference_gds = args.get("reference_gds", None)
+    python_path = args.get("python_path", None)
+    conda_env = args.get("conda_env", "base")
+
+    # Validate BEFORE subprocess
+    required_keys = ["mesa", "contact_patch", "topgate", "contact_route", "bonding_pad"]
+    missing = [k for k in required_keys if k not in layer_map]
+    if missing:
+        raise ValueError("layer_map missing required keys: {}".format(", ".join(missing)))
+
+    if mode == "score" and not reference_gds:
+        raise ValueError("mode='score' requires reference_gds parameter")
+
+    # Save current layout to temp GDS
+    tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_eval_")
+    input_gds = os.path.join(tmp_dir, "input.gds")
+    config_json = os.path.join(tmp_dir, "config.json")
+    output_json = os.path.join(tmp_dir, "output.json")
+
+    try:
+        save_opts = pya.SaveLayoutOptions()
+        save_opts.format = "GDS2"
+        _layout.write(input_gds, save_opts)
+        _log("evaluate_design: saved layout to {}".format(input_gds))
+
+        # Write config JSON
+        config = {
+            "gds_path": input_gds,
+            "layer_map": layer_map,
+            "mode": mode,
+            "output_path": output_json,
+        }
+        if reference_gds:
+            config["reference_gds"] = reference_gds
+        with open(config_json, "w") as f:
+            json.dump(config, f)
+
+        # Find evaluate_worker.py
+        worker_candidates = [
+            os.path.expanduser("~/Documents/GitHub/KlayoutClaw/tools/evaluate_worker.py"),
+            os.path.expanduser("~/testFolder/KlayoutClaw/tools/evaluate_worker.py"),
+            os.path.expanduser("~/.klayout/pymacros/evaluate_worker.py"),
+        ]
+        try:
+            worker_candidates.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluate_worker.py"))
+        except Exception:
+            pass
+        worker_path = None
+        for wp in worker_candidates:
+            if os.path.isfile(wp):
+                worker_path = wp
+                break
+        if worker_path is None:
+            raise ValueError("evaluate_worker.py not found. Searched: " + ", ".join(worker_candidates))
+        _log("evaluate_design: using worker {}".format(worker_path))
+
+        # Spawn subprocess
+        if python_path:
+            cmd = "{} {} {}".format(python_path, worker_path, config_json)
+        else:
+            conda_sh = None
+        for p in [os.path.expanduser("~/miniforge3/etc/profile.d/conda.sh"),
+                   os.path.expanduser("~/anaconda3/etc/profile.d/conda.sh"),
+                   os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh")]:
+            if os.path.isfile(p):
+                conda_sh = p
+                break
+        if conda_sh is None:
+            raise ValueError("conda.sh not found. Checked miniforge3, anaconda3, miniconda3.")
+        cmd = 'source {} &amp;&amp; conda activate {} &amp;&amp; python {} {}'.format(
+            conda_sh,
+                conda_env, worker_path, config_json
+            )
+        _log("evaluate_design: running: {}".format(cmd))
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", cmd],
+                capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            raise ValueError("Evaluation timed out after 60 seconds.")
+        except Exception as e:
+            raise ValueError("Failed to run evaluate_worker.py: {}".format(e))
+
+        if proc.returncode != 0:
+            _log("evaluate_design stderr: {}".format(proc.stderr))
+            stderr = proc.stderr.strip()
+            err_lines = [l for l in stderr.split("\n") if l.strip()]
+            last_err = err_lines[-1] if err_lines else "unknown error"
+            raise ValueError("Evaluation subprocess failed (exit code {}): {}".format(proc.returncode, last_err))
+
+        # Read output
+        if not os.path.isfile(output_json):
+            raise ValueError("evaluate_worker.py produced no output file.\nstdout: {}\nstderr: {}".format(
+                proc.stdout[:300], proc.stderr[:300]))
+
+        with open(output_json, "r") as f:
+            result = json.load(f)
+
+        if result.get("status") == "error":
+            raise ValueError("Evaluation failed: {}".format(result.get("error", "unknown")))
+
+        return json.dumps(result)
+
+    finally:
+        # Cleanup temp files
+        for p in [input_gds, config_json, output_json]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+
+
+def _tool_validate_pixel_size(args):
+    """Validate pixel_size and optionally compute marker spacing from a GDS template."""
+    pixel_size = args.get("pixel_size")
+    template_gds = args.get("template_gds", None)
+    image_path = args.get("image_path", None)
+    if pixel_size is None:
+        raise ValueError("Missing required parameter: pixel_size")
+
+    warnings = []
+    valid = True
+
+    # Check range [0.01, 2.0]
+    if pixel_size &lt; 0.01 or pixel_size &gt; 2.0:
+        valid = False
+        warnings.append("pixel_size {} is outside valid range [0.01, 2.0] um/px".format(pixel_size))
+
+    # Map to likely objective magnification
+    objective_map = [
+        (0.05, "100x"),
+        (0.087, "100x"),
+        (0.1, "50x"),
+        (0.25, "20x"),
+        (0.5, "10x"),
+    ]
+    likely_objective = None
+    best_dist = float("inf")
+    for ref_ps, obj_label in objective_map:
+        dist = abs(pixel_size - ref_ps)
+        if dist &lt; best_dist:
+            best_dist = dist
+            likely_objective = obj_label
+
+    # Compute marker_spacing_um from template_gds if provided
+    marker_spacing_um = None
+    if template_gds:
+        try:
+            tl = pya.Layout()
+            tl.read(template_gds)
+            # Find L5/0 layer
+            l5_idx = None
+            for li in tl.layer_indices():
+                linfo = tl.get_info(li)
+                if linfo.layer == 5 and linfo.datatype == 0:
+                    l5_idx = li
+                    break
+            if l5_idx is not None and tl.top_cell() is not None:
+                tc = tl.top_cell()
+                shape_centroids = []
+                rsi = tc.begin_shapes_rec(l5_idx)
+                while not rsi.at_end():
+                    s = rsi.shape()
+                    if not s.is_text():
+                        bb = s.bbox()
+                        cx = (bb.left + bb.right) / 2.0
+                        cy = (bb.bottom + bb.top) / 2.0
+                        shape_centroids.append((cx, cy))
+                    rsi.next()
+                if len(shape_centroids) &gt;= 2:
+                    tdbu = tl.dbu
+                    # Cluster nearby shapes into markers
+                    # (handles multi-polygon markers like crosses)
+                    cluster_radius = 20.0 / tdbu  # 20 um in dbu
+                    clusters = []  # list of [sum_x, sum_y, count]
+                    for (sx, sy) in shape_centroids:
+                        merged = False
+                        for cl in clusters:
+                            mcx = cl[0] / cl[2]
+                            mcy = cl[1] / cl[2]
+                            dx = sx - mcx
+                            dy = sy - mcy
+                            if (dx * dx + dy * dy) ** 0.5 &lt; cluster_radius:
+                                cl[0] += sx
+                                cl[1] += sy
+                                cl[2] += 1
+                                merged = True
+                                break
+                        if not merged:
+                            clusters.append([sx, sy, 1])
+                    if len(clusters) &gt;= 2:
+                        marker_centers = [(cl[0] / cl[2], cl[1] / cl[2]) for cl in clusters]
+                        min_dist = float("inf")
+                        for i in range(len(marker_centers)):
+                            for j in range(i + 1, len(marker_centers)):
+                                dx = marker_centers[i][0] - marker_centers[j][0]
+                                dy = marker_centers[i][1] - marker_centers[j][1]
+                                d = (dx * dx + dy * dy) ** 0.5
+                                if d &lt; min_dist:
+                                    min_dist = d
+                        marker_spacing_um = round(min_dist * tdbu, 6)
+                    else:
+                        warnings.append("GDS template has fewer than 2 L5/0 markers (after clustering)")
+                else:
+                    warnings.append("GDS template has fewer than 2 L5/0 markers")
+            else:
+                warnings.append("GDS template has no L5/0 layer or no top cell")
+        except Exception as e:
+            warnings.append("Failed to read template_gds: {}".format(e))
+
+    return json.dumps({
+        "status": "ok",
+        "valid": valid,
+        "pixel_size": pixel_size,
+        "likely_objective": likely_objective,
+        "warnings": warnings,
+        "marker_spacing_um": marker_spacing_um,
+    })
+
+
 _TOOL_DISPATCH = {
     "create_layout": _tool_create_layout,
     "execute_script": _tool_execute_script,
@@ -577,6 +890,8 @@ _TOOL_DISPATCH = {
     "get_layout_info": _tool_get_layout_info,
     "screenshot": _tool_screenshot,
     "auto_route": _tool_auto_route,
+    "evaluate_design": _tool_evaluate_design,
+    "validate_pixel_size": _tool_validate_pixel_size,
 }
 
 

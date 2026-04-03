@@ -5,9 +5,15 @@
 # Test outputs (generated)
 test_hallbar.gds
 test_hallbar.png
+.tmp/
 
 # Demo artifacts (generated, except demo.gif which is in README)
 docs/demo_frames/
+
+# Node.js (agent/)
+agent/node_modules/
+agent/dist/
+agent/package-lock.json
 
 # Python
 __pycache__/
@@ -28,7 +34,7 @@ venv/
 
 # Claude Code (share settings, ignore per-user memory)
 .claude/memory/
-
+.claude/scheduled_tasks.lock
 # OS
 .DS_Store
 Thumbs.db
