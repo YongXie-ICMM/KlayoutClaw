@@ -1,7 +1,7 @@
 {
   "name": "klayoutclaw",
-  "description": "Control KLayout from AI agents via MCP — geometry creation, layer display, and visual capture skills for chip/mask layout design",
-  "version": "0.5.2",
+  "description": "Control KLayout from AI agents via MCP — geometry, display, image overlay, visual capture, nanodevice flake detection, GDS alignment, and routing skills for chip/mask layout design",
+  "version": "0.6.0",
   "author": {
     "name": "caidish",
     "email": "caidish1234@gmail.com"

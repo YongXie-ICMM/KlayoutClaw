@@ -11,7 +11,8 @@ KlayoutClaw/
 │   └── klayoutclaw_ui.lym        # KLayout autorun macro (UI panel + status bar)
 ├── tools/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
-│   └── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
+│   ├── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
+│   └── evaluate_worker.py        # Hall bar design evaluation (gdstk)
 ├── skills/
 │   ├── scripts/
 │   │   └── mcp_client.py            # Shared MCP client for all skills
@@ -38,40 +39,60 @@ KlayoutClaw/
 │   │   ├── SKILL.md
 │   │   └── scripts/
 │   │       └── capture.py
-│   └── nanodevice/
-│       ├── flakedetect/
-│       │   ├── SKILL.md              # Orchestrator (dispatches subagents)
-│       │   ├── scripts/
-│       │   │   └── core.py           # Shared CV utilities (morph, contour, Chamfer)
-│       │   ├── align/                # SIFT + Chamfer cross-substrate alignment
-│       │   │   ├── SKILL.md
-│       │   │   └── scripts/          # sift_align, source_contour, footprint, sweep, refine
-│       │   ├── detect/               # Per-material segmentation (4 scripts)
-│       │   │   ├── SKILL.md
-│       │   │   └── scripts/          # graphite, graphene, bottom_hbn, top_hbn
-│       │   ├── combine/              # Coordinate transforms + overlay
-│       │   │   ├── SKILL.md
-│       │   │   └── scripts/          # ecc_register, transform, overlay
-│       │   ├── commit/               # Insert polygons into KLayout
-│       │   │   └── SKILL.md
-│       │   └── review/               # Visual validation protocol
-│       │       └── SKILL.md
-│       ├── gdsalign/
-│       │   ├── SKILL.md              # GDS template alignment orchestrator
-│       │   └── scripts/
-│       │       ├── extract_markers.py # Parse GDS L5/0 marker pairs
-│       │       ├── detect_markers.py  # Template-match markers in image
-│       │       ├── align_gds.py       # Compute similarity transform
-│       │       └── commit_gds.py      # Warp image + contours, commit to KLayout
-│       └── routing/
-│           ├── SKILL.md
-│           └── scripts/
-│               ├── place_pads.py
-│               ├── route_multiwindow.py
-│               └── clear_routes.py
+│   ├── nanodevice_flakedetect/
+│   │   ├── SKILL.md              # Orchestrator (dispatches subagents)
+│   │   └── scripts/
+│   │       └── core.py           # Shared CV utilities (morph, contour, Chamfer)
+│   ├── nanodevice_flakedetect_align/
+│   │   ├── SKILL.md              # SIFT + Chamfer cross-substrate alignment
+│   │   └── scripts/              # sift_align, source_contour, footprint, sweep, refine
+│   ├── nanodevice_flakedetect_detect/
+│   │   ├── SKILL.md              # Per-material segmentation (4 scripts)
+│   │   └── scripts/              # graphite, graphene, bottom_hbn, top_hbn
+│   ├── nanodevice_flakedetect_combine/
+│   │   ├── SKILL.md              # Coordinate transforms + overlay
+│   │   └── scripts/              # ecc_register, transform, overlay
+│   ├── nanodevice_flakedetect_commit/
+│   │   └── SKILL.md              # Insert polygons into KLayout
+│   ├── nanodevice_flakedetect_review/
+│   │   └── SKILL.md              # Visual validation protocol
+│   ├── nanodevice_gdsalign/
+│   │   ├── SKILL.md              # GDS template alignment orchestrator
+│   │   └── scripts/
+│   │       ├── extract_markers.py # Parse GDS L5/0 marker pairs
+│   │       ├── detect_markers.py  # Template-match markers in image
+│   │       ├── align_gds.py       # Compute similarity transform
+│   │       └── commit_gds.py      # Warp image + contours, commit to KLayout
+│   ├── nanodevice_hallbar/
+│   │   └── SKILL.md              # Hall bar device design (adaptive geometry)
+│   ├── nanodevice_e2e_design/
+│   │   └── SKILL.md              # E2E pipeline orchestrator
+│   ├── nanodevice_routing/
+│   │   ├── SKILL.md
+│   │   └── scripts/
+│   │       ├── place_pads.py
+│   │       ├── route_multiwindow.py
+│   │       └── clear_routes.py
+│   └── e2e_judge/
+│       ├── SKILL.md              # Agentic E2E test harness with LLM judge
+│       └── scripts/              # conftest, harness, judge, verifier, run_tests
+├── agent/                          # qlaybot v0.4.1 — Pi-Agent SDK wrapper
+│   ├── src/                        # TypeScript source (see agent/CLAUDE.md)
+│   ├── tests/                      # 697 tests: unit / integration / e2e
+│   ├── workspace/                  # Domain knowledge (SOUL, WORKFLOW, TOOLS, RULES)
+│   ├── package.json
+│   └── CLAUDE.md                   # Agent dev instructions
 ├── tests/
 │   ├── test_connection.py        # Protocol-level MCP connection test
 │   ├── test_connection.sh        # E2E connection test (install + launch + verify)
+│   ├── test_phase0_func.py       # Phase 0: connection + geometry functional tests
+│   ├── test_phase0_mcp.py        # Phase 0: MCP protocol tests
+│   ├── test_phase1_mcp.py        # Phase 1: LYM server MCP tests
+│   ├── test_phase1_worker.py     # Phase 1: route/evaluate worker tests
+│   ├── test_phase2_phase3_func.py # Phase 2-3: skills + flakedetect functional tests
+│   ├── test_phase4_docs_integration.py # Phase 4: docs integration tests
+│   ├── test_phase4_mcp.py        # Phase 4: GDS alignment + routing MCP tests
+│   ├── test_phase4_skills_func.ts # Phase 4: skills functional tests (TS)
 │   ├── create_hallbar.py         # Hall bar creation via execute_script
 │   ├── create_hallbar_unrouted.py # Hall bar with pin markers, no traces
 │   ├── evaluate_gds.py           # Hall bar structural evaluation (gdstk)
@@ -80,8 +101,8 @@ KlayoutClaw/
 │   ├── test_hallbar.sh           # E2E Hall bar test (Claude + tmux)
 │   └── test_autoroute.sh         # E2E autoroute test
 ├── docs/
-│   ├── tools.md                  # MCP tool reference (5 tools)
-│   ├── skills.md                 # Skills CLI reference (geometry, display, image, visual, nanodevice:flakedetect, nanodevice:gdsalign, nanodevice:routing)
+│   ├── tools.md                  # MCP tool reference (8 tools)
+│   ├── skills.md                 # Skills CLI reference (geometry, display, image, visual, nanodevice_flakedetect, nanodevice_gdsalign, nanodevice_routing, nanodevice_hallbar, nanodevice_e2e_design)
 │   ├── ui-plugin.md              # UI plugin architecture + pya Qt pitfalls
 │   └── plans/                    # Architecture design docs
 │       ├── 2026-03-08-qtcpserver-mcp-design.md
@@ -97,7 +118,7 @@ KlayoutClaw/
 └── TODO.md                       # Task tracking
 ```
 
-## MCP Tools (6 total)
+## MCP Tools (8 total)
 
 | Tool | Description |
 |------|-------------|
@@ -107,6 +128,8 @@ KlayoutClaw/
 | `get_layout_info` | Layout summary info |
 | `screenshot` | Capture viewport as PNG (what the user sees) |
 | `auto_route` | Autoroute pin pairs (subprocess, needs conda env) |
+| `evaluate_design` | Evaluate hall bar design quality (subprocess) |
+| `validate_pixel_size` | Validate pixel_size against known objectives |
 
 See `docs/tools.md` for full parameter schemas.
 

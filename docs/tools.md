@@ -4,7 +4,7 @@ All tools are called via MCP `tools/call` method over HTTP POST to `http://127.0
 
 All coordinates are in **microns**. The database unit (dbu) defaults to 0.001.
 
-**6 tools:** create_layout, execute_script, save_layout, get_layout_info, screenshot, auto_route
+**8 tools:** create_layout, execute_script, save_layout, get_layout_info, screenshot, auto_route, evaluate_design, validate_pixel_size
 
 ---
 
@@ -195,3 +195,87 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 9. Paths compressed (collinear points removed) and inserted as pya.Path objects
 
 **Dependencies (subprocess):** numpy, scipy, scikit-image, klayout (standalone package)
+
+---
+
+## evaluate_design
+
+Evaluate a device design against spatial quality checks. Runs `tools/evaluate_worker.py` as a subprocess. In **score** mode (with reference GDS) runs 8 weighted checks; in **drc** mode runs 6 DRC-only checks without reference. Returns per-check scores and a weighted overall score.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `layer_map` | object | yes | | Map of component names to `[layer, datatype]` arrays. Required keys: `mesa`, `contact_patch`, `topgate`, `contact_route`, `bonding_pad` |
+| `reference_gds` | string | no | | Path to reference GDS with flake polygons (required for score mode) |
+| `mode` | string | no | `"score"` | Evaluation mode: `"score"` (all 8 checks, needs reference) or `"drc"` (checks 3-8 only) |
+| `python_path` | string | no | | Path to python binary with gdstk/shapely/numpy (overrides `conda_env`) |
+| `conda_env` | string | no | `"base"` | Conda environment with gdstk/shapely/numpy |
+
+**Returns:**
+```json
+{
+  "status": "ok",
+  "overall": 0.8234,
+  "mode": "score",
+  "checks": [
+    {"name": "mesa_on_overlap", "score": 0.95, "weight": 0.15, "detail": "mesa_on_overlap: 0.9500"},
+    {"name": "contacts_in_regions", "score": 0.90, "weight": 0.15, "detail": "contacts_in_regions: 0.9000"},
+    {"name": "topgate", "score": 0.80, "weight": 0.10, "detail": "topgate: 0.8000"},
+    {"name": "contact_isolation", "score": 0.70, "weight": 0.10, "detail": "contact_isolation: 0.7000"},
+    {"name": "connectivity", "score": 0.85, "weight": 0.10, "detail": "connectivity: 0.8500"},
+    {"name": "route_endpoints", "score": 0.60, "weight": 0.10, "detail": "route_endpoints: 0.6000"},
+    {"name": "contact_mesa_adjacency", "score": 0.75, "weight": 0.15, "detail": "contact_mesa_adjacency: 0.7500"},
+    {"name": "mesa_probes", "score": 0.80, "weight": 0.15, "detail": "mesa_probes: 0.8000"}
+  ]
+}
+```
+
+**Checks (8 total, weights sum to 1.0):**
+- `mesa_on_overlap` (0.15) — mesa placed on flake overlap region (needs reference)
+- `contacts_in_regions` (0.15) — contacts in single-material regions (needs reference)
+- `topgate` (0.10) — topgate isolation from mesa edges and contacts
+- `contact_isolation` (0.10) — contacts have proper isolation gaps
+- `connectivity` (0.10) — all components connected in the layout
+- `route_endpoints` (0.10) — routes terminate at correct contact/pad locations
+- `contact_mesa_adjacency` (0.15) — contacts adjacent to mesa edges
+- `mesa_probes` (0.15) — mesa has proper probe arm geometry (low solidity)
+
+**Dependencies (subprocess):** gdstk, shapely, numpy
+
+---
+
+## validate_pixel_size
+
+Validate a microscope pixel size value and optionally compute marker spacing from a GDS template. Returns validity, likely objective mapping, warnings, and marker spacing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pixel_size` | number | yes | Pixel size in microns per pixel |
+| `template_gds` | string | no | Path to a GDS file with L5/0 alignment markers |
+| `image_path` | string | no | Path to a microscope image for reference |
+
+**Returns:**
+```json
+{
+  "status": "ok",
+  "valid": true,
+  "pixel_size": 0.087,
+  "likely_objective": "100x",
+  "warnings": [],
+  "marker_spacing_um": 200.0
+}
+```
+
+- `valid` — `true` if pixel_size is within range [0.01, 2.0] um/px
+- `likely_objective` — nearest matching objective magnification
+- `warnings` — list of warning strings (empty if no issues)
+- `marker_spacing_um` — spacing between L5/0 markers in microns (null if no `template_gds` provided)
+
+**Known pixel_size values:**
+
+| Objective | pixel_size (um/px) |
+|-----------|--------------------|
+| 100x | 0.05 |
+| 100x (alt) | 0.087 |
+| 50x | 0.1 |
+| 20x | 0.25 |
+| 10x | 0.5 |

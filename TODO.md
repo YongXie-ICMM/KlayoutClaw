@@ -6,7 +6,7 @@
 - [ ] Consider sequential routing with progressive obstacle updates (route one, add to obstacles, route next)
 
 ## v0.6.1: Nanodevice Routing Skill
-- [x] Create `skills/nanodevice/routing/` skill — multi-window EBL routing
+- [x] Create `skills/nanodevice_routing/` skill — multi-window EBL routing
 - [x] `place_pads.py` — bonding pads around field perimeter with pin markers
 - [x] `route_multiwindow.py` — two-pass routing (inner fine + outer coarse + boundary patches)
 - [x] `clear_routes.py` — clean up routing layers

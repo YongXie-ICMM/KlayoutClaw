@@ -275,7 +275,7 @@ Install: `conda install gdstk matplotlib` (or `pip install gdstk matplotlib`)
 
 ---
 
-## GDS Alignment (nanodevice:gdsalign)
+## GDS Alignment (nanodevice_gdsalign)
 
 Align microscope stack images to a GDS fabrication template by detecting lithographic markers and computing a similarity transform. Commits warped image + material contours to KLayout.
 
@@ -295,7 +295,7 @@ Align microscope stack images to a GDS fabrication template by detecting lithogr
 Parse GDS template, extract the 4 innermost L5/0 marker pairs (8 squares total).
 
 ```bash
-conda run -n base python skills/nanodevice/gdsalign/scripts/extract_markers.py \
+conda run -n base python skills/nanodevice_gdsalign/scripts/extract_markers.py \
     --gds Template.gds --output-dir output/gdsalign/
 ```
 
@@ -304,7 +304,7 @@ conda run -n base python skills/nanodevice/gdsalign/scripts/extract_markers.py \
 Detect marker pairs in microscope image via multi-scale, multi-rotation template matching.
 
 ```bash
-conda run -n base python skills/nanodevice/gdsalign/scripts/detect_markers.py \
+conda run -n base python skills/nanodevice_gdsalign/scripts/detect_markers.py \
     --image full_stack_raw.jpg --pixel-size 0.087 \
     --gds-markers output/gdsalign/gds_markers.json --output-dir output/gdsalign/
 ```
@@ -314,7 +314,7 @@ conda run -n base python skills/nanodevice/gdsalign/scripts/detect_markers.py \
 Exhaustive 2-point correspondence enumeration to compute similarity transform (image_um → GDS_um).
 
 ```bash
-conda run -n base python skills/nanodevice/gdsalign/scripts/align_gds.py \
+conda run -n base python skills/nanodevice_gdsalign/scripts/align_gds.py \
     --gds-markers output/gdsalign/gds_markers.json \
     --image-markers output/gdsalign/image_markers.json \
     --output-dir output/gdsalign/
@@ -325,7 +325,7 @@ conda run -n base python skills/nanodevice/gdsalign/scripts/align_gds.py \
 Apply warp to image + contours, commit to KLayout. Use `--warp-only` for offline testing.
 
 ```bash
-conda run -n base python skills/nanodevice/gdsalign/scripts/commit_gds.py \
+conda run -n base python skills/nanodevice_gdsalign/scripts/commit_gds.py \
     --warp output/gdsalign/gds_warp.npy --traces output/combine/traces.json \
     --image full_stack_raw.jpg --pixel-size 0.087 \
     --gds Template.gds --output-dir output/gdsalign/ [--warp-only]
@@ -349,11 +349,11 @@ Conda env: `base` (all deps pre-installed)
 
 ### Full Documentation
 
-See `skills/nanodevice/gdsalign/SKILL.md` for orchestrator workflow and `docs/superpowers/specs/2026-03-13-gdsalign-design.md` for design spec.
+See `skills/nanodevice_gdsalign/SKILL.md` for orchestrator workflow and `docs/superpowers/specs/2026-03-13-gdsalign-design.md` for design spec.
 
 ---
 
-## Flake Detection (nanodevice:flakedetect)
+## Flake Detection (nanodevice_flakedetect)
 
 Agent-orchestrated pipeline for detecting van der Waals heterostructure material boundaries from optical microscope images. Detects hBN, graphene, and graphite from multi-source images and commits polygons to KLayout.
 
@@ -375,7 +375,7 @@ Split into 5 sub-skills, each executed by a subagent:
 1. align → 2. detect → 3. combine → 4. commit → 5. review
 ```
 
-Each step runs as a subagent that reads its SKILL.md from `skills/nanodevice/flakedetect/<step>/SKILL.md`.
+Each step runs as a subagent that reads its SKILL.md from `skills/nanodevice_flakedetect_<step>/SKILL.md`.
 
 ### Dependencies
 
@@ -388,7 +388,45 @@ Conda env: `base` (all deps pre-installed)
 
 ### Full Documentation
 
-See `skills/nanodevice/flakedetect/SKILL.md` for the orchestrator workflow, and each sub-skill's SKILL.md for detailed script references and tuning guides.
+See `skills/nanodevice_flakedetect/SKILL.md` for the orchestrator workflow, and each sub-skill's SKILL.md for detailed script references and tuning guides.
+
+---
+
+## Hall Bar Design (nanodevice_hallbar)
+
+Design Hall bar devices on van der Waals heterostructure flakes with adaptive geometry, physics-based constraints, and automated evaluation. All dimensions derive from the actual flake geometry, not from fixed formulas.
+
+This is a pure-text skill with no scripts. The agent uses `execute_script`, `get_layout_info`, `evaluate_design`, `save_layout`, and the `nanodevice_routing` skill to implement each step.
+
+### Key Constraints
+- Mesa solidity must be < 0.5 (proper Hall bar shape with arms)
+- Contacts must be placed in single-material regions
+- Topgate must maintain isolation gap from mesa edges and contacts
+
+### Full Documentation
+
+See `skills/nanodevice_hallbar/SKILL.md` for the complete adaptive design workflow and constraint specification.
+
+---
+
+## End-to-End Design Pipeline (nanodevice_e2e_design)
+
+Orchestrate the full end-to-end nanodevice design pipeline, from user query through flake detection, GDS alignment, contour commit, Hall bar design, and final save. Sequences sub-skills with gate conditions and retry logic.
+
+This is a pure-text orchestrator skill with no scripts directory. The agent dispatches sub-skills and tools at each step.
+
+### Pipeline Steps
+1. Query parsing and validation
+2. Flake detection (nanodevice_flakedetect)
+3. GDS alignment (nanodevice_gdsalign)
+4. Contour commit
+5. Hall bar design (nanodevice_hallbar)
+6. Routing (nanodevice_routing)
+7. Final save and evaluation
+
+### Full Documentation
+
+See `skills/nanodevice_e2e_design/SKILL.md` for the complete orchestration workflow and gate conditions.
 
 ---
 

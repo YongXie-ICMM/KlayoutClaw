@@ -190,10 +190,10 @@ KlayoutClaw/
 │   ├── display/                  # Layer visibility skills
 │   ├── image/                    # Background image overlay skill
 │   ├── visual/                   # Layout capture skill
-│   └── nanodevice/               # Device fabrication pipelines
-│       ├── flakedetect/          # vdW heterostructure detection (5 sub-skills)
-│       ├── gdsalign/             # GDS template alignment
-│       └── routing/              # Pad placement + autorouting
+│   ├── nanodevice_flakedetect/   # vdW heterostructure detection orchestrator
+│   ├── nanodevice_flakedetect_*/# 5 sub-skills (align, detect, combine, commit, review)
+│   ├── nanodevice_gdsalign/     # GDS template alignment
+│   └── nanodevice_routing/      # Pad placement + autorouting
 ├── tools/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
 │   ├── capture_demo.py           # Simple Hall bar demo capture script
@@ -257,7 +257,7 @@ pytest tests/test_flakedetect.py tests/test_gdsalign.py -v
 
 ## Community
 
-Built for the device physics community. Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) or contact **caidish1234@gmail.com**.
+Built for the device physics community. Interested in contributing? See [DEVELOPMENT.md](DEVELOPMENT.md) or contact **caidish1234@gmail.com**.
 
 ## Acknowledgments
 
