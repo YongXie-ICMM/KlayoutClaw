@@ -52,7 +52,7 @@ describe("config", () => {
   it("uses ANTHROPIC_API_KEY env var", () => {
     const originalKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = "test-key-123";
-    const config = loadConfig();
+    const config = loadConfig(`/tmp/qlaybot-test-cfg-${Date.now()}`);
     const provider = Object.values(config.models.providers)[0];
     expect(provider.apiKey).toBe("test-key-123");
     if (originalKey) {

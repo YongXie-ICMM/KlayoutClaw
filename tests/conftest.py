@@ -4,9 +4,46 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 import numpy as np
 import pytest
+
+# ---------------------------------------------------------------------------
+# Pytest fixtures
+# ---------------------------------------------------------------------------
+
+MCP_URL = "http://127.0.0.1:8765/mcp"
+
+
+@pytest.fixture(scope="session")
+def session_id():
+    """Perform MCP initialize handshake and return the session ID.
+
+    Skips if the KLayout MCP server is not reachable.
+    """
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "0.1"},
+        },
+    }).encode()
+    req = urllib.request.Request(
+        MCP_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        pytest.skip(f"KLayout MCP server not reachable at {MCP_URL}: {e}")
+    sid = r.headers.get("Mcp-Session-Id")
+    return sid
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -24,10 +61,10 @@ FULL_STACK_LUT = os.path.join(ML08_DIR, "full_stack_w_LUT.jpg")
 TEMPLATE_GDS = os.path.join(ML08_DIR, "Template.gds")
 
 FLAKEDETECT_DIR = os.path.join(
-    PROJECT_ROOT, "skills", "nanodevice", "flakedetect"
+    PROJECT_ROOT, "skills", "nanodevice_flakedetect"
 )
 GDSALIGN_DIR = os.path.join(
-    PROJECT_ROOT, "skills", "nanodevice", "gdsalign", "scripts"
+    PROJECT_ROOT, "skills", "nanodevice_gdsalign", "scripts"
 )
 
 # ---------------------------------------------------------------------------
@@ -53,7 +90,12 @@ def run_flakedetect_script(stage, script_name, args, timeout=300):
     Raises:
         pytest.skip: If the subprocess exceeds *timeout*.
     """
-    script_path = os.path.join(FLAKEDETECT_DIR, stage, "scripts", script_name)
+    if stage == "scripts":
+        script_path = os.path.join(FLAKEDETECT_DIR, "scripts", script_name)
+    else:
+        script_path = os.path.join(
+            PROJECT_ROOT, "skills", f"nanodevice_flakedetect_{stage}", "scripts", script_name
+        )
     cmd = [sys.executable, script_path] + args
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)

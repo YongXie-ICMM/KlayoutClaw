@@ -12,7 +12,7 @@ import pytest
 
 # Add core.py to import path
 sys.path.insert(0, os.path.join(
-    os.path.dirname(__file__), "..", "skills", "nanodevice", "flakedetect", "scripts"
+    os.path.dirname(__file__), "..", "skills", "nanodevice_flakedetect", "scripts"
 ))
 from core import (
     morph_clean, make_warp, warp_contour, invert_warp, LAYER_MAP, STACK_ORDER,

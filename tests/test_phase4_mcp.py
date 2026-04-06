@@ -169,15 +169,16 @@ def _parse_documented_skills():
             in_skills_section = True
             continue
         if in_skills_section:
+            # Stop at next top-level sibling (line without box-drawing indent)
+            if re.match(r"├── |└── ", line):
+                in_skills_section = False
+                continue
             # Detect directory entries (children of skills/)
             dir_match = re.search(r"[├└]── ([a-z][a-z0-9_]*)/", line)
             if dir_match:
                 dirname = dir_match.group(1)
                 if dirname not in EXCLUDE:
                     matches.add(dirname)
-            # Stop at next top-level sibling (line without box-drawing indent)
-            if re.match(r"├── |└── ", line):
-                in_skills_section = False
 
     skills = sorted(matches)
     assert len(skills) > 0, (
