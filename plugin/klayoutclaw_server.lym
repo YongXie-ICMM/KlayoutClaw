@@ -246,17 +246,17 @@ TOOLS = [
     },
     {
         "name": "evaluate_design",
-        "description": "Evaluate a device design against spatial quality checks. Runs 8 weighted checks in score mode (with reference GDS) or 6 DRC-only checks without reference. Returns per-check scores and weighted overall score.",
+        "description": "Evaluate a device design against configurable geometric quality checks. Accepts a list of check primitives (component_overlap, component_containment, contact_isolation, connectivity, route_endpoints, adjacency, solidity, spacing) with per-check weights. Returns per-check scores and weighted overall score.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "reference_gds": {"type": "string", "description": "Path to reference GDS with flake polygons (required for score mode)"},
-                "layer_map": {"type": "object", "description": "Map of component names to [layer, datatype] arrays. Required keys: mesa, contact_patch, topgate, contact_route, bonding_pad"},
-                "mode": {"type": "string", "enum": ["score", "drc"], "default": "score", "description": "Evaluation mode: score (all 8 checks, needs reference) or drc (checks 3-8 only)"},
+                "checks": {"type": "array", "description": "List of check objects: [{name, args, weight}]. Available primitives: component_overlap, component_containment, contact_isolation, connectivity, route_endpoints, adjacency, solidity, spacing."},
+                "layer_map": {"type": "object", "description": "Map of component names to [layer, datatype] arrays. Keys are referenced by check args."},
+                "reference_gds": {"type": "string", "description": "Path to reference GDS (optional, for checks that need reference layers)"},
                 "python_path": {"type": "string", "description": "Path to python binary with gdstk/shapely/numpy (overrides conda_env)"},
                 "conda_env": {"type": "string", "default": "base", "description": "Conda environment with gdstk/shapely/numpy"}
             },
-            "required": ["layer_map"]
+            "required": ["checks", "layer_map"]
         }
     }
 ]
@@ -655,21 +655,13 @@ def _tool_evaluate_design(args):
         _get_or_create_view()
 
     layer_map = args.get("layer_map", {})
-    mode = args.get("mode", "score")
-    if mode not in ("score", "drc"):
-        raise ValueError("Invalid mode '{}'. Must be 'score' or 'drc'.".format(mode))
+    checks = args.get("checks", None)
     reference_gds = args.get("reference_gds", None)
     python_path = args.get("python_path", None)
     conda_env = args.get("conda_env", "base")
 
-    # Validate BEFORE subprocess
-    required_keys = ["mesa", "contact_patch", "topgate", "contact_route", "bonding_pad"]
-    missing = [k for k in required_keys if k not in layer_map]
-    if missing:
-        raise ValueError("layer_map missing required keys: {}".format(", ".join(missing)))
-
-    if mode == "score" and not reference_gds:
-        raise ValueError("mode='score' requires reference_gds parameter")
+    if checks is None or not isinstance(checks, list) or len(checks) == 0:
+        raise ValueError("'checks' must be a non-empty list of check objects.")
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_eval_")
@@ -687,7 +679,7 @@ def _tool_evaluate_design(args):
         config = {
             "gds_path": input_gds,
             "layer_map": layer_map,
-            "mode": mode,
+            "checks": checks,
             "output_path": output_json,
         }
         if reference_gds:
