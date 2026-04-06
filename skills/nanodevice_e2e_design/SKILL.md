@@ -1,142 +1,220 @@
 ---
 name: nanodevice_e2e_design
-description: Orchestrate the full end-to-end nanodevice design pipeline, from user query through flake detection, GDS alignment, contour commit, Hall bar design, and final save. Sequences sub-skills with gate conditions and retry logic.
+description: Orchestrate end-to-end nanodevice design from user query through optional flake detection, material analysis, device geometry creation, routing, evaluation, and save. Device-agnostic methodology -- the agent derives physics rules from device type and available materials.
 ---
 
-# nanodevice_e2e_design -- End-to-End Device Design Pipeline
+# nanodevice_e2e_design -- End-to-End Device Design
 
-Orchestrate the complete autonomous nanodevice design workflow. This skill sequences 7 pipeline steps, each gated by verification conditions. Sub-skills handle the domain-specific work; this orchestrator manages sequencing, gate checks, and retries.
+A device-agnostic methodology for designing nanodevices on material regions in KLayout. The agent follows 7 reasoning steps, deriving device-specific physics rules from context and user input. No device type is hardcoded.
 
-**This is a pure-text orchestrator skill.** No scripts directory. The agent dispatches sub-skills and tools at each step.
+**This is a pure-text orchestrator skill.** No scripts directory. The agent uses MCP tools and sub-skills at each step.
 
 ---
 
 ## Pipeline Overview
 
-| # | Step | Tool / Skill | Gate |
-|---|------|-------------|------|
-| 1 | QUERY | nanodevice_hallbar Step 0 | All parameters confirmed |
-| 2 | VALIDATE | validate_pixel_size | Pixel size verified |
-| 3 | DETECT | nanodevice_flakedetect | traces.json with 4 materials |
-| 4 | ALIGN | nanodevice_gdsalign | mean_residual < 5 um |
-| 5 | CONTOUR | nanodevice_flakedetect_commit | Polygons on L10-L13 |
-| 6 | HALLBAR | nanodevice_hallbar | evaluate_design score >= 0.80 |
-| 7 | SAVE | save_layout + result.json | Files written |
+| # | Step | What the agent does | Skip when |
+|---|------|---------------------|-----------|
+| 1 | QUERY | Check if required info is missing; ask only if needed | User provided everything in initial prompt |
+| 2 | PREPARE | Run flake detection + GDS alignment if microscope images provided; otherwise verify existing layout | No images provided / layout already prepared |
+| 3 | ANALYZE | Study material regions, compute overlaps/exclusions, identify design-relevant zones | Never |
+| 4 | DESIGN | Create device geometry via `execute_script` | Never |
+| 5 | ROUTE | Use `auto_route` tool to connect device contacts to bonding pads | Device has no external contacts |
+| 6 | EVALUATE | Run configurable evaluator + visual inspection, iterate on failures | Never |
+| 7 | SAVE | Export GDS + write result.json summary | Never |
 
-Each step has a gate condition that must pass before proceeding to the next step. Maximum of 2 retries per step. If a step fails after 2 retries, report to the user for manual intervention.
-
----
-
-## Step 1: QUERY -- Gather User Requirements
-
-Read the `nanodevice_hallbar` skill and execute its Step 0 (Query User) to collect:
-- Device type, shape, pin count
-- Topgate / backgate preferences
-- Pixel size (with objective-based guide)
-- Source image paths (bottom_part, top_part, full_stack)
-- Output directory
-- Layer assignments
-
-**Gate condition for QUERY:** All required parameters have been provided by the user. Proceed only if device type, pixel_size, and source image paths are confirmed.
+Each step has a gate condition. Maximum 2 retries per step. If a step fails after retries, report to the user.
 
 ---
 
-## Step 2: VALIDATE -- Confirm Pixel Size
+## Step 1: QUERY
 
-Call the `validate_pixel_size` tool to verify the pixel_size value is consistent with the source images and objective metadata.
+Check the user's initial prompt against this checklist. Only ask about missing items -- skip this step entirely if all required info is provided.
 
-**Gate condition for VALIDATE:** validate_pixel_size returns a confirmed pixel_size value. If the tool reports a mismatch, ask the user to verify before proceeding. Proceed only if pixel_size is validated.
+| Parameter | Required? | Notes |
+|-----------|-----------|-------|
+| Device type | Yes | What to build (Hall bar, FET, QD, etc.) |
+| Material regions | Yes | Which layers have which materials, or microscope images to detect them |
+| Layer assignments | Yes | Which layers to use for each design component |
+| pixel_size | If images provided | Microns per pixel, needed for detection/alignment |
+| Device-specific constraints | If any | Gates, contacts, pin count, dimensions |
+| Output path | No | Defaults to source directory |
 
----
-
-## Step 3: DETECT -- Flake Detection
-
-Dispatch a subagent to read and follow the `nanodevice_flakedetect` skill. This runs the full stack detection pipeline (align, detect, combine) on the source microscope images.
-
-Pass to the subagent:
-- Source image paths (bottom_part, top_part, full_stack_raw, full_stack_lut)
-- pixel_size
-- mirror setting
-- Output directory
-
-**Gate condition for DETECT:** The detection pipeline produces `traces.json` with contours for all 4 materials (graphene, graphite, bottom_hBN, top_hBN). Check that `combine_report.json` status is complete. Proceed only if all materials are detected.
+**Gate:** All required parameters are known. Proceed.
 
 ---
 
-## Step 4: ALIGN -- GDS Template Alignment
+## Step 2: PREPARE
 
-Dispatch a subagent to read and follow the `nanodevice_gdsalign` skill. This aligns the microscope stack images to the GDS fabrication template using lithographic marker detection.
+Conditional step -- only runs if microscope images are provided.
 
-Pass to the subagent:
-- full_stack image path
-- Template GDS path
-- pixel_size
-- Output directory
+**If microscope images are provided:**
+1. Validate pixel_size via `validate_pixel_size` tool
+2. Dispatch subagent to run `nanodevice_flakedetect` pipeline (align, detect, combine)
+3. Dispatch subagent to run `nanodevice_gdsalign` if a GDS template is provided
+4. Dispatch subagent to run `nanodevice_flakedetect_commit` to insert material polygons into KLayout
 
-**Gate condition for ALIGN:** `gds_alignment_report.json` exists with `mean_residual < 5 um`. The image-to-GDS transform must be valid. Proceed only if alignment quality meets the prerequisite threshold.
+**If starting from an existing layout:**
+- Verify expected material regions are present via `get_layout_info`
 
----
-
-## Step 5: CONTOUR -- Commit Polygons to KLayout
-
-Dispatch a subagent to read and follow the `nanodevice_flakedetect_commit` skill. This inserts the detected material polygons into KLayout on their designated layers (L10-L13).
-
-Pass to the subagent:
-- traces.json path (from DETECT step output)
-- full_stack image path (for background)
-- pixel_size
-- GDS transform (from ALIGN step)
-
-**Gate condition for CONTOUR:** Polygons are visible on layers L10/0 through L13/0 in KLayout. Verify via `get_layout_info` that at least graphene (L11/0) and graphite (L13/0) have shapes. Proceed only if material contours are committed.
+**Gate:** Material regions exist as polygons on their designated layers in KLayout.
 
 ---
 
-## Step 6: HALLBAR -- Design Hall Bar Device
+## Step 3: ANALYZE
 
-Follow the `nanodevice_hallbar` skill Steps 1-8 to design the Hall bar on the committed material regions. This includes:
-- Analyze material overlap (Step 1)
-- Design adaptive mesa (Step 2)
-- Place contacts (Step 3)
-- Place topgate (Step 4)
-- Place pin markers (Step 5)
-- Route to bonding pads (Step 6)
-- DRC check (Step 7)
-- Evaluate and iterate (Step 8)
+**Prerequisite:** Material contours must exist as polygons in KLayout, and any reference images must be loaded as background overlays. If they are not present, go back to PREPARE or ask the user.
 
-**Gate condition for HALLBAR:** `evaluate_design` with mode=score returns a score >= 0.80. Check that all design components are present before proceeding to save.
+The agent studies available geometry to inform design decisions:
+
+1. Use `get_layout_info` to identify which layers have material regions
+2. Use `execute_script` with `pya.Region` to compute overlaps, exclusions, bounding boxes
+3. Use `screenshot` to visually inspect material regions and plan device placement
+4. Identify which material zones are relevant for the specific device type
+
+The agent derives material analysis logic from its physics knowledge of the device type. For example:
+- A Hall bar needs graphene-graphite overlap for the channel
+- A QD needs a gate-definable region
+- A JJ needs a superconductor-insulator-superconductor stack
+
+**Gate:** The agent has identified where the device should be placed and what material constraints apply.
 
 ---
 
-## Step 7: SAVE -- Save Final Design
+## Step 4: DESIGN
 
-Save the completed layout and write a summary:
+Create device geometry using `execute_script`. What to create depends on the device type -- the agent applies its physics knowledge:
+
+- Design the active region (mesa, channel, dot, junction, etc.)
+- Place contacts appropriate to the device type
+- Place gates if needed (topgate, sidegate, backgate, split-gate, etc.)
+- Ensure all components respect material region boundaries from ANALYZE
+
+The skill does NOT prescribe dimensions, shapes, or layer numbers. The agent derives these from:
+- Device type and physics requirements
+- Available material regions from ANALYZE
+- Layer assignments agreed in QUERY
+- User-specified constraints
+
+Use `screenshot` after each major geometry addition to visually verify placement.
+
+**Gate:** Device geometry is present on designated layers. Visual inspection via `screenshot` confirms correct placement.
+
+---
+
+## Step 5: ROUTE
+
+If the device has contacts that need fan-out to bonding pads:
+
+1. Place pin markers at contact positions via `execute_script` (on a temporary layer)
+2. Place bonding pads if not already present (via `execute_script`)
+3. Place pin markers at pad positions (on a temporary layer)
+4. Call `auto_route` MCP tool with appropriate parameters:
+   - `pin_layer_a`: contact pin layer
+   - `pin_layer_b`: pad pin layer
+   - `output_layer`: route layer
+   - `obstacle_layers`: device geometry layers to avoid
+   - Line width and safe distance as needed
+5. For failed pairs, write custom routing via `execute_script`
+6. Clean up temporary pin marker layers
+
+The agent decides routing topology, line widths, and obstacle avoidance based on device layout. The `nanodevice_routing` skill is available as a reference for multi-window EBL routing patterns, but is not required.
+
+**Gate:** All contacts connected to bonding pads. No route crossings.
+
+---
+
+## Step 6: EVALUATE
+
+Run the `evaluate_design` MCP tool with a check configuration composed by the agent based on what it designed.
+
+**Available check primitives:**
+
+| Primitive | Args | Measures |
+|-----------|------|----------|
+| `component_overlap` | component, region, region_op | Fraction of component area overlapping with region |
+| `component_containment` | component, region, region_op | Fraction of component area contained within region |
+| `contact_isolation` | component | Fraction of route pairs that don't cross |
+| `connectivity` | contact_component, pad_component, route_component, tolerance | Fraction of contacts reaching pads |
+| `route_endpoints` | route_component, target_components, tolerance | Fraction of route endpoints on valid targets |
+| `adjacency` | component_a, component_b, tolerance | Fraction of A shapes within tolerance of B |
+| `solidity` | component, threshold, direction | Shape solidity above/below threshold |
+| `spacing` | component_a, component_b, min_distance | Fraction of pairs meeting min distance |
+
+The `region` arg can be a single layer_map key or a list of keys combined via `region_op` (union, intersection, difference).
+
+**Example check list for a Hall bar:**
+```json
+{
+  "checks": [
+    {"name": "component_containment", "args": {"component": "mesa", "region": ["graphene", "graphite"], "region_op": "intersection"}, "weight": 0.2},
+    {"name": "adjacency", "args": {"component_a": "contact_patch", "component_b": "mesa", "tolerance": 2.0}, "weight": 0.15},
+    {"name": "solidity", "args": {"component": "mesa", "threshold": 0.5, "direction": "below"}, "weight": 0.15},
+    {"name": "contact_isolation", "args": {"component": "contact_route"}, "weight": 0.15},
+    {"name": "connectivity", "args": {"contact_component": "contact_patch", "pad_component": "bonding_pad", "route_component": "contact_route"}, "weight": 0.15},
+    {"name": "route_endpoints", "args": {"route_component": "contact_route", "target_components": ["contact_patch", "mesa", "bonding_pad"]}, "weight": 0.1},
+    {"name": "spacing", "args": {"component_a": "contact_patch", "min_distance": 1.0}, "weight": 0.1}
+  ]
+}
+```
+
+Also take a `screenshot` for visual inspection.
+
+- If score >= 0.80, proceed to SAVE
+- If score < 0.80, identify lowest-scoring check and iterate
+- Maximum 2 retries
+
+**Gate:** Evaluation score >= 0.80 and visual inspection passes.
+
+---
+
+## Step 7: SAVE
 
 1. Call `save_layout` to export the GDS file
 2. Write `result.json` containing:
+   - `device_type`: from QUERY
    - `layer_map`: all layer assignments used
    - `score`: final evaluation score
-   - `pixel_size`: validated pixel size
-   - `device_type`: from QUERY step
+   - `pixel_size`: if applicable
    - `pipeline_status`: per-step pass/fail/retry counts
+   - `checks`: the evaluation check configuration used
    - `feedback`: design notes and any user interventions
 
-**Gate condition for SAVE:** GDS file written successfully and result.json contains all required fields. Verify the output file exists.
+**Gate:** GDS file written and result.json contains all required fields.
 
 ---
 
 ## Retry Protocol
 
-Maximum of 2 retries per step. When a gate condition fails:
+Maximum 2 retries per step. When a gate fails:
 
 | Failed Step | Retry Action |
 |-------------|-------------|
-| VALIDATE | Re-ask user for pixel_size, re-run validation |
-| DETECT | Re-run flakedetect with adjusted parameters (cluster selection, thresholds) |
-| ALIGN | Re-run gdsalign with wider search range or different marker set |
-| CONTOUR | Re-run commit with corrected transform |
-| HALLBAR | Re-run failing sub-step (mesa, contacts, routing) per evaluate_design feedback |
+| PREPARE | Re-run detection with adjusted parameters |
+| ANALYZE | Re-inspect with different region computations |
+| DESIGN | Redesign failing component based on gate feedback |
+| ROUTE | Re-route with adjusted parameters or manual fallback |
+| EVALUATE | Re-run failing design sub-step per lowest-scoring check |
 
-If any step exhausts its 2 retries, stop the pipeline and report the failure to the user with diagnostic information. Do not proceed to subsequent steps with a failed prerequisite.
+If any step exhausts retries, stop and report to the user.
+
+---
+
+## What This Skill Prescribes
+
+- Step ordering (QUERY -> PREPARE -> ANALYZE -> DESIGN -> ROUTE -> EVALUATE -> SAVE)
+- Gate conditions before proceeding
+- Retry protocol (max 2 per step)
+- Which MCP tools to use: `execute_script`, `auto_route`, `evaluate_design`, `screenshot`, `get_layout_info`, `save_layout`, `validate_pixel_size`
+- Query checklist for completeness
+
+## What This Skill Does NOT Prescribe
+
+- Specific device geometries or dimensions
+- Specific layer numbers (agreed with user)
+- Specific material assumptions (agent derives from device type)
+- Specific evaluation weights (agent composes per device)
+- Specific routing topology (agent decides)
 
 ---
 
@@ -145,5 +223,5 @@ If any step exhausts its 2 retries, stop the pipeline and report the failure to 
 - **Conda env:** `base` (has opencv, numpy, scipy, sklearn)
 - **Pixel coordinates:** image origin at top-left; KLayout uses center origin with Y-flip
 - **Layer references:** always as `layer/datatype` (e.g., `11/0`)
-- **Output directory:** defaults to `<source_image_dir>/output/` if not specified
-- **Sub-skill dispatch:** each sub-skill runs as a subagent reading its own SKILL.md
+- **Output directory:** defaults to source image directory if not specified
+- **Sub-skill dispatch:** flakedetect and gdsalign sub-skills run as subagents reading their own SKILL.md
