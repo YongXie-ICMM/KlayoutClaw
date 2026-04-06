@@ -1,17 +1,27 @@
 #!/usr/bin/env python
-"""evaluate_worker.py -- Subprocess evaluator for device design quality checks.
+"""evaluate_worker.py -- Configurable device design evaluator.
 
 CLI: python evaluate_worker.py config.json
 
-Config JSON input: {gds_path, reference_gds (optional), layer_map, mode, output_path}
-Output JSON: {status, overall, mode, checks: [{name, score, weight, detail}]}
+Config JSON input:
+{
+    "gds_path": "result.gds",
+    "reference_gds": "reference.gds",  (optional, for checks that need ref layers)
+    "layer_map": {"mesa": [20, 0], "contact_patch": [21, 0], ...},
+    "checks": [
+        {"name": "component_containment", "args": {...}, "weight": 0.2},
+        ...
+    ],
+    "output_path": "output.json"
+}
+
+Output JSON: {status, overall, checks: [{name, score, weight, detail}]}
 """
 
 import sys
 import os
 import json
 
-# Pre-flight dependency check
 try:
     import gdstk
 except ImportError as e:
@@ -35,17 +45,7 @@ except ImportError as e:
 
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-REF_GRAPHENE = (11, 0)
-REF_GRAPHITE = (13, 0)
-
-REQUIRED_COMPONENTS = ["mesa", "contact_patch", "topgate", "contact_route", "bonding_pad"]
-
-
-# ---------------------------------------------------------------------------
-# Geometry helpers
+# Geometry helpers (unchanged from original)
 # ---------------------------------------------------------------------------
 
 def _to_shapely(points):
@@ -83,7 +83,6 @@ def _component_union(lib, layer_map, name):
     spec = layer_map.get(name)
     if spec is None:
         return sg.Polygon()
-    # Support both [layer, datatype] and [[layer, datatype], ...] formats
     if isinstance(spec[0], (list, tuple)):
         pairs = spec
     else:
@@ -108,13 +107,8 @@ def _component_list(lib, layer_map, name):
     return all_shapes
 
 
-def _ref_material(lib, layer_spec):
-    shapes = _extract_shapely(lib, *layer_spec)
-    return unary_union(shapes) if shapes else sg.Polygon()
-
-
-def _get_spine_endpoints(lib, layer_map):
-    spec = layer_map.get("contact_route")
+def _get_spine_endpoints(lib, layer_map, component="contact_route"):
+    spec = layer_map.get(component)
     if spec is None:
         return []
     if isinstance(spec[0], (list, tuple)):
@@ -152,60 +146,80 @@ def _get_spine_endpoints(lib, layer_map):
 
 
 # ---------------------------------------------------------------------------
-# Check functions
+# Region resolution
 # ---------------------------------------------------------------------------
 
-def _check_mesa_on_overlap(out_lib, ref_lib, layer_map):
-    """Check 1: mesa_on_overlap (0.15) -- needs reference GDS."""
+def _resolve_region(out_lib, ref_lib, layer_map, region_spec, region_op="union"):
+    """Resolve a region specification to a shapely geometry.
+
+    region_spec: a layer_map key (str) or list of keys.
+    region_op: "union", "intersection", or "difference" (applied left-to-right).
+    Uses ref_lib if available, falls back to out_lib.
+    """
+    if isinstance(region_spec, str):
+        region_spec = [region_spec]
+
+    lib = ref_lib if ref_lib is not None else out_lib
+    regions = []
+    for key in region_spec:
+        r = _component_union(lib, layer_map, key)
+        if r.is_empty:
+            r = _component_union(out_lib, layer_map, key)
+        regions.append(r)
+
+    if not regions:
+        return sg.Polygon()
+
+    result = regions[0]
+    for r in regions[1:]:
+        if region_op == "intersection":
+            result = result.intersection(r)
+        elif region_op == "difference":
+            result = result.difference(r)
+        else:
+            result = result.union(r)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Check primitives
+# ---------------------------------------------------------------------------
+
+def _prim_component_overlap(out_lib, ref_lib, layer_map, args):
+    """Fraction of component area overlapping with region."""
     try:
-        mesa = _component_union(out_lib, layer_map, "mesa")
-        if mesa.is_empty:
+        comp = _component_union(out_lib, layer_map, args["component"])
+        if comp.is_empty:
             return 0.0
-        graphene = _ref_material(ref_lib, REF_GRAPHENE)
-        graphite = _ref_material(ref_lib, REF_GRAPHITE)
-        if graphene.is_empty or graphite.is_empty:
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 args["region"], args.get("region_op", "union"))
+        if region.is_empty:
             return 0.0
-        overlap = graphene.intersection(graphite)
-        if overlap.is_empty:
-            return 0.0
-        return mesa.intersection(overlap).area / mesa.area
+        return comp.intersection(region).area / comp.area
     except Exception:
         return 0.0
 
 
-def _check_contacts_in_regions(out_lib, ref_lib, layer_map):
-    """Check 2: contacts_in_regions (0.15) -- needs reference GDS."""
+def _prim_component_containment(out_lib, ref_lib, layer_map, args):
+    """Fraction of component area contained within region."""
     try:
-        patches = _component_list(out_lib, layer_map, "contact_patch")
-        if not patches:
+        comp = _component_union(out_lib, layer_map, args["component"])
+        if comp.is_empty:
             return 0.0
-        graphene = _ref_material(ref_lib, REF_GRAPHENE)
-        graphite = _ref_material(ref_lib, REF_GRAPHITE)
-        graphene_only = graphene.difference(graphite) if not graphene.is_empty else sg.Polygon()
-        graphite_only = graphite.difference(graphene) if not graphite.is_empty else sg.Polygon()
-        correct = sum(1 for p in patches if graphene_only.contains(p.centroid) or graphite_only.contains(p.centroid))
-        return correct / len(patches)
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 args["region"], args.get("region_op", "union"))
+        if region.is_empty:
+            return 0.0
+        return comp.intersection(region).area / comp.area
     except Exception:
         return 0.0
 
 
-def _check_topgate(out_lib, layer_map):
-    """Check 3: topgate (0.10) -- no reference needed."""
+def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
+    """Fraction of route pairs that don't cross."""
     try:
-        topgate = _component_union(out_lib, layer_map, "topgate")
-        mesa = _component_union(out_lib, layer_map, "mesa")
-        routes = _component_union(out_lib, layer_map, "contact_route")
-        coverage = 1.0 if (not topgate.is_empty and not mesa.is_empty and topgate.intersection(mesa).area > 0) else 0.0
-        isolation = 1.0 if (topgate.is_empty or routes.is_empty or topgate.intersection(routes).area < 1.0) else 0.0
-        return 0.5 * coverage + 0.5 * isolation
-    except Exception:
-        return 0.0
-
-
-def _check_contact_isolation(out_lib, layer_map):
-    """Check 4: contact_isolation (0.10) -- no reference needed."""
-    try:
-        routes = _component_list(out_lib, layer_map, "contact_route")
+        route_comp = args.get("component", "contact_route")
+        routes = _component_list(out_lib, layer_map, route_comp)
         if len(routes) < 2:
             return 1.0 if routes else 0.0
         n = len(routes)
@@ -216,6 +230,32 @@ def _check_contact_isolation(out_lib, layer_map):
                 if routes[i].intersection(routes[j]).area > 1.0:
                     crossing += 1
         return (total_pairs - crossing) / total_pairs
+    except Exception:
+        return 0.0
+
+
+def _prim_connectivity(out_lib, ref_lib, layer_map, args):
+    """Fraction of contacts that reach a bonding pad via routes."""
+    try:
+        contact_comp = args.get("contact_component", "contact_patch")
+        pad_comp = args.get("pad_component", "bonding_pad")
+        route_comp = args.get("route_component", "contact_route")
+        tolerance = args.get("tolerance", 15.0)
+
+        patches = _component_list(out_lib, layer_map, contact_comp)
+        pads = _component_union(out_lib, layer_map, pad_comp)
+        if not patches or pads.is_empty:
+            return 0.0
+        pads_buf = pads.buffer(tolerance)
+        route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
+        if not route_eps:
+            return 0.0
+        connected = 0
+        for patch in patches:
+            center = np.array(patch.centroid.coords[0])
+            if _can_reach_pad(center, route_eps, pads_buf, tolerance):
+                connected += 1
+        return connected / len(patches)
     except Exception:
         return 0.0
 
@@ -243,38 +283,19 @@ def _can_reach_pad(start, route_eps, pads_buf, tolerance):
     return False
 
 
-def _check_connectivity(out_lib, layer_map, tolerance=15.0):
-    """Check 5: connectivity (0.10) -- no reference needed."""
+def _prim_route_endpoints(out_lib, ref_lib, layer_map, args):
+    """Fraction of route endpoints that land on valid targets."""
     try:
-        patches = _component_list(out_lib, layer_map, "contact_patch")
-        pads = _component_union(out_lib, layer_map, "bonding_pad")
-        if not patches or pads.is_empty:
-            return 0.0
-        pads_buf = pads.buffer(tolerance)
-        route_eps = _get_spine_endpoints(out_lib, layer_map)
+        route_comp = args.get("route_component", "contact_route")
+        target_components = args.get("target_components", ["contact_patch", "mesa", "bonding_pad"])
+        tolerance = args.get("tolerance", 15.0)
+
+        route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
         if not route_eps:
             return 0.0
-        connected = 0
-        for patch in patches:
-            center = np.array(patch.centroid.coords[0])
-            if _can_reach_pad(center, route_eps, pads_buf, tolerance):
-                connected += 1
-        return connected / len(patches)
-    except Exception:
-        return 0.0
-
-
-def _check_route_endpoints(out_lib, layer_map, tolerance=15.0):
-    """Check 6: route_endpoints (0.10) -- no reference needed."""
-    try:
-        route_eps = _get_spine_endpoints(out_lib, layer_map)
-        if not route_eps:
-            return 0.0
-        device = _component_union(out_lib, layer_map, "contact_patch")
-        mesa = _component_union(out_lib, layer_map, "mesa")
-        pads = _component_union(out_lib, layer_map, "bonding_pad")
         target = sg.Polygon()
-        for g in [device, mesa, pads]:
+        for comp_name in target_components:
+            g = _component_union(out_lib, layer_map, comp_name)
             if not g.is_empty:
                 target = target.union(g) if not target.is_empty else g
         if target.is_empty:
@@ -303,72 +324,84 @@ def _check_route_endpoints(out_lib, layer_map, tolerance=15.0):
         return 0.0
 
 
-def _check_contact_mesa_adjacency(out_lib, layer_map, tolerance=2.0):
-    """Check 7: contact_mesa_adjacency (0.15) -- no reference needed."""
+def _prim_adjacency(out_lib, ref_lib, layer_map, args):
+    """Fraction of component_a shapes within tolerance of component_b."""
     try:
-        patches = _component_list(out_lib, layer_map, "contact_patch")
-        if not patches:
+        shapes_a = _component_list(out_lib, layer_map, args["component_a"])
+        if not shapes_a:
             return 0.0
-        mesa = _component_union(out_lib, layer_map, "mesa")
-        if mesa.is_empty:
+        comp_b = _component_union(out_lib, layer_map, args["component_b"])
+        if comp_b.is_empty:
             return 0.0
-        mesa_buf = mesa.buffer(tolerance)
-        return sum(1 for p in patches if mesa_buf.intersects(p)) / len(patches)
+        tolerance = args.get("tolerance", 2.0)
+        comp_b_buf = comp_b.buffer(tolerance)
+        return sum(1 for s in shapes_a if comp_b_buf.intersects(s)) / len(shapes_a)
     except Exception:
         return 0.0
 
 
-def _check_mesa_probes(out_lib, layer_map):
-    """Check 8: mesa_probes (0.15) -- no reference needed."""
+def _prim_solidity(out_lib, ref_lib, layer_map, args):
+    """Score based on shape solidity relative to threshold."""
     try:
-        mesa = _component_union(out_lib, layer_map, "mesa")
-        if mesa.is_empty:
+        comp = _component_union(out_lib, layer_map, args["component"])
+        if comp.is_empty:
             return 0.0
-        hull = mesa.convex_hull
+        hull = comp.convex_hull
         if hull.is_empty or hull.area == 0:
             return 0.0
-        solidity = mesa.area / hull.area
-        return max(0.0, min(1.0, 1.0 - solidity))
+        solidity = comp.area / hull.area
+        threshold = args.get("threshold", 0.5)
+        direction = args.get("direction", "below")
+        if direction == "below":
+            return max(0.0, min(1.0, 1.0 - solidity)) if solidity < threshold else 0.0
+        else:
+            return max(0.0, min(1.0, solidity)) if solidity >= threshold else 0.0
+    except Exception:
+        return 0.0
+
+
+def _prim_spacing(out_lib, ref_lib, layer_map, args):
+    """Fraction of component pairs meeting minimum distance."""
+    try:
+        shapes_a = _component_list(out_lib, layer_map, args["component_a"])
+        comp_b_name = args.get("component_b", args["component_a"])
+        if comp_b_name == args["component_a"]:
+            shapes_b = shapes_a
+        else:
+            shapes_b = _component_list(out_lib, layer_map, comp_b_name)
+        if not shapes_a or not shapes_b:
+            return 0.0
+        min_distance = args.get("min_distance", 1.0)
+        same = (comp_b_name == args["component_a"])
+        total = 0
+        ok = 0
+        for i, sa in enumerate(shapes_a):
+            start_j = i + 1 if same else 0
+            for j in range(start_j, len(shapes_b)):
+                if same and i == j:
+                    continue
+                total += 1
+                if sa.distance(shapes_b[j]) >= min_distance:
+                    ok += 1
+        return ok / total if total > 0 else 1.0
     except Exception:
         return 0.0
 
 
 # ---------------------------------------------------------------------------
-# Check registry with weights
+# Primitive registry
 # ---------------------------------------------------------------------------
 
-ALL_CHECKS = [
-    ("mesa_on_overlap", 0.15, True),      # needs reference
-    ("contacts_in_regions", 0.15, True),   # needs reference
-    ("topgate", 0.10, False),
-    ("contact_isolation", 0.10, False),
-    ("connectivity", 0.10, False),
-    ("route_endpoints", 0.10, False),
-    ("contact_mesa_adjacency", 0.15, False),
-    ("mesa_probes", 0.15, False),
-]
-
-
-def _run_check(name, out_lib, ref_lib, layer_map):
-    """Run a single check by name and return the score."""
-    if name == "mesa_on_overlap":
-        return _check_mesa_on_overlap(out_lib, ref_lib, layer_map)
-    elif name == "contacts_in_regions":
-        return _check_contacts_in_regions(out_lib, ref_lib, layer_map)
-    elif name == "topgate":
-        return _check_topgate(out_lib, layer_map)
-    elif name == "contact_isolation":
-        return _check_contact_isolation(out_lib, layer_map)
-    elif name == "connectivity":
-        return _check_connectivity(out_lib, layer_map)
-    elif name == "route_endpoints":
-        return _check_route_endpoints(out_lib, layer_map)
-    elif name == "contact_mesa_adjacency":
-        return _check_contact_mesa_adjacency(out_lib, layer_map)
-    elif name == "mesa_probes":
-        return _check_mesa_probes(out_lib, layer_map)
-    else:
-        return 0.0
+PRIMITIVES = {
+    "component_overlap": _prim_component_overlap,
+    "component_containment": _prim_component_containment,
+    "contact_isolation": _prim_contact_isolation,
+    "connectivity": _prim_connectivity,
+    "route_endpoints": _prim_route_endpoints,
+    "adjacency": _prim_adjacency,
+    "solidity": _prim_solidity,
+    "spacing": _prim_spacing,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +409,6 @@ def _run_check(name, out_lib, ref_lib, layer_map):
 # ---------------------------------------------------------------------------
 
 def _write_error(output_path, message):
-    """Write structured error JSON and exit 0."""
     result = {"status": "error", "error": message}
     with open(output_path, "w") as f:
         json.dump(result, f)
@@ -399,46 +431,40 @@ def main():
     gds_path = config.get("gds_path", "")
     reference_gds = config.get("reference_gds", None)
     layer_map = config.get("layer_map", {})
-    mode = config.get("mode", "score")
+    checks = config.get("checks", None)
     output_path = config.get("output_path", "output.json")
 
-    if mode not in ("score", "drc"):
-        _write_error(output_path, "Invalid mode '{}'. Must be 'score' or 'drc'.".format(mode))
-        sys.exit(0)
+    if checks is None:
+        _write_error(output_path, "Config must include 'checks' list.")
 
-    # Validate required layer_map keys
-    missing = [k for k in REQUIRED_COMPONENTS if k not in layer_map]
-    if missing:
-        _write_error(output_path, "layer_map missing required keys: {}".format(", ".join(missing)))
+    if not isinstance(checks, list) or len(checks) == 0:
+        _write_error(output_path, "'checks' must be a non-empty list.")
 
-    # Validate score mode requires reference_gds
-    if mode == "score" and not reference_gds:
-        _write_error(output_path, "mode='score' requires reference_gds in config")
-
-    # Validate GDS file exists
     if not os.path.isfile(gds_path):
         _write_error(output_path, "GDS file not found: {}".format(gds_path))
 
-    # Validate reference GDS exists (if provided)
     if reference_gds and not os.path.isfile(reference_gds):
         _write_error(output_path, "Reference GDS file not found: {}".format(reference_gds))
 
+    # Validate check names
+    for i, check in enumerate(checks):
+        name = check.get("name", "")
+        if name not in PRIMITIVES:
+            _write_error(output_path,
+                "Check {}: unknown primitive '{}'. Available: {}".format(
+                    i, name, ", ".join(sorted(PRIMITIVES.keys()))))
+
     # Load GDS files
     out_lib = gdstk.read_gds(gds_path)
-    ref_lib = None
-    if reference_gds:
-        ref_lib = gdstk.read_gds(reference_gds)
-
-    # Select checks based on mode
-    if mode == "drc":
-        checks_to_run = [(name, weight, needs_ref) for name, weight, needs_ref in ALL_CHECKS if not needs_ref]
-    else:
-        checks_to_run = ALL_CHECKS
+    ref_lib = gdstk.read_gds(reference_gds) if reference_gds else None
 
     # Run checks
     results = []
-    for name, weight, needs_ref in checks_to_run:
-        score = _run_check(name, out_lib, ref_lib, layer_map)
+    for check in checks:
+        name = check["name"]
+        args = check.get("args", {})
+        weight = check.get("weight", 1.0 / len(checks))
+        score = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
         score = max(0.0, min(1.0, float(score)))
         results.append({
             "name": name,
@@ -447,17 +473,16 @@ def main():
             "detail": "{}: {:.4f}".format(name, score),
         })
 
-    # Compute overall score
-    weighted_sum = sum(c["score"] * c["weight"] for c in results)
-    if mode == "drc":
-        overall = round(weighted_sum / 0.70, 6)
+    # Compute overall score (weighted sum)
+    total_weight = sum(c["weight"] for c in results)
+    if total_weight > 0:
+        overall = round(sum(c["score"] * c["weight"] for c in results) / total_weight, 6)
     else:
-        overall = round(weighted_sum, 6)
+        overall = 0.0
 
     output = {
         "status": "ok",
         "overall": overall,
-        "mode": mode,
         "checks": results,
     }
 
