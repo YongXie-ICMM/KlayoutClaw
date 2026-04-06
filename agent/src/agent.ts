@@ -6,6 +6,7 @@
 
 import { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Api } from "@mariozechner/pi-ai";
 import {
   AgentSession,
   SessionManager,
@@ -123,7 +124,7 @@ export async function createDesignSession(
     modelRegistry.registerProvider(providerName, {
       baseUrl: providerConfig.baseUrl,
       apiKey: providerConfig.apiKey,
-      api: providerConfig.api as "anthropic-messages",
+      api: providerConfig.api as Api,
       models: providerConfig.models as Array<{ id: string; name: string; reasoning: boolean; input: ("text" | "image")[]; cost: { input: number; output: number; cacheRead: number; cacheWrite: number }; contextWindow: number; maxTokens: number }>,
     });
     if (providerConfig.apiKey) {
