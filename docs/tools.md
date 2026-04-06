@@ -200,13 +200,13 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 
 ## evaluate_design
 
-Evaluate a device design against spatial quality checks. Runs `tools/evaluate_worker.py` as a subprocess. In **score** mode (with reference GDS) runs 8 weighted checks; in **drc** mode runs 6 DRC-only checks without reference. Returns per-check scores and a weighted overall score.
+Evaluate a device design against configurable geometric quality checks. Runs `tools/evaluate_worker.py` as a subprocess. Accepts a list of check primitives with per-check weights. Returns per-check scores and a weighted overall score.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `layer_map` | object | yes | | Map of component names to `[layer, datatype]` arrays. Required keys: `mesa`, `contact_patch`, `topgate`, `contact_route`, `bonding_pad` |
-| `reference_gds` | string | no | | Path to reference GDS with flake polygons (required for score mode) |
-| `mode` | string | no | `"score"` | Evaluation mode: `"score"` (all 8 checks, needs reference) or `"drc"` (checks 3-8 only) |
+| `checks` | array | yes | | List of check objects: `[{name, args, weight}]`. See primitives below. |
+| `layer_map` | object | yes | | Map of component names to `[layer, datatype]` arrays. Keys are referenced by check args. |
+| `reference_gds` | string | no | | Path to reference GDS (for checks that need reference layers) |
 | `python_path` | string | no | | Path to python binary with gdstk/shapely/numpy (overrides `conda_env`) |
 | `conda_env` | string | no | `"base"` | Conda environment with gdstk/shapely/numpy |
 
@@ -215,29 +215,24 @@ Evaluate a device design against spatial quality checks. Runs `tools/evaluate_wo
 {
   "status": "ok",
   "overall": 0.8234,
-  "mode": "score",
   "checks": [
-    {"name": "mesa_on_overlap", "score": 0.95, "weight": 0.15, "detail": "mesa_on_overlap: 0.9500"},
-    {"name": "contacts_in_regions", "score": 0.90, "weight": 0.15, "detail": "contacts_in_regions: 0.9000"},
-    {"name": "topgate", "score": 0.80, "weight": 0.10, "detail": "topgate: 0.8000"},
-    {"name": "contact_isolation", "score": 0.70, "weight": 0.10, "detail": "contact_isolation: 0.7000"},
-    {"name": "connectivity", "score": 0.85, "weight": 0.10, "detail": "connectivity: 0.8500"},
-    {"name": "route_endpoints", "score": 0.60, "weight": 0.10, "detail": "route_endpoints: 0.6000"},
-    {"name": "contact_mesa_adjacency", "score": 0.75, "weight": 0.15, "detail": "contact_mesa_adjacency: 0.7500"},
-    {"name": "mesa_probes", "score": 0.80, "weight": 0.15, "detail": "mesa_probes: 0.8000"}
+    {"name": "component_containment", "score": 0.95, "weight": 0.2, "detail": "component_containment: 0.9500"},
+    {"name": "contact_isolation", "score": 1.0, "weight": 0.15, "detail": "contact_isolation: 1.0000"}
   ]
 }
 ```
 
-**Checks (8 total, weights sum to 1.0):**
-- `mesa_on_overlap` (0.15) — mesa placed on flake overlap region (needs reference)
-- `contacts_in_regions` (0.15) — contacts in single-material regions (needs reference)
-- `topgate` (0.10) — topgate isolation from mesa edges and contacts
-- `contact_isolation` (0.10) — contacts have proper isolation gaps
-- `connectivity` (0.10) — all components connected in the layout
-- `route_endpoints` (0.10) — routes terminate at correct contact/pad locations
-- `contact_mesa_adjacency` (0.15) — contacts adjacent to mesa edges
-- `mesa_probes` (0.15) — mesa has proper probe arm geometry (low solidity)
+**Available check primitives (8):**
+- `component_overlap` — fraction of component area overlapping with region
+- `component_containment` — fraction of component area contained within region
+- `contact_isolation` — fraction of route pairs that don't cross
+- `connectivity` — fraction of contacts that reach a bonding pad
+- `route_endpoints` — fraction of route endpoints on valid targets
+- `adjacency` — fraction of A shapes within tolerance of B
+- `solidity` — shape solidity above/below threshold
+- `spacing` — fraction of component pairs meeting minimum distance
+
+The `region` arg can be a single `layer_map` key or a list of keys combined via `region_op` (union, intersection, difference).
 
 **Dependencies (subprocess):** gdstk, shapely, numpy
 

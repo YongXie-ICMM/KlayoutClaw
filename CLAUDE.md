@@ -63,10 +63,8 @@ KlayoutClaw/
 │   │       ├── detect_markers.py  # Template-match markers in image
 │   │       ├── align_gds.py       # Compute similarity transform
 │   │       └── commit_gds.py      # Warp image + contours, commit to KLayout
-│   ├── nanodevice_hallbar/
-│   │   └── SKILL.md              # Hall bar device design (adaptive geometry)
 │   ├── nanodevice_e2e_design/
-│   │   └── SKILL.md              # E2E pipeline orchestrator
+│   │   └── SKILL.md              # E2E device design methodology (device-agnostic)
 │   ├── nanodevice_routing/
 │   │   ├── SKILL.md
 │   │   └── scripts/
@@ -102,7 +100,7 @@ KlayoutClaw/
 │   └── test_autoroute.sh         # E2E autoroute test
 ├── docs/
 │   ├── tools.md                  # MCP tool reference (8 tools)
-│   ├── skills.md                 # Skills CLI reference (geometry, display, image, visual, nanodevice_flakedetect, nanodevice_gdsalign, nanodevice_routing, nanodevice_hallbar, nanodevice_e2e_design)
+│   ├── skills.md                 # Skills CLI reference (geometry, display, image, visual, nanodevice_flakedetect, nanodevice_gdsalign, nanodevice_routing, nanodevice_e2e_design)
 │   ├── ui-plugin.md              # UI plugin architecture + pya Qt pitfalls
 │   └── plans/                    # Architecture design docs
 │       ├── 2026-03-08-qtcpserver-mcp-design.md

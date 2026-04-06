@@ -392,41 +392,26 @@ See `skills/nanodevice_flakedetect/SKILL.md` for the orchestrator workflow, and 
 
 ---
 
-## Hall Bar Design (nanodevice_hallbar)
+## End-to-End Device Design (nanodevice_e2e_design)
 
-Design Hall bar devices on van der Waals heterostructure flakes with adaptive geometry, physics-based constraints, and automated evaluation. All dimensions derive from the actual flake geometry, not from fixed formulas.
+Device-agnostic methodology for designing nanodevices on material regions in KLayout. The agent follows a 7-step reasoning pipeline, deriving device-specific physics rules from context and user input. No device type is hardcoded.
 
-This is a pure-text skill with no scripts. The agent uses `execute_script`, `get_layout_info`, `evaluate_design`, `save_layout`, and the `nanodevice_routing` skill to implement each step.
-
-### Key Constraints
-- Mesa solidity must be < 0.5 (proper Hall bar shape with arms)
-- Contacts must be placed in single-material regions
-- Topgate must maintain isolation gap from mesa edges and contacts
-
-### Full Documentation
-
-See `skills/nanodevice_hallbar/SKILL.md` for the complete adaptive design workflow and constraint specification.
-
----
-
-## End-to-End Design Pipeline (nanodevice_e2e_design)
-
-Orchestrate the full end-to-end nanodevice design pipeline, from user query through flake detection, GDS alignment, contour commit, Hall bar design, and final save. Sequences sub-skills with gate conditions and retry logic.
-
-This is a pure-text orchestrator skill with no scripts directory. The agent dispatches sub-skills and tools at each step.
+This is a pure-text orchestrator skill with no scripts directory. The agent dispatches sub-skills and MCP tools at each step.
 
 ### Pipeline Steps
-1. Query parsing and validation
-2. Flake detection (nanodevice_flakedetect)
-3. GDS alignment (nanodevice_gdsalign)
-4. Contour commit
-5. Hall bar design (nanodevice_hallbar)
-6. Routing (nanodevice_routing)
-7. Final save and evaluation
+1. QUERY — gather device type, material regions, layer assignments
+2. PREPARE — run flake detection + GDS alignment (optional, only if microscope images provided)
+3. ANALYZE — study material regions, compute overlaps/exclusions
+4. DESIGN — create device geometry via `execute_script`
+5. ROUTE — connect contacts to bonding pads via `auto_route`
+6. EVALUATE — run configurable evaluator with device-appropriate checks
+7. SAVE — export GDS + write result.json
+
+Steps are conditional: QUERY is skipped if all info is provided, PREPARE is skipped if no images are given, ROUTE is skipped if the device has no external contacts.
 
 ### Full Documentation
 
-See `skills/nanodevice_e2e_design/SKILL.md` for the complete orchestration workflow and gate conditions.
+See `skills/nanodevice_e2e_design/SKILL.md` for the complete methodology, gate conditions, retry protocol, and check primitives.
 
 ---
 
