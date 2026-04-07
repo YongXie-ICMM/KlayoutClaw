@@ -23,15 +23,43 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "nanodevi
 from core import morph_clean, flood_fill_holes, keep_largest_n, mask_centroid
 
 
+def _grabcut_refine_source(image, mask):
+    """GrabCut refinement for source flake — cleans edges to crystallographic facets."""
+    h, w = image.shape[:2]
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+
+    gc_mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+    gc_mask[cv2.dilate(mask, dilate_k) > 0] = cv2.GC_PR_BGD
+    gc_mask[mask > 0] = cv2.GC_PR_FGD
+    gc_mask[cv2.erode(mask, erode_k) > 0] = cv2.GC_FGD
+
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(image, gc_mask, None, bgd, fgd, 8, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return mask
+
+    result = np.where(
+        (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
+
+    result = morph_clean(result, close_k=15, open_k=7)
+    result = keep_largest_n(result, n=1, min_area=5000)
+    result = flood_fill_holes(result)
+    return result
+
+
 def segment_flake(image, gray_only=False):
     """Segment the largest flake using Otsu auto-thresholding.
 
-    Applies Otsu on grayscale (bright regions) AND on HSV saturation
-    (colored regions). The intersection isolates bright + saturated
-    pixels, which typically correspond to flakes on PDMS substrate.
+    Uses OR(gray_otsu, sat_otsu) to capture both thick (dark, high-sat)
+    and thin (bright, low-sat) regions of multi-thickness hBN flakes.
+    GrabCut refines edges to crystallographic facets.
 
     When gray_only=True, uses grayscale Otsu only (skips saturation).
-    This captures very bright/overexposed areas that have low saturation.
 
     Args:
         image: BGR image (uint8).
@@ -54,13 +82,16 @@ def segment_flake(image, gray_only=False):
         # Otsu on saturation — separates colored flake from unsaturated substrate
         _, mask_sat = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Intersection: must be both bright AND saturated
-        mask = cv2.bitwise_and(mask_gray, mask_sat)
+        # Union: captures both thick (dark, high-sat) and thin (bright, low-sat) hBN
+        mask = cv2.bitwise_or(mask_gray, mask_sat)
 
     # Morphological cleanup
-    mask = morph_clean(mask, close_k=15, open_k=11)
+    mask = morph_clean(mask, close_k=5, open_k=3)
     mask = keep_largest_n(mask, n=1, min_area=5000)
     mask = flood_fill_holes(mask)
+
+    # GrabCut refinement for clean crystallographic edges
+    mask = _grabcut_refine_source(image, mask)
 
     return mask
 
