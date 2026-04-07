@@ -176,14 +176,20 @@ Max refine.py invocations: 2. Each takes 10-15 min — 3 would consume 45 min.
 
 ```bash
 conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/sift_align.py \
-    --source <image> --target <image> --pixel-size <um/px> --output-dir <path>
+    --source <image> --target <image> --pixel-size <um/px> --output-dir <path> \
+    [--min-inliers 20] [--scalebar-bottom 0.08] [--scalebar-right 0.20]
 ```
+
+Optional:
+- `--min-inliers N` — minimum RANSAC inliers for "sufficient" quality (default: 20). Thresholds: good ≥ max(50, 2N), warning ≥ N, insufficient < N. Lower to 10 for images with few substrate features.
+- `--scalebar-bottom F` — fraction of image height to mask from bottom to exclude scalebar (default: 0.08). Set to 0 to disable.
+- `--scalebar-right F` — fraction of image width to mask from right to exclude scalebar (default: 0.20). Set to 0 to disable.
 
 | Exit code | Meaning | Agent action |
 |-----------|---------|-------------|
 | 0, ≥50 inliers | Good alignment | Done. Use warp_sift_bottom.npy |
-| 0, 20-49 inliers | Marginal alignment | Accept with warning. Check 01_sift_matches.png |
-| 2 | Too few matches | Switch to Chamfer pipeline |
+| 0, ≥min-inliers | Marginal alignment | Accept with warning. Check 01_sift_matches.png |
+| 2 | Too few matches (<min-inliers) | Try `--min-inliers 10`. If still fails, switch to Chamfer pipeline |
 | 1 | Error | Check stderr |
 
 **Outputs**: `warp_sift_bottom.npy`, `01_sift_matches.png`, `01_sift_overlay.png` (magenta-tinted warped source on desaturated target), updates `alignment_report.json`

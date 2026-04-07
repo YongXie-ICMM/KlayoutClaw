@@ -13,7 +13,8 @@ Graphite and graphene use a **two-pass candidate workflow**: first run auto-sele
 
 - Conda env with opencv, numpy, scikit-learn
 - Source images for each material
-- For bottom_hbn and top_hbn: `footprint_mask.png` from the align step
+- For bottom_hbn: `warp_sift_bottom.npy` from the align step + `full_stack_raw.jpg` for warp target
+- For top_hbn: `footprint_mask.png` from the align step
 - All scripts: `conda run -n instrMCPdev python <script>`
 
 ---
@@ -31,7 +32,7 @@ All 4 scripts are independent — run them in any order (or parallel, to save ti
    → Review 00_graphene_candidates.png — is the auto-selected cluster correct?
    → If wrong: re-run with --cluster-id <N>
 
-3. Run bottom_hbn.py on full_stack_raw (needs footprint_mask from align)
+3. Run bottom_hbn.py on bottom_part (needs warp_sift_bottom.npy from align + full_stack_raw for target)
    → Review 03_bottom_hbn_on_full.png
 
 4. Run top_hbn.py (copies footprint from align)
@@ -114,23 +115,24 @@ conda run -n instrMCPdev python graphene.py \
 
 ## Bottom hBN Detection — Tuning Guide
 
-**Method**: Independent K-means (8 clusters) in LAB space on the full_stack image. Selects clusters with hBN-like color signature (high saturation, blue hue) that are NOT predominantly inside the top hBN footprint. Unions with footprint and keeps the connected component overlapping it.
+**Method**: Detects the bottom hBN directly from the `bottom_part` image (where it is the only hBN visible on SiO2 substrate), then warps the detection into full_stack coordinates using the SIFT warp matrix from the align step. K-means (8 clusters) in LAB space selects clusters with hBN-like color (high saturation, blue hue). The largest connected component is kept.
 
-This script usually works well without tuning. The footprint mask from align effectively separates top and bottom hBN.
+This approach is more robust than detecting from full_stack because the bottom_part has no top flake to confuse the clustering.
 
 ### When it fails
 
 | What you see in 03_bottom_hbn_on_full.png | What's wrong | Action |
 |------------------------------------------|-------------|--------|
 | Contour traces the full bottom hBN boundary | Nothing | Proceed |
-| Contour is much larger than expected (includes substrate) | Substrate cluster misidentified as hBN | Re-run with `--n-clusters 12` for finer color separation |
-| Contour misses parts of the bottom hBN | Not enough hBN clusters selected | Re-run with `--n-clusters 12` (more clusters = finer hBN boundary) |
-| Contour includes part of the top hBN | Footprint mask incomplete | Go back and improve the align footprint |
+| Contour is offset from the visible flake | SIFT warp is inaccurate | Check SIFT inliers in align step. Re-run sift_align with `--min-inliers 10` |
+| Contour is much larger than expected | Multiple hBN flakes merged by morph_clean | Re-run with `--n-clusters 12` for finer color separation |
+| Contour misses parts of the bottom hBN | Not enough hBN clusters selected | Re-run with `--n-clusters 12` (more clusters = finer boundary) |
 
 ```bash
 conda run -n instrMCPdev python bottom_hbn.py \
-    --image <full_stack_raw.jpg> \
-    --footprint-mask <align/footprint_mask.png> \
+    --image <bottom_part.jpg> \
+    --warp-matrix <align/warp_sift_bottom.npy> \
+    --target-image <full_stack_raw.jpg> \
     --pixel-size <um/px> --output-dir <path>
 ```
 
@@ -221,9 +223,9 @@ After all 4 scripts complete, assemble `detections.json` by reading each `*_resu
 
 Each detect script operates in its source image's native coordinate system. The combine step handles all transforms.
 
-| Material | Source Image | Coordinate System | Mirror |
-|----------|-------------|-------------------|--------|
-| graphite | bottom_part | bottom_part | no |
-| graphene | top_part | top_part (mirrored if --mirror) | depends |
-| bottom_hBN | full_stack_raw | full_stack | no |
-| top_hBN | full_stack_raw | full_stack | no |
+| Material | Source Image | Detection Coords | Output Coords | Mirror |
+|----------|-------------|-----------------|---------------|--------|
+| graphite | bottom_part | bottom_part | bottom_part | no |
+| graphene | top_part | top_part | top_part (mirrored if --mirror) | depends |
+| bottom_hBN | bottom_part | bottom_part → warped to full_stack | full_stack | no |
+| top_hBN | full_stack_raw | full_stack | full_stack | no |

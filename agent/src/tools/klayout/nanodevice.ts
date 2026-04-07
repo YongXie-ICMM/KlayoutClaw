@@ -110,6 +110,9 @@ function registerFlakedetectTools(): CodeGenTool[] {
         bottom_part_image: { type: "string", description: "Path to bottom-part image (SIFT alignment)" },
         top_part_image: { type: "string", description: "Path to top-part image (Chamfer alignment)" },
         pixel_size: { type: "number", description: "Microns per pixel" },
+        min_inliers: { type: "number", description: "Minimum RANSAC inliers for SIFT (default: 20, lower to 10 for sparse images)", default: 20 },
+        scalebar_bottom: { type: "number", description: "Fraction of image height to mask from bottom for scalebar exclusion (default: 0.08)", default: 0.08 },
+        scalebar_right: { type: "number", description: "Fraction of image width to mask from right for scalebar exclusion (default: 0.20)", default: 0.20 },
         output_dir: { type: "string", description: "Output directory for alignment artifacts" },
       },
       ["full_stack_image", "pixel_size", "output_dir"],
@@ -122,9 +125,9 @@ function registerFlakedetectTools(): CodeGenTool[] {
           read_first: "Read the skill_doc for detailed workflow, visual checks, and retry protocol.",
           scripts: {
             "1_sift_align": {
-              command: `python ${scriptsDir}/sift_align.py <bottom_part_image> <full_stack_image> --output-dir <out>/align/`,
+              command: `python ${scriptsDir}/sift_align.py --source <bottom_part_image> --target <full_stack_image> --pixel-size <px> --min-inliers ${args.min_inliers ?? 20} --scalebar-bottom ${args.scalebar_bottom ?? 0.08} --scalebar-right ${args.scalebar_right ?? 0.20} --output-dir <out>/align/`,
               when: "Always run if bottom_part_image provided (same-substrate → fast SIFT)",
-              check: "Verify ≥20 inliers and scale ≈ 1.0 in output",
+              check: "Verify ≥min-inliers inliers and scale ≈ 1.0. Masks bottom-right scalebar region automatically.",
             },
             "2_source_contour": {
               command: `python ${scriptsDir}/source_contour.py <top_part_image> --output-dir <out>/align/`,
@@ -167,7 +170,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       [
         "Detect individual material layers from their optimal source images.",
         "Runs 4 independent detections: graphite (bottom_part), graphene (top_part),",
-        "bottom_hBN (full_stack), top_hBN (footprint copy).",
+        "bottom_hBN (bottom_part + SIFT warp to full_stack), top_hBN (footprint copy).",
         "Use after alignment completes. Graphite and graphene need candidate review.",
       ].join(" "),
       {
@@ -198,8 +201,8 @@ function registerFlakedetectTools(): CodeGenTool[] {
               look_for: "Bright region within the flake — not artifacts or overexposure",
             },
             bottom_hbn: {
-              command: `python ${scriptsDir}/bottom_hbn.py <full_stack_image> --pixel-size <px> --output-dir <out>/detect/`,
-              check: "Automatic — no candidate review needed",
+              command: `python ${scriptsDir}/bottom_hbn.py --image <bottom_part_image> --warp-matrix <out>/align/warp_sift_bottom.npy --target-image <full_stack_image> --pixel-size <px> --output-dir <out>/detect/`,
+              check: "Review 03_bottom_hbn_on_full.png — contour should trace the bottom hBN on full_stack. If offset, check SIFT alignment quality.",
             },
             top_hbn: {
               command: `python ${scriptsDir}/top_hbn.py --output-dir <out>/detect/ --align-dir <out>/align/`,

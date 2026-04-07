@@ -29,7 +29,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "nanodevi
 from core import mask_centroid
 
 
-def align_sift(ref_image, mov_image, n_features=2000, ratio_thresh=0.7):
+def _scalebar_mask(h, w, bottom_frac=0.08, right_frac=0.20):
+    """Build a mask that excludes the bottom-right scalebar region.
+
+    Microscope images have a white scalebar overlay in the bottom-right
+    corner. Its high-contrast edges produce spurious SIFT matches that
+    hurt alignment quality. Mask = 255 where features are allowed.
+
+    Args:
+        h, w: image dimensions.
+        bottom_frac: fraction of image height to mask from bottom (default 0.08).
+        right_frac: fraction of image width to mask from right (default 0.20).
+    """
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    mask[int(h * (1 - bottom_frac)):, int(w * (1 - right_frac)):] = 0
+    return mask
+
+
+def align_sift(ref_image, mov_image, n_features=5000, ratio_thresh=0.7,
+               scalebar_bottom=0.08, scalebar_right=0.20):
     """Align two same-substrate images via SIFT feature matching + RANSAC.
 
     Returns:
@@ -46,9 +64,13 @@ def align_sift(ref_image, mov_image, n_features=2000, ratio_thresh=0.7):
     else:
         gray_mov = mov_image
 
+    # Mask out scalebar in bottom-right corner
+    mask_ref = _scalebar_mask(*gray_ref.shape[:2], scalebar_bottom, scalebar_right)
+    mask_mov = _scalebar_mask(*gray_mov.shape[:2], scalebar_bottom, scalebar_right)
+
     sift = cv2.SIFT_create(nfeatures=n_features)
-    kp_ref, des_ref = sift.detectAndCompute(gray_ref, None)
-    kp_mov, des_mov = sift.detectAndCompute(gray_mov, None)
+    kp_ref, des_ref = sift.detectAndCompute(gray_ref, mask_ref)
+    kp_mov, des_mov = sift.detectAndCompute(gray_mov, mask_mov)
 
     if des_ref is None or des_mov is None or len(kp_ref) < 4 or len(kp_mov) < 4:
         return None, 0, 1.0, 0.0, [], kp_ref, kp_mov
@@ -131,6 +153,12 @@ def main():
     parser.add_argument("--source", required=True, help="Source image (e.g., bottom_part)")
     parser.add_argument("--target", required=True, help="Target image (e.g., full_stack_raw)")
     parser.add_argument("--pixel-size", type=float, required=True, help="um/px")
+    parser.add_argument("--min-inliers", type=int, default=20,
+                        help="Minimum RANSAC inliers for sufficient quality (default: 20)")
+    parser.add_argument("--scalebar-bottom", type=float, default=0.08,
+                        help="Fraction of image height to mask from bottom for scalebar (default: 0.08)")
+    parser.add_argument("--scalebar-right", type=float, default=0.20,
+                        help="Fraction of image width to mask from right for scalebar (default: 0.20)")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
@@ -147,7 +175,9 @@ def main():
 
     # Run SIFT alignment (target=ref, source=mov per warp convention)
     warp, n_inliers, scale, rot_deg, good, kp_ref, kp_mov = align_sift(
-        target_img, source_img
+        target_img, source_img,
+        scalebar_bottom=args.scalebar_bottom,
+        scalebar_right=args.scalebar_right,
     )
 
     # Fallback to ECC if SIFT failed
@@ -159,9 +189,10 @@ def main():
         rot_deg = 0.0
 
     # Determine quality
-    if n_inliers >= 50:
+    min_inliers = args.min_inliers
+    if n_inliers >= max(50, min_inliers * 2):
         quality = "good"
-    elif n_inliers >= 20:
+    elif n_inliers >= min_inliers:
         quality = "warning"
     else:
         quality = "insufficient"
