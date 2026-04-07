@@ -12,14 +12,14 @@ Transforms all per-material detections into the full_stack coordinate system, pr
 - Conda env `base` with opencv, numpy
 - Completed align step (warp matrices, footprint mask)
 - Completed detect step (per-material masks/contours, detections.json)
-- All scripts run via `conda run -n base python <script>`
+- All scripts run via `conda run -n instrMCPdev python <script>`
 
 ## Scripts
 
 ### ecc_register.py — ECC raw-to-LUT translation alignment
 
 ```bash
-conda run -n base python skills/nanodevice_flakedetect_combine/scripts/ecc_register.py \
+conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/ecc_register.py \
     --raw <full_stack_raw_image> \
     --lut <full_stack_lut_image> \
     --output-dir <path>
@@ -39,7 +39,7 @@ Computes ECC translation alignment between raw and LUT images. The LUT image typ
 ### transform.py — Coordinate transforms for all materials
 
 ```bash
-conda run -n base python skills/nanodevice_flakedetect_combine/scripts/transform.py \
+conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/transform.py \
     --detections <detect/detections.json> \
     --align-dir <align/> \
     --image <full_stack_raw_image> \
@@ -77,7 +77,7 @@ All materials get `smooth_material()` applied after transform.
 ### overlay.py — Contour overlay visualization
 
 ```bash
-conda run -n base python skills/nanodevice_flakedetect_combine/scripts/overlay.py \
+conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/overlay.py \
     --traces <combine/traces.json> \
     --raw <full_stack_raw_image> \
     [--lut <full_stack_lut_image>] \

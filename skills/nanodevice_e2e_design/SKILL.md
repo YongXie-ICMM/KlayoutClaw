@@ -171,14 +171,16 @@ Also take a `screenshot` for visual inspection.
 ## Step 7: SAVE
 
 1. Call `save_layout` to export the GDS file
-2. Write `result.json` containing:
+2. Write `result.json` — **check if the task or benchmark specifies a required format first and use that exactly**. If no format is specified, use this general-purpose default:
    - `device_type`: from QUERY
-   - `layer_map`: all layer assignments used
-   - `score`: final evaluation score
+   - `layer_map`: all layer assignments used (e.g. `{"mesa": [{"layer": 20, "datatype": 0}], ...}`)
+   - `score`: final evaluation score from EVALUATE
    - `pixel_size`: if applicable
    - `pipeline_status`: per-step pass/fail/retry counts
    - `checks`: the evaluation check configuration used
    - `feedback`: design notes and any user interventions
+
+> **Note for benchmark tasks**: Benchmarks often require a flat format where component names are top-level keys mapping to layer arrays (e.g., `{"mesa": [...], "contact_patch": [...], "bonding_pad": [...]}`). This differs from the general-purpose format above. Always follow the benchmark instruction's format specification.
 
 **Gate:** GDS file written and result.json contains all required fields.
 
@@ -220,7 +222,7 @@ If any step exhausts retries, stop and report to the user.
 
 ## Conventions
 
-- **Conda env:** `base` (has opencv, numpy, scipy, sklearn)
+- **Conda env:** `instrMCPdev` (has opencv, numpy, scipy, sklearn, shapely, gdstk)
 - **Pixel coordinates:** image origin at top-left; KLayout uses center origin with Y-flip
 - **Layer references:** always as `layer/datatype` (e.g., `11/0`)
 - **Output directory:** defaults to source image directory if not specified

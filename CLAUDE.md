@@ -12,7 +12,7 @@ KlayoutClaw/
 ├── tools/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
 │   ├── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
-│   └── evaluate_worker.py        # Hall bar design evaluation (gdstk)
+│   └── evaluate_worker.py        # Configurable device design evaluation (gdstk)
 ├── skills/
 │   ├── scripts/
 │   │   └── mcp_client.py            # Shared MCP client for all skills
@@ -126,7 +126,7 @@ KlayoutClaw/
 | `get_layout_info` | Layout summary info |
 | `screenshot` | Capture viewport as PNG (what the user sees) |
 | `auto_route` | Autoroute pin pairs (subprocess, needs conda env) |
-| `evaluate_design` | Evaluate hall bar design quality (subprocess) |
+| `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess) |
 | `validate_pixel_size` | Validate pixel_size against known objectives |
 
 See `docs/tools.md` for full parameter schemas.

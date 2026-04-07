@@ -14,7 +14,7 @@ Graphite and graphene use a **two-pass candidate workflow**: first run auto-sele
 - Conda env with opencv, numpy, scikit-learn
 - Source images for each material
 - For bottom_hbn and top_hbn: `footprint_mask.png` from the align step
-- All scripts: `conda run -n base python <script>`
+- All scripts: `conda run -n instrMCPdev python <script>`
 
 ---
 
@@ -65,11 +65,11 @@ All 4 scripts are independent — run them in any order (or parallel, to save ti
 
 ```bash
 # Pass 1: auto-detect + review
-conda run -n base python graphite.py \
+conda run -n instrMCPdev python graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path>
 
 # Pass 2: override after reviewing 00_graphite_candidates.png
-conda run -n base python graphite.py \
+conda run -n instrMCPdev python graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> \
     --cluster-id 3 --output-dir <path>
 ```
@@ -99,11 +99,11 @@ If the align step used `--mirror` for the top_part, **you must also pass --mirro
 
 ```bash
 # Pass 1: auto-detect + review
-conda run -n base python graphene.py \
+conda run -n instrMCPdev python graphene.py \
     --image <top_part.jpg> --pixel-size <um/px> --mirror --output-dir <path>
 
 # Pass 2: override after reviewing 00_graphene_candidates.png
-conda run -n base python graphene.py \
+conda run -n instrMCPdev python graphene.py \
     --image <top_part.jpg> --pixel-size <um/px> --mirror \
     --cluster-id 0 --output-dir <path>
 ```
@@ -128,7 +128,7 @@ This script usually works well without tuning. The footprint mask from align eff
 | Contour includes part of the top hBN | Footprint mask incomplete | Go back and improve the align footprint |
 
 ```bash
-conda run -n base python bottom_hbn.py \
+conda run -n instrMCPdev python bottom_hbn.py \
     --image <full_stack_raw.jpg> \
     --footprint-mask <align/footprint_mask.png> \
     --pixel-size <um/px> --output-dir <path>
@@ -145,7 +145,7 @@ conda run -n base python bottom_hbn.py \
 If the top hBN detection looks wrong, the fix is in the **align** step (re-run footprint.py or adjust Chamfer alignment), not here.
 
 ```bash
-conda run -n base python top_hbn.py \
+conda run -n instrMCPdev python top_hbn.py \
     --footprint-mask <align/footprint_mask.png> \
     --footprint-contour <align/footprint_contour.npy> \
     --image <full_stack_raw.jpg> \

@@ -281,7 +281,13 @@ TESTS: list[AgenticTestCase] = [
             "Create a scratch layout (name='PREFLIGHT'), then call each tool once: "
             "1) get_layout_info to inspect the layout, "
             "2) validate_pixel_size with pixel_size=0.1, "
-            "3) evaluate_design with mode=drc and layer_map={mesa:[20,0], contact_patch:[21,0], "
+            "3) evaluate_design with checks=[{name:'contact_isolation', args:{component:'contact_route'}, weight:0.15}, "
+            "{name:'connectivity', args:{contact_component:'contact_patch', pad_component:'bonding_pad', route_component:'contact_route'}, weight:0.15}, "
+            "{name:'route_endpoints', args:{route_component:'contact_route', target_components:['contact_patch','mesa','bonding_pad']}, weight:0.15}, "
+            "{name:'adjacency', args:{component_a:'contact_patch', component_b:'mesa', tolerance:2.0}, weight:0.20}, "
+            "{name:'component_containment', args:{component:'topgate', region:'mesa'}, weight:0.15}, "
+            "{name:'spacing', args:{component_a:'contact_patch', min_distance:1.0}, weight:0.20}] "
+            "and layer_map={mesa:[20,0], contact_patch:[21,0], "
             "topgate:[22,0], contact_route:[23,0], bonding_pad:[24,0]}. "
             "Write the combined results (a JSON object with keys 'get_layout_info', "
             "'validate_pixel_size', 'evaluate_design') to /tmp/preflight.json."
@@ -413,15 +419,16 @@ TESTS: list[AgenticTestCase] = [
             "The current layout has a toy Hall bar device with geometry on layers "
             "L20/0 (mesa), L21/0 (contact_patch), L22/0 (topgate), L23/0 (contact_route), "
             "L24/0 (bonding_pad). Do NOT create a new layout — the device is already set up. "
-            "Run evaluate_design with mode=drc and layer_map="
+            "Run evaluate_design with DRC checks=[contact_isolation, connectivity, "
+            "route_endpoints, adjacency, component_containment, spacing] and layer_map="
             f"{HALLBAR_LAYER_MAP_STR}. "
             "Report: how many checks were returned, each check name and score, "
             "and the overall score."
         ),
         assertion=(
-            "The agent called evaluate_design with mode=drc and the correct layer_map. "
-            "It received 6 checks (topgate, contact_isolation, connectivity, route_endpoints, "
-            "contact_mesa_adjacency, mesa_probes) and an overall score between 0 and 1. "
+            "The agent called evaluate_design with DRC checks and the correct layer_map. "
+            "It received 6 checks (contact_isolation, connectivity, route_endpoints, "
+            "adjacency, component_containment, spacing) and an overall score between 0 and 1. "
             "The agent reported each check name and score."
         ),
         verify_fn="verify_evaluate_drc",
@@ -436,14 +443,16 @@ TESTS: list[AgenticTestCase] = [
             "The current layout has a toy Hall bar device. "
             "Do NOT create a new layout — the device is already set up. "
             "First, save the current layout to /tmp/phase5_reference.gds as a reference. "
-            "Then run evaluate_design with mode=score, the same layer_map="
+            "Then run evaluate_design with score checks=[component_overlap, component_containment, "
+            "contact_isolation, connectivity, route_endpoints, adjacency, component_containment, spacing], "
+            "the same layer_map="
             f"{HALLBAR_LAYER_MAP_STR}, "
             "and reference_gds=/tmp/phase5_reference.gds. "
             "Report how many checks were returned and list them all."
         ),
         assertion=(
-            "The agent saved a reference GDS, then called evaluate_design with mode=score. "
-            "It received 8 checks including mesa_on_overlap and contacts_in_regions "
+            "The agent saved a reference GDS, then called evaluate_design with score checks. "
+            "It received 8 checks including component_overlap and component_containment "
             "(the two reference-dependent checks). The overall score is between 0 and 1."
         ),
         verify_fn="verify_evaluate_score",
@@ -458,16 +467,16 @@ TESTS: list[AgenticTestCase] = [
         group="evaluate",
         name="EvaluateMissingReferenceGracefulFallback",
         task_prompt=(
-            "Run evaluate_design with mode=score and reference_gds pointing to "
+            "Run evaluate_design with score checks and reference_gds pointing to "
             "a file that does NOT exist: /tmp/nonexistent_reference_xyz.gds. "
             "Use layer_map=" + HALLBAR_LAYER_MAP_STR + ". "
-            "Report what happens -- does it error? Does it fall back to DRC mode? "
+            "Report what happens -- does it error? Does it handle missing reference gracefully? "
             "Handle the result gracefully and explain what you observe."
         ),
         assertion=(
-            "The agent attempted evaluate_design mode=score with a missing reference GDS. "
+            "The agent attempted evaluate_design with score checks and a missing reference GDS. "
             "It received either an error message (which it reported gracefully) or a "
-            "fallback to DRC mode. The agent did NOT crash or hang -- it handled "
+            "graceful fallback. The agent did NOT crash or hang -- it handled "
             "the error condition and explained the outcome."
         ),
         verify_fn="verify_evaluate_graceful_error",
@@ -491,10 +500,10 @@ TESTS: list[AgenticTestCase] = [
             "with topgate=yes, backgate=no, pixel_size=0.1 um/px. "
             "Use the default layer assignments: mesa=20/0, contact_patch=21/0, "
             "topgate=22/0, contact_route=23/0, bonding_pad=24/0. "
-            "After designing, run evaluate_design mode=drc to check quality."
+            "After designing, run evaluate_design with DRC checks to check quality."
         ),
         assertion=(
-            "The agent designed a Hall bar device and ran evaluate_design mode=drc. "
+            "The agent designed a Hall bar device and ran evaluate_design with DRC checks. "
             "The DRC evaluation returned 6 checks with an overall score between 0 and 1. "
             "If the independent verification confirms DRC checks are present, the test passes "
             "even if the transcript is truncated and does not show all intermediate design steps."
@@ -612,7 +621,7 @@ TESTS: list[AgenticTestCase] = [
         task_prompt=(
             "The current layout has a toy device. "
             "Do NOT create a new layout — the device is already set up. "
-            "Run evaluate_design mode=drc with "
+            "Run evaluate_design with DRC checks and "
             "a layer_map that uses multi-layer contact_route parameter: "
             '{"mesa":[20,0], "contact_patch":[21,0], "topgate":[22,0], '
             '"contact_route":[[3,0],[4,0]], "bonding_pad":[24,0]}. '
@@ -784,12 +793,13 @@ TESTS: list[AgenticTestCase] = [
             "mesa (L20/0), contact_patch (L21/0), topgate (L22/0), "
             "contact_route (L23/0), bonding_pad (L24/0). "
             "Do NOT create a new layout — the device is already set up. "
-            "Run evaluate_design mode=drc with the matching layer_map. "
+            "Run evaluate_design with DRC checks=[contact_isolation, connectivity, "
+            "route_endpoints, adjacency, component_containment, spacing] and the matching layer_map. "
             "For EACH of the 6 DRC checks returned, explain what it measures "
             "and whether the score is good (>0.7) or needs improvement."
         ),
         assertion=(
-            "The agent ran evaluate_design mode=drc and received 6 checks. "
+            "The agent ran evaluate_design with DRC checks and received 6 checks. "
             "For each check it explained the metric and assessed the score. "
             "The overall score is between 0 and 1. All 6 check names were listed."
         ),
@@ -806,15 +816,17 @@ TESTS: list[AgenticTestCase] = [
             "Do NOT create a new layout — the device is already set up. "
             "Save the layout to "
             "/tmp/phase5_ref_adv.gds as a reference. Then run evaluate_design "
-            "mode=score with reference_gds=/tmp/phase5_ref_adv.gds and layer_map="
+            "with score checks=[component_overlap, component_containment, contact_isolation, "
+            "connectivity, route_endpoints, adjacency, component_containment, spacing] "
+            "with reference_gds=/tmp/phase5_ref_adv.gds and layer_map="
             f"{HALLBAR_LAYER_MAP_STR}. "
-            "Report all 8 checks, focusing on mesa_on_overlap and contacts_in_regions "
+            "Report all 8 checks, focusing on component_overlap and component_containment "
             "(the two reference-dependent checks). What do these checks measure?"
         ),
         assertion=(
-            "The agent ran evaluate_design mode=score and received 8 checks. "
-            "It specifically discussed mesa_on_overlap (mesa placed on flake overlap) "
-            "and contacts_in_regions (contacts in single-material regions). "
+            "The agent ran evaluate_design with score checks and received 8 checks. "
+            "It specifically discussed component_overlap (mesa placed on flake overlap) "
+            "and component_containment (contacts in single-material regions). "
             "All 8 check names and scores were reported."
         ),
         verify_fn="verify_evaluate_score",
@@ -831,19 +843,22 @@ TESTS: list[AgenticTestCase] = [
         task_prompt=(
             "The current layout has a toy device. "
             "Do NOT create a new layout — the device is already set up. "
-            "Run evaluate_design in BOTH modes: "
-            "1) mode=drc with layer_map=" + HALLBAR_LAYER_MAP_STR + " "
-            "2) mode=score with the same layer_map and reference_gds=/tmp/phase5_ref_adv.gds "
+            "Run evaluate_design with BOTH check sets: "
+            "1) DRC checks=[contact_isolation, connectivity, route_endpoints, adjacency, "
+            "component_containment, spacing] with layer_map=" + HALLBAR_LAYER_MAP_STR + " "
+            "2) Score checks=[component_overlap, component_containment, contact_isolation, "
+            "connectivity, route_endpoints, adjacency, component_containment, spacing] "
+            "with the same layer_map and reference_gds=/tmp/phase5_ref_adv.gds "
             "(save the layout to that path first if needed). "
-            "Compare the results: which checks appear in both modes? Which are unique "
-            "to score mode? Write a comparison JSON to /tmp/eval_comparison.json with keys "
+            "Compare the results: which checks appear in both sets? Which are unique "
+            "to score checks? Write a comparison JSON to /tmp/eval_comparison.json with keys "
             '"drc_checks", "score_checks", "common_checks", "score_only_checks", '
             '"drc_overall", "score_overall".'
         ),
         assertion=(
-            "The agent ran both drc (6 checks) and score (8 checks) modes. "
+            "The agent ran both DRC (6 checks) and score (8 checks) check sets. "
             "It wrote a comparison JSON to /tmp/eval_comparison.json identifying "
-            "that score mode adds mesa_on_overlap and contacts_in_regions. "
+            "that score checks add component_overlap and component_containment. "
             "The file exists and contains the expected keys."
         ),
         verify_fn="verify_dual_eval",
@@ -867,12 +882,12 @@ TESTS: list[AgenticTestCase] = [
             "Design a complete 8-pin Hall bar device with topgate=yes. Use layers: "
             "mesa=20/0, contact_patch=21/0, topgate=22/0, contact_route=23/0, "
             "bonding_pad=24/0. Follow the nanodevice_hallbar skill workflow. "
-            "After designing, run evaluate_design mode=drc and report the overall score. "
+            "After designing, run evaluate_design with DRC checks and report the overall score. "
             "Target: score >= 0.80."
         ),
         assertion=(
             "The agent designed a complete Hall bar on the synthetic flake contours. "
-            "evaluate_design mode=drc returned a score. Geometry exists on all 5 device "
+            "evaluate_design with DRC checks returned a score. Geometry exists on all 5 device "
             "layers (L20-L24). The design was evaluated and the score was reported."
         ),
         verify_fn="verify_hallbar_on_contours",

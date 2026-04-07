@@ -12,7 +12,7 @@ Align microscope images to a GDS fabrication template by detecting lithographic 
 - Conda env `base` with opencv, numpy, scipy, gdstk
 - Template GDS file with L5/0 alignment markers (4 cross pairs)
 - flakedetect output: `traces.json` with material contours in pixel coordinates
-- All scripts: `conda run -n base python <script>`
+- All scripts: `conda run -n instrMCPdev python <script>`
 
 ## Default Output Directory
 
@@ -43,7 +43,7 @@ Align microscope images to a GDS fabrication template by detecting lithographic 
 ### extract_markers.py
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/extract_markers.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/extract_markers.py \
     --gds Template.gds --output-dir output/gdsalign/
 ```
 
@@ -54,7 +54,7 @@ Parses GDS, finds all L5/0 polygons, selects the 8 closest to grid center, group
 ### detect_markers.py
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/detect_markers.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/detect_markers.py \
     --image stack.png --pixel-size <um/px> \
     --gds-markers output/gdsalign/gds_markers.json \
     --output-dir output/gdsalign/
@@ -69,7 +69,7 @@ Renders marker-pair templates from `gds_markers.json`, then runs multi-method te
 ### align_gds.py
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/align_gds.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/align_gds.py \
     --gds-markers output/gdsalign/gds_markers.json \
     --image-markers output/gdsalign/image_markers.json \
     --output-dir output/gdsalign/
@@ -82,7 +82,7 @@ Exhaustive enumeration over 2-point correspondences finds the best reflected sim
 ### commit_gds.py
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/commit_gds.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/commit_gds.py \
     --warp output/gdsalign/gds_warp.npy \
     --traces output/combine/traces.json \
     --image full_stack_raw.jpg --pixel-size <um/px> \

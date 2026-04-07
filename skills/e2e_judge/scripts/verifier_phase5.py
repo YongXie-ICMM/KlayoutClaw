@@ -231,11 +231,32 @@ else:
 # T2/T9: Evaluate Design
 # ---------------------------------------------------------------------------
 
+_DRC_CHECKS = [
+    {"name": "contact_isolation", "args": {"component": "contact_route"}, "weight": 0.15},
+    {"name": "connectivity", "args": {"contact_component": "contact_patch", "pad_component": "bonding_pad", "route_component": "contact_route"}, "weight": 0.15},
+    {"name": "route_endpoints", "args": {"route_component": "contact_route", "target_components": ["contact_patch", "mesa", "bonding_pad"]}, "weight": 0.15},
+    {"name": "adjacency", "args": {"component_a": "contact_patch", "component_b": "mesa", "tolerance": 2.0}, "weight": 0.20},
+    {"name": "component_containment", "args": {"component": "topgate", "region": "mesa"}, "weight": 0.15},
+    {"name": "spacing", "args": {"component_a": "contact_patch", "min_distance": 1.0}, "weight": 0.20},
+]
+
+_SCORE_CHECKS = [
+    {"name": "component_overlap", "args": {"component": "mesa", "region": ["graphene", "graphite"], "region_op": "intersection"}, "weight": 0.15},
+    {"name": "component_containment", "args": {"component": "contact_patch", "region": ["graphene", "graphite"], "region_op": "union"}, "weight": 0.15},
+    {"name": "contact_isolation", "args": {"component": "contact_route"}, "weight": 0.10},
+    {"name": "connectivity", "args": {"contact_component": "contact_patch", "pad_component": "bonding_pad", "route_component": "contact_route"}, "weight": 0.10},
+    {"name": "route_endpoints", "args": {"route_component": "contact_route", "target_components": ["contact_patch", "mesa", "bonding_pad"]}, "weight": 0.10},
+    {"name": "adjacency", "args": {"component_a": "contact_patch", "component_b": "mesa", "tolerance": 2.0}, "weight": 0.15},
+    {"name": "component_containment", "args": {"component": "topgate", "region": "mesa"}, "weight": 0.10},
+    {"name": "spacing", "args": {"component_a": "contact_patch", "min_distance": 1.0}, "weight": 0.15},
+]
+
+
 def verify_evaluate_drc(client: MCPClient, layer_map: dict = None,
                         expected_check_count: int = 6,
                         expected_names: list[str] = None,
                         **kwargs) -> VerificationResult:
-    """Call evaluate_design mode=drc directly and verify it returns expected checks.
+    """Call evaluate_design with DRC checks directly and verify it returns expected checks.
 
     If expected_names is provided (or defaults to the 6 known DRC check names),
     the verifier confirms those names are present in the returned checks list.
@@ -251,13 +272,13 @@ def verify_evaluate_drc(client: MCPClient, layer_map: dict = None,
 
     if expected_names is None:
         expected_names = [
-            "topgate", "contact_isolation", "connectivity",
-            "route_endpoints", "contact_mesa_adjacency", "mesa_probes",
+            "component_containment", "contact_isolation", "connectivity",
+            "route_endpoints", "adjacency", "spacing",
         ]
 
     try:
         result = client.call_tool("evaluate_design", timeout=120,
-                                  layer_map=layer_map, mode="drc")
+                                  layer_map=layer_map, checks=_DRC_CHECKS)
     except Exception as e:
         return VerificationResult(
             checks={"error": str(e)},
@@ -297,7 +318,7 @@ def verify_evaluate_drc(client: MCPClient, layer_map: dict = None,
 def verify_evaluate_score(client: MCPClient, layer_map: dict = None,
                           reference_gds: str = None,
                           expected_check_count: int = 8, **kwargs) -> VerificationResult:
-    """Call evaluate_design mode=score directly and verify 8 checks returned."""
+    """Call evaluate_design with score checks directly and verify 8 checks returned."""
     if layer_map is None:
         layer_map = {
             "mesa": [20, 0],
@@ -325,7 +346,7 @@ def verify_evaluate_score(client: MCPClient, layer_map: dict = None,
 
     try:
         result = client.call_tool("evaluate_design", timeout=120,
-                                  layer_map=layer_map, mode="score",
+                                  layer_map=layer_map, checks=_SCORE_CHECKS,
                                   reference_gds=reference_gds)
     except Exception as e:
         return VerificationResult(
@@ -340,8 +361,8 @@ def verify_evaluate_score(client: MCPClient, layer_map: dict = None,
     check_names = [c.get("name", "?") for c in checks_list]
 
     # Check for the two reference-dependent checks
-    has_mesa_overlap = "mesa_on_overlap" in check_names
-    has_contacts_regions = "contacts_in_regions" in check_names
+    has_mesa_overlap = "component_overlap" in check_names
+    has_contacts_regions = "component_containment" in check_names
 
     ok = (num_checks >= expected_check_count and 0 <= overall <= 1
           and has_mesa_overlap and has_contacts_regions)
@@ -349,21 +370,21 @@ def verify_evaluate_score(client: MCPClient, layer_map: dict = None,
     return VerificationResult(
         checks={"num_checks": num_checks, "expected_check_count": expected_check_count,
                 "overall_score": overall, "check_names": check_names,
-                "has_mesa_on_overlap": has_mesa_overlap,
-                "has_contacts_in_regions": has_contacts_regions,
+                "has_component_overlap": has_mesa_overlap,
+                "has_component_containment": has_contacts_regions,
                 "ref_created_by_verifier": ref_created_by_verifier},
         passed=ok,
         summary=f"Score mode: {num_checks} checks (expected >={expected_check_count}), "
-                f"overall={overall:.3f}, mesa_overlap={has_mesa_overlap}, "
-                f"contacts_regions={has_contacts_regions}"
+                f"overall={overall:.3f}, component_overlap={has_mesa_overlap}, "
+                f"component_containment={has_contacts_regions}"
                 + (" (verifier saved reference GDS)" if ref_created_by_verifier else ""),
     )
 
 
 def verify_evaluate_graceful_error(client: MCPClient, layer_map: dict = None,
                                    **kwargs) -> VerificationResult:
-    """Call evaluate_design mode=score with a missing reference_gds.
-    Expect either an error or a graceful fallback to drc mode.
+    """Call evaluate_design with score checks and a missing reference_gds.
+    Expect either an error or a graceful fallback.
     """
     if layer_map is None:
         layer_map = {
@@ -376,7 +397,7 @@ def verify_evaluate_graceful_error(client: MCPClient, layer_map: dict = None,
 
     try:
         result = client.call_tool("evaluate_design", timeout=120,
-                                  layer_map=layer_map, mode="score",
+                                  layer_map=layer_map, checks=_SCORE_CHECKS,
                                   reference_gds="/tmp/nonexistent_ref_12345.gds")
         # If it returned without error, it may have fallen back to DRC
         mode = result.get("mode", "unknown")
@@ -792,10 +813,10 @@ def verify_dual_eval(client: MCPClient, layer_map: dict = None,
             "bonding_pad": [24, 0],
         }
 
-    # Run DRC mode directly
+    # Run DRC checks directly
     try:
         drc_result = client.call_tool("evaluate_design", timeout=120,
-                                      layer_map=layer_map, mode="drc")
+                                      layer_map=layer_map, checks=_DRC_CHECKS)
         drc_ok = True
         drc_count = len(drc_result.get("checks", []))
         drc_names = [c.get("name", "?") for c in drc_result.get("checks", [])]
@@ -823,7 +844,7 @@ def verify_dual_eval(client: MCPClient, layer_map: dict = None,
     if ref_exists:
         try:
             score_result = client.call_tool("evaluate_design", timeout=120,
-                                            layer_map=layer_map, mode="score",
+                                            layer_map=layer_map, checks=_SCORE_CHECKS,
                                             reference_gds=reference_gds)
             score_ok = True
             score_count = len(score_result.get("checks", []))
@@ -981,7 +1002,7 @@ def verify_evaluate_layer_map_array(client: MCPClient, layer_map: dict = None,
 
     try:
         result = client.call_tool("evaluate_design", timeout=120,
-                                  layer_map=layer_map, mode="drc")
+                                  layer_map=layer_map, checks=_DRC_CHECKS)
     except Exception as e:
         error_msg = str(e)
         # The tool may not support array layer specs -- an error is also a valid
@@ -1025,7 +1046,7 @@ def verify_hallbar_on_contours(client: MCPClient, layer_map: dict = None,
 
     try:
         result = client.call_tool("evaluate_design", timeout=120,
-                                  layer_map=layer_map, mode="drc")
+                                  layer_map=layer_map, checks=_DRC_CHECKS)
     except Exception as e:
         return VerificationResult(
             checks={"error": str(e)},
