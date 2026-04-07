@@ -35,7 +35,8 @@
 - Common valid values: 0.05, 0.087, 0.1, 0.25, 0.5 um/px
 - Incorrect pixel_size causes marker detection failures and incorrect transforms
 
-## Hallbar Geometry Constraints
+## Device-Specific Geometry Constraints (Example: Hall Bar)
+These constraints apply specifically to Hall bar designs. For other device types, the agent derives equivalent constraints from physics knowledge.
 - **Solidity < 0.5**: The mesa must have solidity below 0.5 — a proper Hall bar shape with arms, not a filled rectangle
 - **Contacts in single-material regions**: Each contact must lie entirely within a single material boundary (e.g., only graphene, not overlapping graphene + hBN)
 - **Topgate isolation**: The topgate must maintain an isolation gap from mesa edges and contact regions to prevent shorts; topgate should not overlap or touch contacts

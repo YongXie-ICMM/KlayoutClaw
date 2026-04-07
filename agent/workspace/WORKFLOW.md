@@ -3,18 +3,17 @@
 ## Phase 0: Query
 - Parse the user's request to identify device type, materials, and constraints
 - Determine if this is a new design or modification of an existing layout
-- Identify which pipeline steps are needed (flake detection, GDS alignment, hallbar design, routing)
+- Identify which pipeline steps are needed (flake detection, GDS alignment, device design, routing)
 - Validate pixel_size if microscope images are involved
 - **Entry criteria:** User describes a design task
 - **Exit criteria:** Device type, materials, and pipeline steps identified
 - **Key tools:** `klayout_native_validate_pixel_size`
 
-## Hallbar Design Constraints Summary
-- Mesa solidity must be < 0.5 (ensures Hall bar shape, not a filled rectangle)
-- Contacts must be placed in single-material regions (no overlap between materials)
-- Topgate must have isolation gap from mesa edges and contacts
-- Channel length/width ratio should be appropriate for transport measurements
-- All dimensions are adaptive, derived from actual flake geometry
+## Design Constraints Summary
+- Device-specific constraints are derived from physics knowledge and RULES.md — no universal shape rules apply to all devices
+- Contacts must be placed in single-material regions appropriate to the device type
+- Isolation gaps (gates vs. contacts/mesa) must respect device physics and fabrication limits
+- All dimensions are adaptive, derived from actual flake geometry or user-specified constraints
 
 ## Phase 1: Plan
 - Understand the target device (type, materials, dimensions)
@@ -45,10 +44,11 @@
 - **Key tools:** `klayout_native_auto_route`, `klayout_native_save_layout`
 
 ## Phase 4: Evaluate and Iterate
-- Run `klayout_native_evaluate_design` to assess design quality metrics
-- Check solidity, contact placement, topgate isolation, and overall geometry
-- If evaluation fails, iterate: adjust geometry, re-evaluate, repeat
-- The evaluate -> iterate loop continues until all metrics pass or maximum retries reached
+- Compose a check list appropriate for the device type (containment, adjacency, solidity, isolation, connectivity, spacing, etc.)
+- Run `klayout_native_evaluate_design` with the composed checks and `layer_map`
+- Review per-check scores; if overall score < 0.80, identify the lowest-scoring check and iterate on the corresponding geometry
+- Maximum 2 retries; stop and report to the user if not resolved
+- Visual review with `klayout_native_screenshot` after each iteration
 - **Entry criteria:** Design geometry complete (Phase 2 or Phase 3 done)
-- **Exit criteria:** All evaluation metrics pass
+- **Exit criteria:** Overall evaluation score >= 0.80 and visual inspection passes
 - **Key tools:** `klayout_native_evaluate_design`, `klayout_native_screenshot`

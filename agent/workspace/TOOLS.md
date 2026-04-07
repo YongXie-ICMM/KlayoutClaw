@@ -10,7 +10,7 @@
 | `klayout_native_get_layout_info` | Checking layout state (cells, layers, dbu) |
 | `klayout_native_screenshot` | Capturing viewport for visual review |
 | `klayout_native_auto_route` | Autorouting pin pairs (subprocess, heavy computation) |
-| `klayout_native_evaluate_design` | Evaluate hall bar design quality (solidity, contacts, isolation) |
+| `klayout_native_evaluate_design` | Evaluate device design quality via configurable check primitives (component_containment, contact_isolation, connectivity, adjacency, solidity, spacing, etc.) |
 | `klayout_native_validate_pixel_size` | Validate pixel_size against known objectives (0.05, 0.087, 0.1, 0.25, 0.5) |
 
 ### get_layout_info per-layer output
