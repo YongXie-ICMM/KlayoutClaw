@@ -6,6 +6,10 @@ import type { BackgroundTask } from "./types.js";
 
 const BACKGROUNDABLE_TOOLS = new Set([
   "klayout_nanodevice_flakedetect_detect_stack",
+  "klayout_nanodevice_flakedetect_align",
+  "klayout_nanodevice_flakedetect_detect",
+  "klayout_nanodevice_flakedetect_combine",
+  "klayout_nanodevice_gdsalign_align_to_gds",
   "klayout_native_auto_route",
   "klayout_native_save_layout",
   "klayout_native_evaluate_design",

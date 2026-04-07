@@ -298,12 +298,36 @@ describe("visual tools", () => {
 });
 
 describe("nanodevice tools", () => {
-  it("registers nanodevice tools", () => {
+  it("registers all nanodevice tools (flakedetect + gdsalign + routing)", () => {
     const tools = registerNanodeviceTools();
-    expect(tools.length).toBeGreaterThan(0);
     const names = tools.map((t) => t.name);
+    // Flakedetect pipeline: orchestrator + 5 substeps
     expect(names).toContain("klayout_nanodevice_flakedetect_detect_stack");
+    expect(names).toContain("klayout_nanodevice_flakedetect_align");
+    expect(names).toContain("klayout_nanodevice_flakedetect_detect");
+    expect(names).toContain("klayout_nanodevice_flakedetect_combine");
+    expect(names).toContain("klayout_nanodevice_flakedetect_commit");
+    expect(names).toContain("klayout_nanodevice_flakedetect_review");
+    // GDS alignment
     expect(names).toContain("klayout_nanodevice_gdsalign_align_to_gds");
+    // Routing
+    expect(names).toContain("klayout_nanodevice_routing_place_pads");
+    expect(names).toContain("klayout_nanodevice_routing_route_leads");
+    expect(names).toContain("klayout_nanodevice_routing_clear_routes");
+    expect(tools.length).toBe(10);
+  });
+
+  it("each tool returns instruction JSON with skill_doc reference", () => {
+    const tools = registerNanodeviceTools();
+    for (const tool of tools) {
+      const code = tool.generateCode({});
+      expect(code).toContain("result =");
+      // All tools except clear_routes should reference a skill_doc
+      if (tool.originalName !== "clear_routes") {
+        expect(code).toContain("skill_doc");
+        expect(code).toContain("SKILL.md");
+      }
+    }
   });
 });
 
