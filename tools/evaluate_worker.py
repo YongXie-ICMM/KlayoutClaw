@@ -79,14 +79,31 @@ def _extract_shapely(lib, layer, datatype):
     return shapes
 
 
+def _normalize_layer_spec(spec):
+    """Normalize a layer spec to list of (layer, datatype) pairs.
+
+    Accepts:
+      [layer, datatype]              -> [(layer, datatype)]
+      [[layer, dt], [layer, dt]]     -> [(layer, dt), ...]
+      {"layer": N, "datatype": N}    -> [(N, N)]
+      [{"layer": N, "datatype": N}]  -> [(N, N)]
+    """
+    if isinstance(spec, dict):
+        return [(spec["layer"], spec.get("datatype", 0))]
+    if isinstance(spec, (list, tuple)) and len(spec) > 0:
+        if isinstance(spec[0], dict):
+            return [(s["layer"], s.get("datatype", 0)) for s in spec]
+        if isinstance(spec[0], (list, tuple)):
+            return [tuple(s) for s in spec]
+        return [tuple(spec)]
+    return []
+
+
 def _component_union(lib, layer_map, name):
     spec = layer_map.get(name)
     if spec is None:
         return sg.Polygon()
-    if isinstance(spec[0], (list, tuple)):
-        pairs = spec
-    else:
-        pairs = [spec]
+    pairs = _normalize_layer_spec(spec)
     all_shapes = []
     for layer, dt in pairs:
         all_shapes.extend(_extract_shapely(lib, layer, dt))
@@ -97,10 +114,7 @@ def _component_list(lib, layer_map, name):
     spec = layer_map.get(name)
     if spec is None:
         return []
-    if isinstance(spec[0], (list, tuple)):
-        pairs = spec
-    else:
-        pairs = [spec]
+    pairs = _normalize_layer_spec(spec)
     all_shapes = []
     for layer, dt in pairs:
         all_shapes.extend(_extract_shapely(lib, layer, dt))
@@ -111,10 +125,7 @@ def _get_spine_endpoints(lib, layer_map, component="contact_route"):
     spec = layer_map.get(component)
     if spec is None:
         return []
-    if isinstance(spec[0], (list, tuple)):
-        pairs = spec
-    else:
-        pairs = [spec]
+    pairs = _normalize_layer_spec(spec)
     endpoints = []
     for layer, dt in pairs:
         layer_eps = []

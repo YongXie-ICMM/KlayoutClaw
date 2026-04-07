@@ -246,15 +246,31 @@ TOOLS = [
     },
     {
         "name": "evaluate_design",
-        "description": "Evaluate a device design against configurable geometric quality checks. Accepts a list of check primitives (component_overlap, component_containment, contact_isolation, connectivity, route_endpoints, adjacency, solidity, spacing) with per-check weights. Returns per-check scores and weighted overall score.",
+        "description": "Evaluate a device design against configurable geometric quality checks. Returns per-check scores and weighted overall score (0-1).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "checks": {"type": "array", "description": "List of check objects: [{name, args, weight}]. Available primitives: component_overlap, component_containment, contact_isolation, connectivity, route_endpoints, adjacency, solidity, spacing."},
-                "layer_map": {"type": "object", "description": "Map of component names to [layer, datatype] arrays. Keys are referenced by check args."},
-                "reference_gds": {"type": "string", "description": "Path to reference GDS (optional, for checks that need reference layers)"},
+                "checks": {
+                    "type": "array",
+                    "description": "List of check objects. Each: {name, args, weight}. weight is 0-1 (all weights should sum to 1). Available primitives and their args:\n- component_overlap: {component, region, region_op?} — fraction of component area overlapping region\n- component_containment: {component, region, region_op?} — fraction of component area inside region\n- contact_isolation: {component?} — fraction of route pairs that don't cross (default component: contact_route)\n- connectivity: {contact_component?, pad_component?, route_component?, tolerance?} — fraction of contacts reaching a pad via routes (defaults: contact_patch, bonding_pad, contact_route, 15.0)\n- route_endpoints: {route_component?, target_components?, tolerance?} — fraction of route endpoints on valid targets (defaults: contact_route, [contact_patch, mesa, bonding_pad], 15.0)\n- adjacency: {component_a, component_b, tolerance?} — fraction of component_a shapes near component_b (default tolerance: 2.0)\n- solidity: {component, threshold?, direction?} — shape solidity score (default threshold: 0.5, direction: below)\n- spacing: {component_a, component_b?, min_distance?} — fraction of shape pairs meeting min distance (default: same component, 1.0)\nAll component/region values are keys in layer_map. region can be a string or list of strings; region_op: union (default) or intersection.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "args": {"type": "object"},
+                            "weight": {"type": "number"}
+                        },
+                        "required": ["name", "args", "weight"]
+                    }
+                },
+                "layer_map": {
+                    "type": "object",
+                    "description": "Map of component names to layer specs. Values can be [layer, datatype] (e.g. [20, 0]), {\"layer\": 20, \"datatype\": 0}, or a list of either for multi-layer components. Keys are referenced by check args (component, region, etc.).",
+                    "additionalProperties": {}
+                },
+                "reference_gds": {"type": "string", "description": "Path to reference GDS (optional, for checks needing reference layers)"},
                 "python_path": {"type": "string", "description": "Path to python binary with gdstk/shapely/numpy (overrides conda_env)"},
-                "conda_env": {"type": "string", "default": "base", "description": "Conda environment with gdstk/shapely/numpy"}
+                "conda_env": {"type": "string", "default": "instrMCPdev", "description": "Conda environment with gdstk/shapely/numpy"}
             },
             "required": ["checks", "layer_map"]
         }
@@ -658,7 +674,7 @@ def _tool_evaluate_design(args):
     checks = args.get("checks", None)
     reference_gds = args.get("reference_gds", None)
     python_path = args.get("python_path", None)
-    conda_env = args.get("conda_env", "base")
+    conda_env = args.get("conda_env", "instrMCPdev")
 
     if checks is None or not isinstance(checks, list) or len(checks) == 0:
         raise ValueError("'checks' must be a non-empty list of check objects.")
@@ -711,17 +727,16 @@ def _tool_evaluate_design(args):
             cmd = "{} {} {}".format(python_path, worker_path, config_json)
         else:
             conda_sh = None
-        for p in [os.path.expanduser("~/miniforge3/etc/profile.d/conda.sh"),
-                   os.path.expanduser("~/anaconda3/etc/profile.d/conda.sh"),
-                   os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh")]:
-            if os.path.isfile(p):
-                conda_sh = p
-                break
-        if conda_sh is None:
-            raise ValueError("conda.sh not found. Checked miniforge3, anaconda3, miniconda3.")
-        cmd = 'source {} &amp;&amp; conda activate {} &amp;&amp; python {} {}'.format(
-            conda_sh,
-                conda_env, worker_path, config_json
+            for p in [os.path.expanduser("~/miniforge3/etc/profile.d/conda.sh"),
+                       os.path.expanduser("~/anaconda3/etc/profile.d/conda.sh"),
+                       os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh")]:
+                if os.path.isfile(p):
+                    conda_sh = p
+                    break
+            if conda_sh is None:
+                raise ValueError("conda.sh not found. Checked miniforge3, anaconda3, miniconda3.")
+            cmd = 'source {} &amp;&amp; conda activate {} &amp;&amp; python {} {}'.format(
+                conda_sh, conda_env, worker_path, config_json
             )
         _log("evaluate_design: running: {}".format(cmd))
         try:
