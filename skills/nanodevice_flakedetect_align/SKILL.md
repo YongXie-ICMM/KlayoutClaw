@@ -207,36 +207,23 @@ Optional: `--gray-only` — use grayscale Otsu only, skip saturation intersectio
 
 ### footprint.py
 
-Two modes:
-- **Diff mode** (`--bottom` provided): SIFT-aligns bottom_part to target, computes LAB diff image, K-means on intensity. Isolates top-placed flake from substrate. **Preferred when bottom_part is available.**
-- **Color mode** (no `--bottom`): K-means on target LAB color, filter by saturation. Fallback when no bottom image exists.
-
-Both modes split disconnected blobs within clusters into sub-clusters before enumeration, so spatially separate flakes sharing the same intensity/color are treated independently.
+SIFT-aligns bottom_part to target, computes LAB diff image, K-means on diff intensity. Isolates the top-placed flake from substrate. Splits disconnected blobs within clusters into sub-clusters before enumeration, so spatially separate flakes sharing the same intensity are treated independently.
 
 ```bash
-# Diff mode (preferred)
 conda run -n base python skills/nanodevice_flakedetect_align/scripts/footprint.py \
     --source <top_part> --target <full_stack_raw> \
     --bottom <bottom_part> [--mirror] \
     [--source-contour <out>/align/source_contour.npy] \
     [--source-mask <out>/align/source_mask.png] \
     --pixel-size <um/px> --output-dir <path>
-
-# Color mode (fallback)
-conda run -n base python skills/nanodevice_flakedetect_align/scripts/footprint.py \
-    --source <top_part> --target <full_stack_raw> [--mirror] \
-    [--source-contour <out>/align/source_contour.npy] \
-    [--source-mask <out>/align/source_mask.png] \
-    --pixel-size <um/px> --output-dir <path>
 ```
 
 Optional:
-- `--bottom <image>` — bottom_part image. Enables diff mode: SIFT-aligns bottom to target and subtracts, so K-means clusters on diff intensity instead of color. Much better at isolating the top flake from substrate.
 - `--source-contour` + `--source-mask` — use pre-computed contour/mask from source_contour.py instead of re-segmenting internally. **Recommended**: ensures footprint uses the same source shape as sweep/refine.
-- `--n-clusters N` — number of K-means clusters (default: 12 for diff mode, 16 for color mode; increase for finer segmentation on retry)
+- `--n-clusters N` — number of K-means clusters (default: 12; increase for finer segmentation on retry)
 - `--candidate-rank N` — use the Nth-ranked candidate instead of the default (#1). **Always check `03_footprint_candidates.png`** — candidate #1 is often wrong. Try `--candidate-rank 2` or `--candidate-rank 3` on retry.
 
-**Outputs**: `footprint_mask.png`, `footprint_contour.npy`, `02_diff_image.png` (diff mode only), `02_cluster_map.png`, `03_footprint_candidates.png`, `04_footprint_grabcut.png`, updates `alignment_report.json`
+**Outputs**: `footprint_mask.png`, `footprint_contour.npy`, `02_diff_image.png`, `02_cluster_map.png`, `03_footprint_candidates.png`, `04_footprint_grabcut.png`, updates `alignment_report.json`
 
 ### sweep.py
 

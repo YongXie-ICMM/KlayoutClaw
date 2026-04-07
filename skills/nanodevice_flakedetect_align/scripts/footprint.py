@@ -1,14 +1,9 @@
 #!/usr/bin/env python
 """Build target footprint via shape-guided K-means + GrabCut.
 
-Two modes:
-  1. Diff mode (--bottom provided): SIFT-align bottom_part to target,
-     compute LAB diff image, K-means on intensity, filter by brightness.
-     This isolates the top-placed flake from the substrate.
-  2. Color mode (no --bottom): K-means on target LAB color, filter by
-     saturation. Original pipeline for when no bottom image is available.
-
-In both modes, cluster subsets are enumerated and ranked by shape
+SIFT-aligns bottom_part to target, computes LAB diff image, K-means on
+intensity, filters by brightness to isolate the top-placed flake from
+the substrate. Cluster subsets are enumerated and ranked by shape
 similarity to the source flake. GrabCut refines edges on the original
 color target image.
 
@@ -159,19 +154,6 @@ def segment_source_flake(image):
 # Clustering
 # ---------------------------------------------------------------------------
 
-def cluster_target_color(image, n_clusters=16):
-    """K-means clustering on target image in LAB color space."""
-    h, w = image.shape[:2]
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    pixels = lab.reshape(-1, 3).astype(np.float32)
-
-    km = KMeans(n_clusters=n_clusters, n_init=30, random_state=42)
-    labels = km.fit_predict(pixels)
-    label_map = labels.reshape(h, w)
-
-    return label_map, km
-
-
 def cluster_target_diff(diff_gray, n_clusters=12):
     """K-means clustering on grayscale diff intensity."""
     h, w = diff_gray.shape[:2]
@@ -182,31 +164,6 @@ def cluster_target_diff(diff_gray, n_clusters=12):
     label_map = labels.reshape(h, w)
 
     return label_map, km
-
-
-def filter_clusters_color(label_map, image, n_clusters):
-    """Filter out substrate and tiny clusters by saturation (color mode)."""
-    h, w = label_map.shape
-    total_px = h * w
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-
-    candidates = []
-    for cid in range(n_clusters):
-        cluster_mask = (label_map == cid)
-        area_frac = cluster_mask.sum() / total_px
-        mean_sat = sat[cluster_mask].mean() if cluster_mask.any() else 0
-
-        if mean_sat < 20:
-            continue
-        if area_frac < 0.005:
-            continue
-        if area_frac > 0.60:
-            continue
-
-        candidates.append(cid)
-
-    return candidates
 
 
 def filter_clusters_diff(label_map, diff_gray, n_clusters):
@@ -447,8 +404,8 @@ def main():
                         help="Source image (for shape reference)")
     parser.add_argument("--target", required=True,
                         help="Target image (full_stack_raw)")
-    parser.add_argument("--bottom", default=None,
-                        help="Bottom part image for diff mode (SIFT-align and subtract)")
+    parser.add_argument("--bottom", required=True,
+                        help="Bottom part image (SIFT-aligned and subtracted from target)")
     parser.add_argument("--source-contour", default=None,
                         help="Pre-computed source contour .npy (from source_contour.py)")
     parser.add_argument("--source-mask", default=None,
@@ -457,31 +414,26 @@ def main():
                         help="Mirror source before shape extraction")
     parser.add_argument("--pixel-size", type=float, required=True,
                         help="Microns per pixel")
-    parser.add_argument("--n-clusters", type=int, default=None,
-                        help="Number of K-means clusters (default: 12 for diff, 16 for color)")
+    parser.add_argument("--n-clusters", type=int, default=12,
+                        help="Number of K-means clusters (default: 12)")
     parser.add_argument("--candidate-rank", type=int, default=1,
                         help="Which ranked candidate to use (1=best, 2=second-best, etc.)")
     parser.add_argument("--output-dir", required=True, help="Output directory")
     args = parser.parse_args()
 
-    diff_mode = args.bottom is not None
-
     # Load images
     source_img = cv2.imread(args.source)
     target_img = cv2.imread(args.target)
+    bottom_img = cv2.imread(args.bottom)
     if source_img is None:
         print(f"ERROR: Cannot read source: {args.source}", file=sys.stderr)
         sys.exit(1)
     if target_img is None:
         print(f"ERROR: Cannot read target: {args.target}", file=sys.stderr)
         sys.exit(1)
-
-    bottom_img = None
-    if diff_mode:
-        bottom_img = cv2.imread(args.bottom)
-        if bottom_img is None:
-            print(f"ERROR: Cannot read bottom: {args.bottom}", file=sys.stderr)
-            sys.exit(1)
+    if bottom_img is None:
+        print(f"ERROR: Cannot read bottom: {args.bottom}", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -511,27 +463,21 @@ def main():
           f"convexity={source_desc['convexity']:.3f}, "
           f"solidity={source_desc['solidity']:.3f}")
 
-    # ── Step 2: Compute diff (if diff mode) and cluster ──
-    if diff_mode:
-        n_clusters = args.n_clusters or 12
-        print(f"Diff mode: SIFT-aligning bottom to target...")
-        warp_matrix, n_inliers = sift_align(bottom_img, target_img)
-        if warp_matrix is None:
-            print(f"ERROR: SIFT alignment failed ({n_inliers} matches).", file=sys.stderr)
-            sys.exit(1)
-        print(f"SIFT: {n_inliers} inliers")
+    # ── Step 2: SIFT-align bottom to target, compute diff, cluster ──
+    n_clusters = args.n_clusters
+    print(f"SIFT-aligning bottom to target...")
+    warp_matrix, n_inliers = sift_align(bottom_img, target_img)
+    if warp_matrix is None:
+        print(f"ERROR: SIFT alignment failed ({n_inliers} matches).", file=sys.stderr)
+        sys.exit(1)
+    print(f"SIFT: {n_inliers} inliers")
 
-        diff_gray = compute_diff_image(target_img, bottom_img, warp_matrix)
-        cv2.imwrite(os.path.join(args.output_dir, "02_diff_image.png"), diff_gray)
+    diff_gray = compute_diff_image(target_img, bottom_img, warp_matrix)
+    cv2.imwrite(os.path.join(args.output_dir, "02_diff_image.png"), diff_gray)
 
-        print(f"K-means clustering on diff (n={n_clusters})...")
-        label_map, km = cluster_target_diff(diff_gray, n_clusters=n_clusters)
-        candidate_ids = filter_clusters_diff(label_map, diff_gray, n_clusters)
-    else:
-        n_clusters = args.n_clusters or 16
-        print(f"Color mode: K-means clustering (n={n_clusters})...")
-        label_map, km = cluster_target_color(target_img, n_clusters=n_clusters)
-        candidate_ids = filter_clusters_color(label_map, target_img, n_clusters)
+    print(f"K-means clustering on diff (n={n_clusters})...")
+    label_map, km = cluster_target_diff(diff_gray, n_clusters=n_clusters)
+    candidate_ids = filter_clusters_diff(label_map, diff_gray, n_clusters)
 
     cluster_vis = draw_cluster_map(label_map, n_clusters)
     cv2.imwrite(os.path.join(args.output_dir, "02_cluster_map.png"), cluster_vis)
@@ -612,7 +558,7 @@ def main():
         report = {}
 
     report["footprint"] = {
-        "mode": "diff" if diff_mode else "color",
+        "mode": "diff",
         "cluster_ids": best_ids,
         "shape_distance": round(best_dist, 4),
         "grabcut_area_px": fp_area,
