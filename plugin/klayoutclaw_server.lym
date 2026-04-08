@@ -655,25 +655,22 @@ def _tool_auto_route(args):
     except Exception as e:
         raise ValueError("Failed to run route_worker.py subprocess: {}".format(e))
 
-    if proc.returncode != 0:
+    # Check output JSON first — worker writes structured errors there before exit(1)
+    if os.path.isfile(output_json):
+        with open(output_json, "r") as f:
+            result = json.load(f)
+        if result.get("status") == "error":
+            raise ValueError("Routing failed: {}".format("; ".join(result.get("errors", ["unknown"]))))
+    elif proc.returncode != 0:
         _log("auto_route stderr: {}".format(proc.stderr))
         stderr = proc.stderr.strip()
-        # Try to extract the last meaningful error line
         err_lines = [l for l in stderr.split("\n") if l.strip()]
         last_err = err_lines[-1] if err_lines else "unknown error"
         raise ValueError("Routing subprocess failed (exit code {}): {}\nFull stderr:\n{}".format(
             proc.returncode, last_err, stderr[:500]))
-
-    # Read output
-    if not os.path.isfile(output_json):
+    else:
         raise ValueError("route_worker.py ran but produced no output file. This usually means it crashed before writing results.\nstdout: {}\nstderr: {}".format(
             proc.stdout[:300], proc.stderr[:300]))
-
-    with open(output_json, "r") as f:
-        result = json.load(f)
-
-    if result.get("status") == "error":
-        raise ValueError("Routing failed: {}".format("; ".join(result.get("errors", ["unknown"]))))
 
     # Insert routed paths into layout
     ol_parts = output_layer.split("/")

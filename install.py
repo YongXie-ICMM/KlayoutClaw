@@ -20,6 +20,17 @@ def main():
         shutil.copy2(src, dst)
         print(f"Installed: {dst}")
 
+    tools_dir = Path(__file__).parent / "tools"
+    for worker in ["route_worker.py", "evaluate_worker.py"]:
+        src = tools_dir / worker
+        if not src.exists():
+            print(f"ERROR: Worker script not found: {src}")
+            sys.exit(1)
+        dst = klayout_dir / worker
+        shutil.copy2(src, dst)
+        print(f"Installed: {dst}")
+
+
     print("\nDone! No external Python dependencies needed (uses only stdlib + pya).")
     print("Restart KLayout to activate the MCP server.")
     print("The server will be available at http://127.0.0.1:8765/mcp")

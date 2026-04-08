@@ -366,10 +366,15 @@ def route(config: dict) -> dict:
     pins_b = extract_pin_centers(cell, layout, lb, db)
 
     if not pins_a or not pins_b:
+        missing = []
+        if not pins_a:
+            missing.append(f"pin_layer_a '{pin_layer_a}' has 0 pins")
+        if not pins_b:
+            missing.append(f"pin_layer_b '{pin_layer_b}' has 0 pins")
         return {"status": "error", "routed_pairs": 0,
                 "total_pins_a": len(pins_a), "total_pins_b": len(pins_b),
                 "paths": [],
-                "errors": ["No pins found on one or both layers"]}
+                "errors": [f"No pins found: {'; '.join(missing)}. Check that the layer specs match your layout and that polygons exist on those layers."]}
 
     obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
 
