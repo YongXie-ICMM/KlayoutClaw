@@ -1,16 +1,13 @@
 #!/usr/bin/env python
-"""Fine alignment optimization with agent-selected rotation.
+"""Fine alignment optimization v2 — optimized for speed.
 
-Full-resolution DE + L-BFGS-B + multi-restart pipeline. Takes the
-agent's rotation hint from the sweep step and optimizes within narrow
-bounds to find the precise alignment.
+Changes from refine.py:
+  1. Downsampled masks (25% resolution) in cost() — warpAffine on 386x520
+     instead of 1544x2080. Full-res masks still used in evaluate().
+  2. Reduced iteration budget: DE pop=20/maxiter=200, multi-restart 30 trials
+     with early stopping (stop after 10 consecutive non-improving trials).
 
-Usage:
-    conda run -n base python refine.py \
-        --source-contour <.npy> --source-mask <.png> \
-        --footprint-contour <.npy> --footprint-mask <.png> \
-        --target-image <image> --rot-hint <degrees> \
-        [--scale-hint <value>] --pixel-size <um/px> --output-dir <path>
+Usage: same CLI as refine.py
 """
 
 import argparse
@@ -23,15 +20,153 @@ import time
 import cv2
 import numpy as np
 from scipy.optimize import differential_evolution, minimize
+from scipy.spatial import KDTree
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "nanodevice_flakedetect", "scripts"))
-from core import (ChamferAligner, make_warp, warp_contour, desaturate,
-                  mask_centroid)
+from core import make_warp, warp_contour, desaturate, mask_centroid
 
+
+class FastChamferAligner:
+    """ChamferAligner with downsampled masks for fast cost evaluation.
+
+    Identical to ChamferAligner except:
+    - cost() uses 25% resolution masks for the warpAffine containment check
+    - evaluate() still uses full-resolution masks for accurate final metrics
+    """
+
+    def __init__(self, source_contour, source_mask,
+                 footprint_contour, footprint_mask,
+                 n_source_pts=600, n_fp_pts=800, ds_factor=4):
+        # Store full-res masks (for evaluate)
+        self.source_mask = source_mask
+        self.footprint_mask = footprint_mask
+        self.h, self.w = footprint_mask.shape[:2]
+
+        # Downsampled masks (for cost)
+        self.ds = ds_factor
+        self.small_w = self.w // ds_factor
+        self.small_h = self.h // ds_factor
+        self.small_source_mask = cv2.resize(
+            source_mask, (self.small_w, self.small_h),
+            interpolation=cv2.INTER_NEAREST)
+        self.small_footprint_mask = cv2.resize(
+            footprint_mask, (self.small_w, self.small_h),
+            interpolation=cv2.INTER_NEAREST)
+
+        # Centroids (full-res coordinates)
+        src_centroid = mask_centroid(source_mask)
+        if src_centroid is None:
+            raise ValueError("Source mask is empty")
+        self.src_cx, self.src_cy = src_centroid
+
+        fp_centroid = mask_centroid(footprint_mask)
+        if fp_centroid is None:
+            raise ValueError("Footprint mask is empty")
+        self.fp_cx, self.fp_cy = fp_centroid
+
+        # Subsample source contour
+        src_pts = np.asarray(source_contour, dtype=np.float64).reshape(-1, 2)
+        if len(src_pts) > n_source_pts:
+            idx = np.linspace(0, len(src_pts) - 1, n_source_pts, dtype=int)
+            src_pts = src_pts[idx]
+        self.source_pts = src_pts
+
+        # Subsample footprint contour + KDTree
+        fp_pts = np.asarray(footprint_contour, dtype=np.float64).reshape(-1, 2)
+        if len(fp_pts) > n_fp_pts:
+            idx = np.linspace(0, len(fp_pts) - 1, n_fp_pts, dtype=int)
+            fp_pts = fp_pts[idx]
+        self.fp_pts = fp_pts
+        self.fp_tree = KDTree(fp_pts)
+
+    def cost(self, params):
+        """Fast cost using downsampled masks for containment."""
+        rot_deg, scale, dx, dy = params
+        M = make_warp(self.src_cx, self.src_cy,
+                      self.fp_cx + dx, self.fp_cy + dy,
+                      math.radians(rot_deg), scale)
+
+        # Warp source contour points (full-res coordinates)
+        ones = np.ones((len(self.source_pts), 1))
+        warped = (M @ np.hstack([self.source_pts, ones]).T).T
+
+        # Out-of-bounds check
+        oob = ((warped[:, 0] < 0) | (warped[:, 0] >= self.w) |
+               (warped[:, 1] < 0) | (warped[:, 1] >= self.h))
+        oob_frac = oob.sum() / len(warped)
+        if oob_frac > 0.3:
+            return 1e6
+
+        # Forward Chamfer (KDTree, unchanged)
+        dists_fwd, _ = self.fp_tree.query(warped)
+        fwd = (dists_fwd ** 2).mean()
+
+        # Containment on DOWNSAMPLED masks
+        # Both src and dst downsampled by ds, so M_small[:,:2] = M[:,:2]
+        # and M_small[:,2] = M[:,2] / ds
+        M_small = M.copy()
+        M_small[0, 2] /= self.ds
+        M_small[1, 2] /= self.ds
+
+        warped_mask = cv2.warpAffine(self.small_source_mask, M_small,
+                                     (self.small_w, self.small_h),
+                                     flags=cv2.INTER_NEAREST)
+        warped_area = (warped_mask > 0).sum()
+        if warped_area < (100 // (self.ds * self.ds)):
+            return 1e6
+        outside = cv2.bitwise_and(warped_mask,
+                                  cv2.bitwise_not(self.small_footprint_mask))
+        outside_frac = (outside > 0).sum() / warped_area
+
+        return fwd + 3000.0 * outside_frac + 500.0 * oob_frac
+
+    def evaluate(self, params, pixel_size_um=1.0):
+        """Full-resolution evaluation (identical to original ChamferAligner)."""
+        rot_deg, scale, dx, dy = params
+        M = make_warp(self.src_cx, self.src_cy,
+                      self.fp_cx + dx, self.fp_cy + dy,
+                      math.radians(rot_deg), scale)
+
+        ones = np.ones((len(self.source_pts), 1))
+        warped = (M @ np.hstack([self.source_pts, ones]).T).T
+
+        dists_fwd, _ = self.fp_tree.query(warped)
+
+        warped_mask = cv2.warpAffine(self.source_mask, M, (self.w, self.h),
+                                     flags=cv2.INTER_NEAREST)
+
+        inter = cv2.bitwise_and(warped_mask, self.footprint_mask)
+        union = cv2.bitwise_or(warped_mask, self.footprint_mask)
+
+        inter_area = (inter > 0).sum()
+        union_area = max((union > 0).sum(), 1)
+        warped_area = max((warped_mask > 0).sum(), 1)
+        fp_area = max((self.footprint_mask > 0).sum(), 1)
+
+        outside = cv2.bitwise_and(warped_mask,
+                                  cv2.bitwise_not(self.footprint_mask))
+
+        return {
+            "rot_deg": float(rot_deg),
+            "scale": float(scale),
+            "dx_px": float(dx),
+            "dy_px": float(dy),
+            "cost": float(self.cost(params)),
+            "fwd_chamfer_mean_um": float(dists_fwd.mean() * pixel_size_um),
+            "fwd_chamfer_median_um": float(np.median(dists_fwd) * pixel_size_um),
+            "fwd_chamfer_p90_um": float(np.percentile(dists_fwd, 90) * pixel_size_um),
+            "iou": float(inter_area / union_area),
+            "top_containment": float(inter_area / warped_area),
+            "fp_containment": float(inter_area / fp_area),
+            "outside_fraction": float((outside > 0).sum() / warped_area),
+            "warp_matrix": M,
+        }
+
+
+# ---- Visualization (unchanged from refine.py) ----
 
 def draw_overlay_raw(target_img, source_contour, footprint_contour,
                      params, aligner, pixel_size):
-    """Draw warped contour (yellow) + footprint contour (green) on raw image."""
     rot_deg, scale, dx, dy = params
     M = make_warp(aligner.src_cx, aligner.src_cy,
                   aligner.fp_cx + dx, aligner.fp_cy + dy,
@@ -54,7 +189,6 @@ def draw_overlay_raw(target_img, source_contour, footprint_contour,
 
 def draw_mask_overlap(target_img, source_mask, footprint_mask,
                       params, aligner, metrics):
-    """Draw mask overlap: green=overlap, red=footprint-only, blue=warped-only."""
     rot_deg, scale, dx, dy = params
     M = make_warp(aligner.src_cx, aligner.src_cy,
                   aligner.fp_cx + dx, aligner.fp_cy + dy,
@@ -84,7 +218,6 @@ def draw_mask_overlap(target_img, source_mask, footprint_mask,
 
 def draw_chamfer_heatmap(target_img, source_contour, footprint_contour,
                          params, aligner, pixel_size):
-    """Draw distance-coded warped contour: green=close, red=far."""
     rot_deg, scale, dx, dy = params
     M = make_warp(aligner.src_cx, aligner.src_cy,
                   aligner.fp_cx + dx, aligner.fp_cy + dy,
@@ -95,13 +228,11 @@ def draw_chamfer_heatmap(target_img, source_contour, footprint_contour,
     dists, _ = aligner.fp_tree.query(wc)
 
     bg = desaturate(target_img, 0.4)
-    # Draw footprint contour faintly
     cv2.drawContours(bg, [footprint_contour.reshape(-1, 1, 2).astype(np.int32)],
                      -1, (255, 255, 0), 1)
 
-    # Color-code warped contour by distance
     for i in range(len(wc) - 1):
-        t = min(dists[i] / 40.0, 1.0)  # normalize: 0=close, 1=far (40px)
+        t = min(dists[i] / 40.0, 1.0)
         color = (0, int(255 * (1 - t)), int(255 * t))
         pt1 = (int(wc[i, 0]), int(wc[i, 1]))
         pt2 = (int(wc[i + 1, 0]), int(wc[i + 1, 1]))
@@ -113,8 +244,10 @@ def draw_chamfer_heatmap(target_img, source_contour, footprint_contour,
     return bg
 
 
+# ---- Main ----
+
 def main():
-    parser = argparse.ArgumentParser(description="Fine alignment optimization")
+    parser = argparse.ArgumentParser(description="Fine alignment optimization v2")
     parser.add_argument("--source-contour", required=True)
     parser.add_argument("--source-mask", required=True)
     parser.add_argument("--footprint-contour", required=True)
@@ -142,11 +275,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     h, w = footprint_mask.shape[:2]
 
-    # Build aligner at full resolution
-    aligner = ChamferAligner(
+    # Build fast aligner (downsampled masks)
+    aligner = FastChamferAligner(
         source_contour, source_mask,
         footprint_contour, footprint_mask,
-        n_source_pts=600, n_fp_pts=800
+        n_source_pts=600, n_fp_pts=800, ds_factor=4
     )
 
     # Bounds: narrow around hint
@@ -155,14 +288,12 @@ def main():
 
     scale_hint = args.scale_hint
     if scale_hint is None:
-        # Auto-read from sweep candidates in alignment_report.json
         report_path = os.path.join(args.output_dir, "alignment_report.json")
         if os.path.exists(report_path):
             with open(report_path) as f:
                 report = json.load(f)
             candidates = report.get("sweep_candidates", [])
             if candidates:
-                # Find candidate closest to --rot-hint
                 best = min(candidates,
                            key=lambda c: abs(c["rotation_deg"] - args.rot_hint))
                 scale_hint = best["scale"]
@@ -182,13 +313,13 @@ def main():
         (-h / 2, h / 2),
     ]
 
-    # Stage 1: Differential Evolution
+    # Stage 1: Differential Evolution (reduced: pop=20, maxiter=200)
     print(f"DE: rot=[{rot_lo:.0f},{rot_hi:.0f}] scale=[{s_lo:.2f},{s_hi:.2f}]")
     t0 = time.time()
 
     de = differential_evolution(
         aligner.cost, bounds=bounds,
-        maxiter=500, popsize=50,
+        maxiter=200, popsize=20,
         tol=1e-5, seed=42,
         mutation=(0.5, 1.5), recombination=0.9,
         polish=False,
@@ -209,11 +340,12 @@ def main():
         best_x = nm.x.copy()
         print(f"  L-BFGS-B improved: cost={nm.fun:.1f}")
 
-    # Stage 3: Multi-restart
-    print("Multi-restart (150 trials)...")
+    # Stage 3: Multi-restart (reduced: 30 trials, early stop after 10 non-improving)
+    print("Multi-restart (30 trials, early stop=10)...")
     rng = np.random.RandomState(42)
     n_improved = 0
-    for trial in range(150):
+    no_improve_streak = 0
+    for trial in range(30):
         x0 = best_x + rng.randn(4) * np.array([4.0, 0.03, 12.0, 12.0])
         x0 = np.clip(x0, [b[0] for b in bounds], [b[1] for b in bounds])
         try:
@@ -223,14 +355,21 @@ def main():
                 best_cost = r.fun
                 best_x = r.x.copy()
                 n_improved += 1
+                no_improve_streak = 0
+            else:
+                no_improve_streak += 1
         except Exception:
-            pass
+            no_improve_streak += 1
+
+        if no_improve_streak >= 10:
+            print(f"  Early stop at trial {trial + 1} (10 consecutive non-improving)")
+            break
 
     total_time = time.time() - t0
     print(f"  Multi-restart: {n_improved} improvements, "
           f"final cost={best_cost:.1f} ({total_time:.0f}s total)")
 
-    # Evaluate final result
+    # Evaluate final result (full resolution)
     final_params = list(best_x)
     metrics = aligner.evaluate(final_params, args.pixel_size)
 
@@ -305,7 +444,7 @@ def main():
         "scale": metrics["scale"],
         "dx_px": metrics["dx_px"],
         "dy_px": metrics["dy_px"],
-        "mirror": True,  # inherited from source_contour step
+        "mirror": True,
         "fwd_chamfer_um": metrics["fwd_chamfer_mean_um"],
         "fwd_chamfer_median_um": metrics["fwd_chamfer_median_um"],
         "fwd_chamfer_p90_um": metrics["fwd_chamfer_p90_um"],
@@ -319,7 +458,7 @@ def main():
         json.dump(report, f, indent=2)
 
     print(f"\nSaved: warp_top.npy, 20/21/22 diagnostic images")
-    print(f"Status: complete")
+    print(f"Status: complete ({total_time:.0f}s)")
 
 
 if __name__ == "__main__":
