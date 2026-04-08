@@ -225,7 +225,7 @@ Evaluate a device design against configurable geometric quality checks. Runs `to
 **Available check primitives (8):**
 - `component_overlap` — fraction of component area overlapping with region
 - `component_containment` — fraction of component area contained within region
-- `contact_isolation` — fraction of route pairs that don't cross
+- `contact_isolation` — route crossing check with junction-aware detection and steep penalty curve
 - `connectivity` — fraction of contacts that reach a bonding pad
 - `route_endpoints` — fraction of route endpoints on valid targets
 - `adjacency` — fraction of A shapes within tolerance of B

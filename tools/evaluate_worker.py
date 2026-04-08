@@ -220,20 +220,107 @@ def _prim_component_containment(out_lib, ref_lib, layer_map, args):
     return comp.intersection(region).area / comp.area
 
 
+def _route_endpoints_on_layer(lib, layer, datatype):
+    """Extract spine endpoints for each route on a single layer.
+
+    Returns list of (endpoint_a, endpoint_b) numpy arrays.
+    Prefers path spine; falls back to polygon most-distant-vertices.
+    """
+    eps = []
+    for cell in lib.cells:
+        for path in cell.get_paths():
+            if path.layers[0] == layer and path.datatypes[0] == datatype:
+                try:
+                    spine = np.array(path.spine())
+                except (AttributeError, TypeError):
+                    try:
+                        spine = np.array(path.points)
+                    except (AttributeError, TypeError):
+                        continue
+                if len(spine) >= 2:
+                    eps.append((spine[0].copy(), spine[-1].copy()))
+    if eps:
+        return eps
+    for cell in lib.cells:
+        for poly in cell.get_polygons():
+            if poly.layer == layer and poly.datatype == datatype:
+                pts = poly.points
+                if len(pts) < 3:
+                    continue
+                dists = np.sqrt(((pts[:, None] - pts[None, :]) ** 2).sum(axis=2))
+                i, j = np.unravel_index(np.argmax(dists), dists.shape)
+                eps.append((pts[i].copy(), pts[j].copy()))
+    return eps
+
+
+def _is_junction(intersection_geom, eps_a, eps_b, tolerance=2.0):
+    """True if intersection sits near an endpoint of both routes (junction).
+
+    A junction is end-to-end; a crossing is mid-body overlap.
+    """
+    if intersection_geom.is_empty:
+        return True
+    centroid = np.array(intersection_geom.centroid.coords[0])
+    near_a = any(np.linalg.norm(centroid - ep) <= tolerance for ep in eps_a)
+    near_b = any(np.linalg.norm(centroid - ep) <= tolerance for ep in eps_b)
+    return near_a and near_b
+
+
+def _crossing_penalty(crossing):
+    """Steep penalty curve for route crossings.
+
+    0 → 1.0, 1-2 → 0.8, 3-5 → linear decay to 0.2, ≥6 → exp collapse.
+    """
+    if crossing == 0:
+        return 1.0
+    if crossing <= 2:
+        return 0.8
+    if crossing <= 5:
+        return 0.6 - (crossing - 3) * 0.2
+    return 0.1 * (0.5 ** (crossing - 5))
+
+
 def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
-    """Fraction of route pairs that don't cross."""
+    """Route crossing check with junction-aware detection.
+
+    Distinguishes junctions (endpoint-to-endpoint) from real crossings
+    (mid-body shorts).  Penalises crossings steeply — shorts are
+    dead-or-alive, not a fractional metric.
+    """
     route_comp = args.get("component", "contact_route")
-    routes = _component_list(out_lib, layer_map, route_comp)
-    if len(routes) < 2:
-        return 1.0 if routes else 0.0
-    n = len(routes)
-    total_pairs = n * (n - 1) // 2
+    spec = layer_map.get(route_comp)
+    if spec is None:
+        return 0.0
+    pairs = _normalize_layer_spec(spec)
+    if not pairs:
+        return 0.0
+
+    all_routes = []
+    all_eps = []
+    for layer, dt in pairs:
+        routes = _extract_shapely(out_lib, layer, dt)
+        eps = _route_endpoints_on_layer(out_lib, layer, dt)
+        all_routes.extend(routes)
+        all_eps.extend(eps)
+
+    n = len(all_routes)
+    if n < 2:
+        return 1.0 if all_routes else 0.0
+
     crossing = 0
     for i in range(n):
         for j in range(i + 1, n):
-            if routes[i].intersection(routes[j]).area > 1.0:
-                crossing += 1
-    return (total_pairs - crossing) / total_pairs
+            ix = all_routes[i].intersection(all_routes[j])
+            if ix.area <= 0.01:
+                continue
+            if i < len(all_eps) and j < len(all_eps):
+                if _is_junction(ix, all_eps[i], all_eps[j]):
+                    continue
+            elif ix.area <= 1.0:
+                continue
+            crossing += 1
+
+    return _crossing_penalty(crossing)
 
 
 def _prim_connectivity(out_lib, ref_lib, layer_map, args):
