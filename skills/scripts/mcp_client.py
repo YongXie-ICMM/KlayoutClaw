@@ -28,7 +28,8 @@ def load_mcp_config(config_path=None):
       1. config_path (explicit --mcp-config flag)
       2. .mcp.json in current working directory
       3. mcp_config.json in the KlayoutClaw project root
-      4. Default http://127.0.0.1:8765/mcp
+      4. klayout.json in the workspace and .qlaybot root directory.
+      5. Default http://127.0.0.1:8765/mcp
 
     Returns the resolved URL and sets the module-level MCP_URL.
     """
@@ -61,7 +62,22 @@ def load_mcp_config(config_path=None):
         url = cfg["mcpServers"]["klayoutclaw"]["url"]
         MCP_URL = url
         return url
-
+    
+    #Fallback 3:klayout.json in the workspace and .qlaybot root directory
+    cwd_cfg = os.path.join(os.getcwd(), "klayout.json")
+    qlaybot_root_cfg = os.path.join('~/.qlaybot/config', "klayout.json")
+    if os.path.exists(cwd_cfg):
+        with open(cwd_cfg) as f:
+            cfg = json.load(f)
+        url = cfg["url"]
+        MCP_URL = url
+        return url
+    if os.path.exists(qlaybot_root_cfg):
+        with open(qlaybot_root_cfg) as f:
+            cfg = json.load(f)
+        url = cfg["url"]
+        MCP_URL = url
+        return url
     # Default
     MCP_URL = _DEFAULT_URL
     return _DEFAULT_URL
