@@ -368,6 +368,17 @@ export async function createDesignSession(
         break;
       }
       case "tool_execution_start":
+        // Flush thinking/text accumulated before this tool call
+        // (the LLM produces thinking + text, then emits tool_use)
+        {
+          const thinkingText = pendingThinkingChunks.join("");
+          if (thinkingText) history.recordThinking(thinkingText);
+          pendingThinkingChunks = [];
+
+          const responseText = pendingTextChunks.join("");
+          if (responseText) history.recordResponse(responseText);
+          pendingTextChunks = [];
+        }
         toolStartTimes.set(event.toolCallId, Date.now());
         toolStartArgs.set(event.toolCallId, event.args);
         break;
@@ -381,12 +392,11 @@ export async function createDesignSession(
         break;
       }
       case "agent_end": {
-        // Flush accumulated thinking
+        // Flush any remaining thinking/text from the final turn
         const thinkingText = pendingThinkingChunks.join("");
         if (thinkingText) history.recordThinking(thinkingText);
         pendingThinkingChunks = [];
 
-        // Flush accumulated response text
         const responseText = pendingTextChunks.join("");
         if (responseText) history.recordResponse(responseText);
         pendingTextChunks = [];

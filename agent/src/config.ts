@@ -257,6 +257,9 @@ export function loadConfig(configDir?: string): QlayBotConfig {
       const modelConfig = JSON.parse(readFileSync(modelPath, "utf-8"));
       if (modelConfig.defaultModel) config.agent.defaultModel = modelConfig.defaultModel;
       if (modelConfig.thinkingLevel) config.agent.thinkingLevel = modelConfig.thinkingLevel;
+      // Env vars take precedence over file config (allows runtime override without rebuild)
+      if (process.env.QLAYBOT_MODEL) config.agent.defaultModel = process.env.QLAYBOT_MODEL;
+      if (process.env.QLAYBOT_THINKING) config.agent.thinkingLevel = process.env.QLAYBOT_THINKING as QlayBotConfig["agent"]["thinkingLevel"];
       if (modelConfig.providers) {
         config.models.providers = modelConfig.providers;
         // Still apply env var override
