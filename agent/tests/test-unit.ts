@@ -317,6 +317,24 @@ describe("nanodevice tools", () => {
     expect(tools.length).toBe(10);
   });
 
+  it("gdsalign commit_gds command includes --warp, --traces, and --gds args", () => {
+    const tools = registerNanodeviceTools();
+    const gdsalignTool = tools.find((t) => t.name === "klayout_nanodevice_gdsalign_align_to_gds");
+    expect(gdsalignTool).toBeDefined();
+    const code = gdsalignTool!.generateCode({});
+    // Parse the JSON from the instruction result
+    const jsonStr = code.replace(/^result = /, "");
+    const result = JSON.parse(jsonStr);
+    const commitCmd = result.scripts["4_commit_gds"].command as string;
+    // All 6 required args must be present in the command template
+    expect(commitCmd).toContain("--warp");
+    expect(commitCmd).toContain("--traces");
+    expect(commitCmd).toContain("--gds");
+    expect(commitCmd).toContain("--image");
+    expect(commitCmd).toContain("--pixel-size");
+    expect(commitCmd).toContain("--output-dir");
+  });
+
   it("each tool returns instruction JSON with skill_doc reference", () => {
     const tools = registerNanodeviceTools();
     for (const tool of tools) {

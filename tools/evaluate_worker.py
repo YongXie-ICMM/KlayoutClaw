@@ -54,7 +54,7 @@ def _to_shapely(points):
         if not s.is_valid:
             s = make_valid(s)
         return s if not s.is_empty else None
-    except Exception:
+    except (ValueError, shapely.errors.GEOSException):
         return None
 
 
@@ -198,77 +198,65 @@ def _resolve_region(out_lib, ref_lib, layer_map, region_spec, region_op="union")
 
 def _prim_component_overlap(out_lib, ref_lib, layer_map, args):
     """Fraction of component area overlapping with region."""
-    try:
-        comp = _component_union(out_lib, layer_map, args["component"])
-        if comp.is_empty:
-            return 0.0
-        region = _resolve_region(out_lib, ref_lib, layer_map,
-                                 args["region"], args.get("region_op", "union"))
-        if region.is_empty:
-            return 0.0
-        return comp.intersection(region).area / comp.area
-    except Exception:
+    comp = _component_union(out_lib, layer_map, args["component"])
+    if comp.is_empty:
         return 0.0
+    region = _resolve_region(out_lib, ref_lib, layer_map,
+                             args["region"], args.get("region_op", "union"))
+    if region.is_empty:
+        return 0.0
+    return comp.intersection(region).area / comp.area
 
 
 def _prim_component_containment(out_lib, ref_lib, layer_map, args):
     """Fraction of component area contained within region."""
-    try:
-        comp = _component_union(out_lib, layer_map, args["component"])
-        if comp.is_empty:
-            return 0.0
-        region = _resolve_region(out_lib, ref_lib, layer_map,
-                                 args["region"], args.get("region_op", "union"))
-        if region.is_empty:
-            return 0.0
-        return comp.intersection(region).area / comp.area
-    except Exception:
+    comp = _component_union(out_lib, layer_map, args["component"])
+    if comp.is_empty:
         return 0.0
+    region = _resolve_region(out_lib, ref_lib, layer_map,
+                             args["region"], args.get("region_op", "union"))
+    if region.is_empty:
+        return 0.0
+    return comp.intersection(region).area / comp.area
 
 
 def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
     """Fraction of route pairs that don't cross."""
-    try:
-        route_comp = args.get("component", "contact_route")
-        routes = _component_list(out_lib, layer_map, route_comp)
-        if len(routes) < 2:
-            return 1.0 if routes else 0.0
-        n = len(routes)
-        total_pairs = n * (n - 1) // 2
-        crossing = 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                if routes[i].intersection(routes[j]).area > 1.0:
-                    crossing += 1
-        return (total_pairs - crossing) / total_pairs
-    except Exception:
-        return 0.0
+    route_comp = args.get("component", "contact_route")
+    routes = _component_list(out_lib, layer_map, route_comp)
+    if len(routes) < 2:
+        return 1.0 if routes else 0.0
+    n = len(routes)
+    total_pairs = n * (n - 1) // 2
+    crossing = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if routes[i].intersection(routes[j]).area > 1.0:
+                crossing += 1
+    return (total_pairs - crossing) / total_pairs
 
 
 def _prim_connectivity(out_lib, ref_lib, layer_map, args):
     """Fraction of contacts that reach a bonding pad via routes."""
-    try:
-        contact_comp = args.get("contact_component", "contact_patch")
-        pad_comp = args.get("pad_component", "bonding_pad")
-        route_comp = args.get("route_component", "contact_route")
-        tolerance = args.get("tolerance", 15.0)
+    contact_comp = args.get("contact_component", "contact_patch")
+    pad_comp = args.get("pad_component", "bonding_pad")
+    route_comp = args.get("route_component", "contact_route")
+    tolerance = args.get("tolerance", 15.0)
 
-        patches = _component_list(out_lib, layer_map, contact_comp)
-        pads = _component_union(out_lib, layer_map, pad_comp)
-        if not patches or pads.is_empty:
-            return 0.0
-        pads_buf = pads.buffer(tolerance)
-        route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
-        if not route_eps:
-            return 0.0
-        connected = 0
-        for patch in patches:
-            center = np.array(patch.centroid.coords[0])
-            if _can_reach_pad(center, route_eps, pads_buf, tolerance):
-                connected += 1
-        return connected / len(patches)
-    except Exception:
+    patches = _component_list(out_lib, layer_map, contact_comp)
+    pads = _component_union(out_lib, layer_map, pad_comp)
+    if not patches or pads.is_empty:
         return 0.0
+    pads_buf = pads.buffer(tolerance)
+    route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
+    if not route_eps:
+        return 0.0
+    connected = 0
+    for patch in patches:
+        center = np.array(patch.centroid.coords[0])
+        if _can_reach_pad(center, route_eps, pads_buf, tolerance):
+            connected += 1
+    return connected / len(patches)
 
 
 def _can_reach_pad(start, route_eps, pads_buf, tolerance):
@@ -296,107 +284,95 @@ def _can_reach_pad(start, route_eps, pads_buf, tolerance):
 
 def _prim_route_endpoints(out_lib, ref_lib, layer_map, args):
     """Fraction of route endpoints that land on valid targets."""
-    try:
-        route_comp = args.get("route_component", "contact_route")
-        target_components = args.get("target_components", ["contact_patch", "mesa", "bonding_pad"])
-        tolerance = args.get("tolerance", 15.0)
+    route_comp = args.get("route_component", "contact_route")
+    target_components = args.get("target_components", ["contact_patch", "mesa", "bonding_pad"])
+    tolerance = args.get("tolerance", 15.0)
 
-        route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
-        if not route_eps:
-            return 0.0
-        target = sg.Polygon()
-        for comp_name in target_components:
-            g = _component_union(out_lib, layer_map, comp_name)
-            if not g.is_empty:
-                target = target.union(g) if not target.is_empty else g
-        if target.is_empty:
-            return 0.0
-        target_buf = target.buffer(tolerance)
-        all_eps = []
-        for ep_a, ep_b in route_eps:
-            all_eps.extend([ep_a, ep_b])
-        all_eps_arr = np.array(all_eps) if all_eps else np.empty((0, 2))
-        correct = 0
-        total = 0
-        for route_idx, (ep_a, ep_b) in enumerate(route_eps):
-            for ep_offset, ep in enumerate([ep_a, ep_b]):
-                total += 1
-                pt = sg.Point(ep)
-                if target_buf.contains(pt):
-                    correct += 1
-                elif len(all_eps_arr) > 0:
-                    dists = np.linalg.norm(all_eps_arr - ep, axis=1)
-                    self_idx = 2 * route_idx + ep_offset
-                    dists[self_idx] = np.inf
-                    if np.any(dists <= tolerance):
-                        correct += 1
-        return correct / total if total > 0 else 0.0
-    except Exception:
+    route_eps = _get_spine_endpoints(out_lib, layer_map, route_comp)
+    if not route_eps:
         return 0.0
+    target = sg.Polygon()
+    for comp_name in target_components:
+        g = _component_union(out_lib, layer_map, comp_name)
+        if not g.is_empty:
+            target = target.union(g) if not target.is_empty else g
+    if target.is_empty:
+        return 0.0
+    target_buf = target.buffer(tolerance)
+    all_eps = []
+    for ep_a, ep_b in route_eps:
+        all_eps.extend([ep_a, ep_b])
+    all_eps_arr = np.array(all_eps) if all_eps else np.empty((0, 2))
+    correct = 0
+    total = 0
+    for route_idx, (ep_a, ep_b) in enumerate(route_eps):
+        for ep_offset, ep in enumerate([ep_a, ep_b]):
+            total += 1
+            pt = sg.Point(ep)
+            if target_buf.contains(pt):
+                correct += 1
+            elif len(all_eps_arr) > 0:
+                dists = np.linalg.norm(all_eps_arr - ep, axis=1)
+                self_idx = 2 * route_idx + ep_offset
+                dists[self_idx] = np.inf
+                if np.any(dists <= tolerance):
+                    correct += 1
+    return correct / total if total > 0 else 0.0
 
 
 def _prim_adjacency(out_lib, ref_lib, layer_map, args):
     """Fraction of component_a shapes within tolerance of component_b."""
-    try:
-        shapes_a = _component_list(out_lib, layer_map, args["component_a"])
-        if not shapes_a:
-            return 0.0
-        comp_b = _component_union(out_lib, layer_map, args["component_b"])
-        if comp_b.is_empty:
-            return 0.0
-        tolerance = args.get("tolerance", 2.0)
-        comp_b_buf = comp_b.buffer(tolerance)
-        return sum(1 for s in shapes_a if comp_b_buf.intersects(s)) / len(shapes_a)
-    except Exception:
+    shapes_a = _component_list(out_lib, layer_map, args["component_a"])
+    if not shapes_a:
         return 0.0
+    comp_b = _component_union(out_lib, layer_map, args["component_b"])
+    if comp_b.is_empty:
+        return 0.0
+    tolerance = args.get("tolerance", 2.0)
+    comp_b_buf = comp_b.buffer(tolerance)
+    return sum(1 for s in shapes_a if comp_b_buf.intersects(s)) / len(shapes_a)
 
 
 def _prim_solidity(out_lib, ref_lib, layer_map, args):
     """Score based on shape solidity relative to threshold."""
-    try:
-        comp = _component_union(out_lib, layer_map, args["component"])
-        if comp.is_empty:
-            return 0.0
-        hull = comp.convex_hull
-        if hull.is_empty or hull.area == 0:
-            return 0.0
-        solidity = comp.area / hull.area
-        threshold = args.get("threshold", 0.5)
-        direction = args.get("direction", "below")
-        if direction == "below":
-            return max(0.0, min(1.0, 1.0 - solidity)) if solidity < threshold else 0.0
-        else:
-            return max(0.0, min(1.0, solidity)) if solidity >= threshold else 0.0
-    except Exception:
+    comp = _component_union(out_lib, layer_map, args["component"])
+    if comp.is_empty:
         return 0.0
+    hull = comp.convex_hull
+    if hull.is_empty or hull.area == 0:
+        return 0.0
+    solidity = comp.area / hull.area
+    threshold = args.get("threshold", 0.5)
+    direction = args.get("direction", "below")
+    if direction == "below":
+        return max(0.0, min(1.0, 1.0 - solidity)) if solidity < threshold else 0.0
+    else:
+        return max(0.0, min(1.0, solidity)) if solidity >= threshold else 0.0
 
 
 def _prim_spacing(out_lib, ref_lib, layer_map, args):
     """Fraction of component pairs meeting minimum distance."""
-    try:
-        shapes_a = _component_list(out_lib, layer_map, args["component_a"])
-        comp_b_name = args.get("component_b", args["component_a"])
-        if comp_b_name == args["component_a"]:
-            shapes_b = shapes_a
-        else:
-            shapes_b = _component_list(out_lib, layer_map, comp_b_name)
-        if not shapes_a or not shapes_b:
-            return 0.0
-        min_distance = args.get("min_distance", 1.0)
-        same = (comp_b_name == args["component_a"])
-        total = 0
-        ok = 0
-        for i, sa in enumerate(shapes_a):
-            start_j = i + 1 if same else 0
-            for j in range(start_j, len(shapes_b)):
-                if same and i == j:
-                    continue
-                total += 1
-                if sa.distance(shapes_b[j]) >= min_distance:
-                    ok += 1
-        return ok / total if total > 0 else 1.0
-    except Exception:
+    shapes_a = _component_list(out_lib, layer_map, args["component_a"])
+    comp_b_name = args.get("component_b", args["component_a"])
+    if comp_b_name == args["component_a"]:
+        shapes_b = shapes_a
+    else:
+        shapes_b = _component_list(out_lib, layer_map, comp_b_name)
+    if not shapes_a or not shapes_b:
         return 0.0
+    min_distance = args.get("min_distance", 1.0)
+    same = (comp_b_name == args["component_a"])
+    total = 0
+    ok = 0
+    for i, sa in enumerate(shapes_a):
+        start_j = i + 1 if same else 0
+        for j in range(start_j, len(shapes_b)):
+            if same and i == j:
+                continue
+            total += 1
+            if sa.distance(shapes_b[j]) >= min_distance:
+                ok += 1
+    return ok / total if total > 0 else 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -469,19 +445,41 @@ def main():
     out_lib = gdstk.read_gds(gds_path)
     ref_lib = gdstk.read_gds(reference_gds) if reference_gds else None
 
+    # Pre-check: report which layer_map components have zero geometry
+    empty_components = []
+    for comp_name, spec in layer_map.items():
+        if comp_name.startswith("_"):
+            continue
+        pairs = _normalize_layer_spec(spec)
+        if not pairs:
+            empty_components.append("{} (invalid layer spec: {})".format(comp_name, spec))
+            continue
+        has_shapes = False
+        for layer, dt in pairs:
+            if _extract_shapely(out_lib, layer, dt):
+                has_shapes = True
+                break
+        if not has_shapes:
+            empty_components.append("{} (layer {} — no shapes found)".format(comp_name, pairs))
+
     # Run checks
     results = []
     for check in checks:
         name = check["name"]
         args = check.get("args", {})
         weight = check.get("weight", 1.0 / len(checks))
-        score = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
-        score = max(0.0, min(1.0, float(score)))
+        try:
+            score = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
+            score = max(0.0, min(1.0, float(score)))
+            detail = "{}: {:.4f}".format(name, score)
+        except Exception as e:
+            score = 0.0
+            detail = "{}: ERROR — {}".format(name, e)
         results.append({
             "name": name,
             "score": score,
             "weight": weight,
-            "detail": "{}: {:.4f}".format(name, score),
+            "detail": detail,
         })
 
     # Compute overall score (weighted sum)
@@ -496,6 +494,11 @@ def main():
         "overall": overall,
         "checks": results,
     }
+    if empty_components:
+        output["warnings"] = [
+            "Components with no geometry in the GDS: " + "; ".join(empty_components),
+            "Checks referencing empty components will score 0.0.",
+        ]
 
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)

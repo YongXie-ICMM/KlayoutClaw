@@ -302,17 +302,18 @@ class TestMCPToolListMatchesDocs:
                     f"but it appears in MCP schema required: {required}"
                 )
 
-        # Also verify mode enum values (specific to evaluate_design)
-        mode_prop = properties.get("mode", {})
-        has_enum = "enum" in mode_prop
-        has_default = "default" in mode_prop
-        assert has_enum or has_default, (
-            f"mode property must have enum or default. Got: {mode_prop}"
+        # Verify checks and layer_map are required (current schema)
+        assert "checks" in required, (
+            f"'checks' must be required in evaluate_design schema. required={required}"
         )
-        if has_enum:
-            assert "score" in mode_prop["enum"] and "drc" in mode_prop["enum"], (
-                f"mode enum must include 'score' and 'drc'. Got: {mode_prop['enum']}"
-            )
+        assert "layer_map" in required, (
+            f"'layer_map' must be required in evaluate_design schema. required={required}"
+        )
+        # checks must be an array type
+        checks_prop = properties.get("checks", {})
+        assert checks_prop.get("type") == "array", (
+            f"'checks' property must be type 'array'. Got: {checks_prop}"
+        )
 
     def test_validate_pixel_size_schema_matches_docs(self):
         """validate_pixel_size inputSchema must match parameters documented in docs/tools.md."""
@@ -377,7 +378,7 @@ result = "setup complete"
         """get_layout_info before and after calling evaluate_design in DRC mode must be identical."""
         info_before = tool_call("get_layout_info")
 
-        # Call evaluate_design in DRC mode (does not need reference_gds)
+        # Call evaluate_design with checks + layer_map
         layer_map = {
             "mesa": [1, 0],
             "contact_patch": [2, 0],
@@ -385,8 +386,11 @@ result = "setup complete"
             "contact_route": [4, 0],
             "bonding_pad": [5, 0],
         }
+        checks = [
+            {"name": "component_containment", "args": {"component": "contact_patch", "region": "mesa"}, "weight": 1.0},
+        ]
         try:
-            tool_call("evaluate_design", layer_map=layer_map, mode="drc")
+            tool_call("evaluate_design", layer_map=layer_map, checks=checks)
         except RuntimeError:
             # evaluate_design may error (missing conda env, etc.) -- that is fine,
             # what matters is that the layout was not mutated
@@ -474,7 +478,7 @@ class TestWorkspaceDocsReferenceRealTools:
         )
 
     def test_workflow_evaluate_iterate_is_callable(self):
-        """evaluate_design can be invoked and returns structured response (DRC mode)."""
+        """evaluate_design can be invoked and returns structured response."""
         # This tests that the tool exists, can be called, and returns a
         # meaningful response -- not just that the JSON-RPC envelope is valid.
         layer_map = {
@@ -484,10 +488,13 @@ class TestWorkspaceDocsReferenceRealTools:
             "contact_route": [4, 0],
             "bonding_pad": [5, 0],
         }
+        checks = [
+            {"name": "component_containment", "args": {"component": "contact_patch", "region": "mesa"}, "weight": 1.0},
+        ]
         # We use mcp_call directly to inspect the full response structure
         result = mcp_call("tools/call", {
             "name": "evaluate_design",
-            "arguments": {"layer_map": layer_map, "mode": "drc"},
+            "arguments": {"layer_map": layer_map, "checks": checks},
         }, timeout=60)
 
         # The MCP server must return a valid JSON-RPC result (not a protocol error)

@@ -408,7 +408,7 @@ function registerGdsalignTools(): CodeGenTool[] {
               check: "≥3 markers detected, ≥2 inliers, mean residual < 5um",
             },
             "4_commit_gds": {
-              command: `python ${scriptsDir}/commit_gds.py --output-dir <out>/gdsalign/ --image <image_path> --pixel-size <px>`,
+              command: `python ${scriptsDir}/commit_gds.py --warp <out>/gdsalign/gds_warp.npy --traces <traces_json> --image <image_path> --pixel-size <px> --gds <gds_path> --output-dir <out>/gdsalign/`,
               purpose: "Warp image + transform contours, commit to KLayout",
             },
           },

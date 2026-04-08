@@ -172,7 +172,8 @@ def warp_image(img, M, pixel_size_in, pixel_size_out=None):
     return warped, (x_min, y_min), pixel_size_out, (out_w, out_h)
 
 
-def main():
+def build_parser():
+    """Build and return the argument parser for commit_gds."""
     parser = argparse.ArgumentParser(
         description="Warp image + contours into GDS coordinates and commit")
     parser.add_argument("--warp", required=True,
@@ -189,6 +190,14 @@ def main():
                         help="Output directory")
     parser.add_argument("--warp-only", action="store_true",
                         help="Only produce warped outputs, skip KLayout commit")
+    parser.add_argument("--mcp-config", default=None,
+                        help="Path to MCP config JSON file (fallback: "
+                             ".mcp.json in CWD, mcp_config.json in project root, then default)")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # --- Validate inputs ---
@@ -282,7 +291,10 @@ def main():
 
     # Import MCP client for KLayout communication
     sys.path.insert(0, SKILL_ROOT)
-    from mcp_client import init_session, execute_script, tool_call
+    from mcp_client import init_session, execute_script, tool_call, load_mcp_config
+
+    # Configure MCP connection URL
+    load_mcp_config(args.mcp_config)
 
     print("Connecting to KLayout MCP server...")
     init_session()

@@ -108,6 +108,7 @@ def _notify_request(method, success, error_msg=None):
 _layout_view = None
 _layout = None
 _top_cell = None
+_exec_seq = 0
 
 
 def _get_or_create_view():
@@ -131,6 +132,33 @@ def _get_or_create_view():
     else:
         _top_cell = _layout.top_cell()
     return _layout_view, _layout, _top_cell
+
+
+def _handles_stale():
+    """Return True if cached _layout/_layout_view/_top_cell are stale."""
+    global _layout_view, _layout, _top_cell
+    if _layout is None or _layout_view is None or _top_cell is None:
+        return True
+    try:
+        # Verify layout is still alive
+        _layout.cells()
+        # Verify the cellview is still valid
+        cv = _layout_view.active_cellview()
+        if cv is None or not cv.is_valid():
+            return True
+        # Verify cached layout matches the current view's layout
+        if cv.layout() is not _layout:
+            return True
+        _top_cell.name
+    except Exception:
+        return True
+    return False
+
+
+def _ensure_valid_handles():
+    """Refresh layout handles if they are stale."""
+    if _handles_stale():
+        _get_or_create_view()
 
 
 # ---------------------------------------------------------------------------
@@ -360,10 +388,23 @@ def _tool_create_layout(args):
 
 
 def _tool_execute_script(args):
-    global _layout, _layout_view, _top_cell
+    global _layout, _layout_view, _top_cell, _exec_seq
+    _ensure_valid_handles()
     code = args.get("code")
     if not code:
         raise ValueError("Missing required parameter: code")
+    # Auto-save code block to /tmp/KLayout_Execute/ (best-effort, never blocks execution)
+    _exec_seq += 1
+    try:
+        _save_dir = "/tmp/KLayout_Execute"
+        os.makedirs(_save_dir, exist_ok=True)
+        _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _save_name = "{}_{:04d}.py".format(_ts, _exec_seq)
+        _save_path = os.path.join(_save_dir, _save_name)
+        with open(_save_path, "w", encoding="utf-8") as _sf:
+            _sf.write("# KlayoutClaw execute_script auto-save\n# timestamp: {}\n# sequence: {}\n\n".format(_ts, _exec_seq) + code)
+    except Exception:
+        pass  # auto-save is best-effort
     ns = {
         "pya": pya,
         "json": json,
@@ -374,9 +415,19 @@ def _tool_execute_script(args):
         "_get_or_create_view": _get_or_create_view,
         "_refresh_view": _refresh_view,
     }
+    # Capture stdout/stderr during execution
+    _captured_stdout = io.StringIO()
+    _captured_stderr = io.StringIO()
+    _old_stdout = sys.stdout
+    _old_stderr = sys.stderr
+    sys.stdout = _captured_stdout
+    sys.stderr = _captured_stderr
     try:
         exec(code, ns)
     except Exception as e:
+        # Capture output before re-raising
+        _err_stdout = _captured_stdout.getvalue()
+        _err_stderr = _captured_stderr.getvalue()
         # Format a readable error with traceback pointing to user code lines
         tb_lines = _tb_mod.format_exception(type(e), e, e.__traceback__)
         # Filter to show only the &lt;string&gt; (user code) frames
@@ -387,7 +438,16 @@ def _tool_execute_script(args):
         err_msg = "{}: {}".format(type(e).__name__, e)
         if user_frames:
             err_msg += "\n  in user code:\n    " + "\n    ".join(user_frames)
+        if _err_stdout:
+            err_msg += "\n  stdout: " + _err_stdout.rstrip()
+        if _err_stderr:
+            err_msg += "\n  stderr: " + _err_stderr.rstrip()
         raise RuntimeError(err_msg)
+    finally:
+        sys.stdout = _old_stdout
+        sys.stderr = _old_stderr
+    _stdout_val = _captured_stdout.getvalue()
+    _stderr_val = _captured_stderr.getvalue()
     # Update globals in case script called _get_or_create_view()
     if ns.get("_layout") is not _layout:
         _layout = ns["_layout"]
@@ -397,19 +457,20 @@ def _tool_execute_script(args):
         _top_cell = ns["_top_cell"]
     _refresh_view()
     result = ns.get("result", {"status": "ok"})
-    if isinstance(result, str):
-        return result
+    if not isinstance(result, dict):
+        result = {"status": "ok", "result": result}
+    result["stdout"] = _stdout_val
+    result["stderr"] = _stderr_val
     return json.dumps(result)
 
 
 def _tool_save_layout(args):
     global _layout
+    _ensure_valid_handles()
     filepath = args.get("filepath")
     fmt = args.get("format", "GDS2")
     if not filepath:
         raise ValueError("Missing required parameter: filepath")
-    if _layout is None:
-        _get_or_create_view()
     abs_path = os.path.abspath(filepath)
     save_opts = pya.SaveLayoutOptions()
     if fmt.upper() == "OASIS":
@@ -422,8 +483,7 @@ def _tool_save_layout(args):
 
 def _tool_get_layout_info(args):
     global _layout, _top_cell
-    if _layout is None:
-        _get_or_create_view()
+    _ensure_valid_handles()
     cells = []
     for ci in range(_layout.cells()):
         c = _layout.cell(ci)
@@ -473,8 +533,7 @@ def _tool_get_layout_info(args):
 def _tool_screenshot(args):
     """Capture the current KLayout viewport as a PNG image."""
     global _layout_view
-    if _layout_view is None:
-        _get_or_create_view()
+    _ensure_valid_handles()
     if _layout_view is None:
         raise ValueError("No layout view available to capture")
 
@@ -494,8 +553,7 @@ def _tool_auto_route(args):
     import subprocess
 
     global _layout, _layout_view, _top_cell
-    if _layout is None:
-        _get_or_create_view()
+    _ensure_valid_handles()
 
     pin_layer_a = args.get("pin_layer_a")
     pin_layer_b = args.get("pin_layer_b")
@@ -667,8 +725,7 @@ def _tool_evaluate_design(args):
     import subprocess
 
     global _layout, _layout_view, _top_cell
-    if _layout is None:
-        _get_or_create_view()
+    _ensure_valid_handles()
 
     layer_map = args.get("layer_map", {})
     checks = args.get("checks", None)
@@ -678,6 +735,64 @@ def _tool_evaluate_design(args):
 
     if checks is None or not isinstance(checks, list) or len(checks) == 0:
         raise ValueError("'checks' must be a non-empty list of check objects.")
+
+    # Validate check structure before spawning subprocess
+    _known_primitives = ["component_overlap", "component_containment", "contact_isolation",
+                         "connectivity", "route_endpoints", "adjacency", "solidity", "spacing"]
+    _required_args = {
+        "component_overlap": ["component", "region"],
+        "component_containment": ["component", "region"],
+        "contact_isolation": [],
+        "connectivity": [],
+        "route_endpoints": [],
+        "adjacency": ["component_a", "component_b"],
+        "solidity": ["component"],
+        "spacing": ["component_a"],
+    }
+    for i, check in enumerate(checks):
+        if not isinstance(check, dict):
+            raise ValueError("checks[{}] must be a dict with 'name', 'args', 'weight'. Got: {}".format(i, type(check).__name__))
+        name = check.get("name")
+        if not name:
+            raise ValueError("checks[{}] missing 'name'. Each check needs {{name, args, weight}}.".format(i))
+        if name not in _known_primitives:
+            raise ValueError("checks[{}]: unknown primitive '{}'. Available: {}".format(i, name, ", ".join(_known_primitives)))
+        check_args = check.get("args")
+        if check_args is None or not isinstance(check_args, dict):
+            raise ValueError("checks[{}] ('{}') missing 'args' dict. Each check needs {{name, args, weight}}.".format(i, name))
+        if "weight" not in check:
+            raise ValueError("checks[{}] ('{}') missing 'weight'. Each check needs {{name, args, weight}}.".format(i, name))
+        for req in _required_args.get(name, []):
+            if req not in check_args:
+                raise ValueError("checks[{}] ('{}') missing required arg '{}'. Required args: {}".format(
+                    i, name, req, _required_args[name]))
+        # Validate that component/region args reference keys in layer_map
+        _component_keys = ["component", "component_a", "component_b", "contact_component",
+                           "pad_component", "route_component"]
+        for key in _component_keys:
+            val = check_args.get(key)
+            if val is not None and val not in layer_map:
+                raise ValueError("checks[{}] ('{}') arg '{}' = '{}' not found in layer_map. "
+                                 "Available keys: {}".format(i, name, key, val, list(layer_map.keys())))
+        region_val = check_args.get("region")
+        if region_val is not None:
+            region_list = [region_val] if isinstance(region_val, str) else region_val
+            for rv in region_list:
+                if rv not in layer_map:
+                    raise ValueError("checks[{}] ('{}') region '{}' not found in layer_map. "
+                                     "Available keys: {}".format(i, name, rv, list(layer_map.keys())))
+        targets = check_args.get("target_components")
+        if targets is not None:
+            for t in targets:
+                if t not in layer_map:
+                    raise ValueError("checks[{}] ('{}') target_component '{}' not found in layer_map. "
+                                     "Available keys: {}".format(i, name, t, list(layer_map.keys())))
+
+    # Validate layer_map format
+    for lname, lspec in layer_map.items():
+        if isinstance(lspec, str):
+            raise ValueError("layer_map['{}'] = '{}' is a string. Expected [layer, datatype] (e.g. [20, 0]) "
+                             "or {{\"layer\": 20, \"datatype\": 0}}.".format(lname, lspec))
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_eval_")

@@ -13,6 +13,7 @@ export const unitFiles = [
   "tests/test-tier1-bugs.ts",
   "tests/test-tier2-bugs.ts",
   "tests/test-reviewer-findings.ts",
+  "tests/test-image-escaping.ts",
 ];
 
 export const integrationFiles = [

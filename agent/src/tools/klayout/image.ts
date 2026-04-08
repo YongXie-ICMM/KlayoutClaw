@@ -8,6 +8,16 @@ import type { NamespacedTool } from "../../mcp/types.js";
 const GROUP = "image";
 const PREFIX = "klayout";
 
+/** Escape a string for safe interpolation inside a Python double-quoted string literal. */
+export function pyEscape(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** Convert a JS boolean to a Python boolean literal string. */
+export function pyBool(v: boolean): string {
+  return v ? "True" : "False";
+}
+
 interface CodeGenTool extends NamespacedTool {
   generateCode: (args: Record<string, unknown>) => string;
 }
@@ -44,11 +54,11 @@ export function registerImageTools(): CodeGenTool[] {
       },
       ["filepath"],
       (args) => {
-        const filepath = args.filepath as string;
+        const filepath = pyEscape(args.filepath as string);
         const ps = args.pixel_size ?? 1.0;
         const x = args.x ?? 0;
         const y = args.y ?? 0;
-        const center = args.center ?? false;
+        const center = pyBool((args.center ?? false) as boolean);
         return `
 import os
 filepath = "${filepath}"
