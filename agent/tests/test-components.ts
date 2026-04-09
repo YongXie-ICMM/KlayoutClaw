@@ -91,7 +91,7 @@ function makeDefaultTUIState(overrides: Partial<TUIState> = {}): TUIState {
 }
 
 function makeBgTask(overrides: Partial<BackgroundTaskSummaryTUI> = {}): BackgroundTaskSummaryTUI {
-  return { id: "bg-1", name: "detect_stack", status: "running", startedAt: Date.now() - 5000, ...overrides };
+  return { id: "bg-1", name: "align", status: "running", startedAt: Date.now() - 5000, ...overrides };
 }
 
 // ============================================================
@@ -538,7 +538,7 @@ describe("BackgroundBar", () => {
 
   it("shows collapsed summary with running count", () => {
     const tasks = [
-      makeBgTask({ id: "1", name: "detect_stack", status: "running" }),
+      makeBgTask({ id: "1", name: "align", status: "running" }),
       makeBgTask({ id: "2", name: "save_layout", status: "completed" }),
     ];
     const text = renderText(React.createElement(BackgroundBar, { tasks, expanded: false }));
@@ -547,12 +547,12 @@ describe("BackgroundBar", () => {
 
   it("shows expanded list with task names", () => {
     const tasks = [
-      makeBgTask({ id: "1", name: "detect_stack", status: "running" }),
+      makeBgTask({ id: "1", name: "align", status: "running" }),
       makeBgTask({ id: "2", name: "save_layout", status: "completed", completedAt: Date.now() }),
       makeBgTask({ id: "3", name: "auto_route", status: "failed", error: "timeout" }),
     ];
     const text = renderText(React.createElement(BackgroundBar, { tasks, expanded: true }));
-    expect(text).toContain("detect_stack");
+    expect(text).toContain("align");
     expect(text).toContain("save_layout");
     expect(text).toContain("auto_route");
   });

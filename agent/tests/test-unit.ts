@@ -301,8 +301,7 @@ describe("nanodevice tools", () => {
   it("registers all nanodevice tools (flakedetect + gdsalign + routing)", () => {
     const tools = registerNanodeviceTools();
     const names = tools.map((t) => t.name);
-    // Flakedetect pipeline: orchestrator + 5 substeps
-    expect(names).toContain("klayout_nanodevice_flakedetect_detect_stack");
+    // Flakedetect pipeline: 5 substeps
     expect(names).toContain("klayout_nanodevice_flakedetect_align");
     expect(names).toContain("klayout_nanodevice_flakedetect_detect");
     expect(names).toContain("klayout_nanodevice_flakedetect_combine");
@@ -314,7 +313,7 @@ describe("nanodevice tools", () => {
     expect(names).toContain("klayout_nanodevice_routing_place_pads");
     expect(names).toContain("klayout_nanodevice_routing_route_leads");
     expect(names).toContain("klayout_nanodevice_routing_clear_routes");
-    expect(tools.length).toBe(10);
+    expect(tools.length).toBe(9);
   });
 
   it("gdsalign commit_gds command includes --warp, --traces, and --gds args", () => {

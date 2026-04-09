@@ -50,51 +50,6 @@ function instructionResult(obj: Record<string, unknown>): string {
 
 function registerFlakedetectTools(): CodeGenTool[] {
   return [
-    // --- detect_stack (orchestrator) ---
-    makeNanoTool(
-      "nanodevice_flakedetect",
-      "detect_stack",
-      [
-        "Orchestrate the full van der Waals heterostructure flake detection pipeline.",
-        "Dispatches 5 sequential steps: align → detect → combine → commit → review.",
-        "Use when user provides microscope images of a vdW stack and wants material",
-        "polygons (top_hBN, graphene, bottom_hBN, graphite) inserted into KLayout.",
-        "Requires: source images (full_stack + at least one of bottom_part/top_part),",
-        "pixel_size (um/px), and output directory.",
-      ].join(" "),
-      {
-        full_stack_image: { type: "string", description: "Path to full-stack microscope image (raw or LUT)" },
-        bottom_part_image: { type: "string", description: "Path to bottom-part image (same substrate as full_stack)" },
-        top_part_image: { type: "string", description: "Path to top-part image (PDMS stamp, cross-substrate)" },
-        full_stack_lut_image: { type: "string", description: "Path to LUT-enhanced full-stack image (optional)" },
-        pixel_size: { type: "number", description: "Microns per pixel (validate with validate_pixel_size tool first)" },
-        mirror: { type: "boolean", description: "Whether top_part image is mirrored (PDMS flip). Default false" },
-        output_dir: { type: "string", description: "Output directory. Defaults to <image_dir>/output/" },
-      },
-      ["full_stack_image", "pixel_size"],
-      (args) => {
-        return instructionResult({
-          action: "orchestrate_pipeline",
-          pipeline: "nanodevice_flakedetect",
-          skill_doc: "skills/nanodevice_flakedetect/SKILL.md",
-          read_first: "Read the skill_doc for the full orchestration protocol before starting.",
-          steps: [
-            "1. ALIGN  — call klayout_nanodevice_flakedetect_align with the source images",
-            "2. DETECT — call klayout_nanodevice_flakedetect_detect for each material",
-            "3. COMBINE — call klayout_nanodevice_flakedetect_combine to unify coords",
-            "4. COMMIT — call klayout_nanodevice_flakedetect_commit to insert polygons",
-            "5. REVIEW — call klayout_nanodevice_flakedetect_review to validate",
-          ],
-          notes: [
-            "Each step must complete before the next starts.",
-            "Max 2 retries per step. If review FAILs, re-run the indicated step.",
-            "Output structure: <out>/align/, <out>/detect/, <out>/combine/",
-          ],
-          args,
-        });
-      },
-    ),
-
     // --- align ---
     makeNanoTool(
       "nanodevice_flakedetect",

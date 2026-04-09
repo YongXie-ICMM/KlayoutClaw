@@ -5,7 +5,6 @@
 import type { BackgroundTask } from "./types.js";
 
 const BACKGROUNDABLE_TOOLS = new Set([
-  "klayout_nanodevice_flakedetect_detect_stack",
   "klayout_nanodevice_flakedetect_align",
   "klayout_nanodevice_flakedetect_detect",
   "klayout_nanodevice_flakedetect_combine",
