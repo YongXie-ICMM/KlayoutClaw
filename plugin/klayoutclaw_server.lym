@@ -376,7 +376,14 @@ def _tool_create_layout(args):
     name = args.get("name", "TOP")
     dbu = args.get("dbu", 0.001)
     mw = pya.Application.instance().main_window()
-    mw.create_layout(0)
+    # mw.create_layout(1) opens a new tab/panel with a fresh empty layout
+    # and auto-switches mw.current_view() to it, while leaving any existing
+    # tabs (with their cells, polygons, and image annotations) intact.
+    # Mode 0 instead *replaces* the current view's layout in-place, which
+    # wipes the user's existing work and also inherits the previous view's
+    # pya.Image annotations. Mode 1 gives the natural "new blank layout"
+    # behaviour you'd expect.
+    mw.create_layout(1)
     _layout_view = mw.current_view()
     cv = _layout_view.active_cellview()
     _layout = cv.layout()
@@ -485,10 +492,11 @@ def _tool_get_layout_info(args):
     global _layout, _top_cell
     _ensure_valid_handles()
     cells = []
-    for ci in range(_layout.cells()):
-        c = _layout.cell(ci)
-        if c is not None:
-            cells.append(c.name)
+    # Use each_cell() instead of range(layout.cells()) because the cell
+    # count can include holes in the index space after Layout.read() merges
+    # GDS content with cell-name collisions (KLayout leaves orphaned slots).
+    for c in _layout.each_cell():
+        cells.append(c.name)
     dbu = _layout.dbu
     layers = {}
     for li in _layout.layer_indices():

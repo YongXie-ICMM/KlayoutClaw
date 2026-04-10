@@ -150,3 +150,12 @@ See `docs/tools.md` for full parameter schemas.
 - MCP client config: `mcp_config.json` (type: http, url: `http://127.0.0.1:8765/mcp`)
 - Test scripts use absolute paths for GDS output — KLayout's CWD is `/`, so relative paths fail
 - `auto_route` subprocess needs `route_worker.py` — searched in `~/Documents/GitHub/KlayoutClaw/tools/` and `~/.klayout/pymacros/`
+- **`mw.create_layout(mode)` mode argument** — empirically determined (pya docs are misleading):
+  - `mode=0` — **replaces** the current view's layout in place (wipes cells, **keeps image annotations** on the view)
+  - `mode=1` — **creates a new tab** with a fresh empty layout, auto-switches `current_view()` to it, leaves existing tabs untouched
+  - `mode=2` — operates on the current view without creating a new tab
+  - `_tool_create_layout` uses mode 1 so each MCP `create_layout` call adds a blank tab (non-destructive)
+- **`Layout.read()` cell-name collisions** — reading a GDS into a layout that already contains cells with the same names (e.g. the default empty `TOP` from `mw.create_layout()` vs. a template whose top cell is also `TOP`) leaves **orphaned cell index slots**: `layout.cells()` reports N but `layout.cell(N-1)` raises "Not a valid cell index". Always iterate cells via `layout.each_cell()`, and when loading templates into a populated layout call `layout.clear()` first to avoid the collision.
+- **Dangling `cv.cell` after `Layout.read()`** — when the collision above triggers, the `CellView.cell` pointer can be left referencing a cell that was destroyed. Explicitly rebind `cv.cell = <resolved_top_cell>` after any `layout.read()` into a non-empty layout.
+- **`pya.Image` placement semantics** — `DCplxTrans(ps, rot, mirror, disp)` applied to a `pya.Image` factors the scale into `img.pixel_width`/`pixel_height` (so `trans.mag` reads back as 1.0 but `img.box()` is the real GDS bbox). With identity rotation, the image occupies `(disp.x, disp.y)` to `(disp.x + W*ps, disp.y + H*ps)` — i.e. it extends in **+X and +Y** from `disp`. PNG file row 0 is rendered at the **high-Y edge** (north) of the bbox, so to display a PNG whose row 0 represents GDS-south you must `cv2.flip(img, 0)` before placement.
+- **Image annotations persist across layout changes** — `pya.Image` is stored on the `LayoutView`, not the `Layout`. Replacing a layout (`mode=0`) leaves old images attached; use `view.clear_images()` if you need to wipe them without closing the tab.

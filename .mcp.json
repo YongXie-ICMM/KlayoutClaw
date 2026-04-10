@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "klayoutclaw": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp",
-      "authorization": "none"
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "http://127.0.0.1:8765/mcp",
+        "--allow-http"
+      ]
     }
   }
 }

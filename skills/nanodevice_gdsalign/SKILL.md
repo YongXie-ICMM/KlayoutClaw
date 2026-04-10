@@ -98,7 +98,9 @@ Warps the microscope image and material contours into GDS coordinates using the 
 | `--image` | Full-stack microscope image |
 | `--pixel-size` | Image pixel size in um/px |
 | `--gds` | Template GDS file (loaded into KLayout during commit) |
+| `--output-dir` | Output directory for `traces_gds.json`, `full_stack_gds.png`, `image_placement.json` |
 | `--warp-only` | Only produce warped files, skip KLayout commit |
+| `--mcp-config` | Path to MCP config JSON. Fallback chain: `.mcp.json` in CWD → `mcp_config.json` in project root → default `127.0.0.1:8765`. **In Docker**, pass a config pointing to `http://host.docker.internal:8765/mcp` |
 
 **Outputs**: `full_stack_gds.png`, `traces_gds.json`, `image_placement.json`
 
@@ -117,7 +119,9 @@ Warps the microscope image and material contours into GDS coordinates using the 
 ## Known Behaviour
 
 - **Rotational ambiguity**: Square marker grids have rotational symmetry — θ, θ+90°, θ+180°, θ+270° can yield similar residuals. `align_gds.py` automatically tries all four companions and picks the one with rotation closest to 0°.
-- **PNG orientation**: The warped PNG (`full_stack_gds.png`) has GDS south at the top (standard for GDS→image rendering). KLayout overlay places it correctly via `origin_um = (x_min, y_min)`.
+- **PNG orientation**: The warped PNG (`full_stack_gds.png`) is vertically flipped on save so that row 0 holds GDS-north data. KLayout's `pya.Image` renders PNG row 0 at the high-Y edge of the placement bbox, so the image ends up right-side-up when placed at `origin_um = (x_min, y_min)` with identity rotation. If you inspect the PNG in a file viewer it will already look correct (north at top).
+- **Image ↔ contour consistency**: The warped image and the transformed contours (`traces_gds.json`) are produced from the same affine. If you re-run the alignment at a different `pixel_size`, you **must** also re-run `commit_gds.py` with the same `pixel_size`. Mixing a `gds_warp.npy` produced at one pixel size with `commit_gds.py --pixel-size` at another will place the image at the wrong scale (the scale factor in the warp matrix compensates for the pixel_size used during alignment).
+- **Destructive commit**: `commit_gds.py` calls `layout.clear()` before loading the template into KLayout, so any pre-existing geometry in the current tab is wiped. This is intentional — it avoids cell-name collisions in `Layout.read()` that otherwise leave orphaned cell indices. Run `commit_gds.py` against a fresh tab (or use the `create_layout` MCP tool first) if you have ongoing work you don't want to lose.
 
 ---
 

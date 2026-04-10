@@ -258,8 +258,15 @@ def main():
 
     warped_path = os.path.join(args.output_dir, "full_stack_gds.png")
 
-    # Horizontal flip to match KLayout coordinate convention (image X vs GDS X)
-    warped = cv2.flip(warped, 1)
+    # Vertical flip before saving.
+    # warp_image() produces a PNG where row 0 corresponds to GDS y_min (south)
+    # and row H corresponds to GDS y_max (north) — the "GDS south at top"
+    # orientation noted in the skill docs. pya.Image, however, renders PNG
+    # row 0 at the high-Y edge (north) of the placed bbox, so loading it as-is
+    # would render the image upside-down. Flipping along axis 0 swaps rows so
+    # that the flipped row 0 = original row H = north data, which then lines
+    # up with pya.Image's natural rendering.
+    warped = cv2.flip(warped, 0)
 
     # Use lossless PNG for quality
     cv2.imwrite(warped_path, warped)
@@ -309,25 +316,58 @@ if not os.path.exists(filepath):
     raise FileNotFoundError(f"GDS not found: {{filepath}}")
 
 mw = pya.Application.instance().main_window()
-
-# Check if already loaded
 view = mw.current_view()
-already_loaded = False
-if view is not None:
-    for ci in range(view.cellviews()):
-        cv = view.cellview(ci)
-        if cv.is_valid() and cv.filename() == filepath:
-            already_loaded = True
-            break
 
-if not already_loaded:
-    mw.load_layout(filepath, 1)
+# Ensure a layout view exists
+if view is None:
+    mw.create_layout(1)
     view = mw.current_view()
 
-# Store references for subsequent calls
-_layout = view.active_cellview().layout()
-_top_cell = _layout.top_cell()
-result = {{"status": "ok", "cell": _top_cell.name, "loaded": not already_loaded}}
+cv = view.active_cellview()
+_layout_view = view
+_layout = cv.layout()
+
+# Clear any existing content before reading.
+# Rationale: Layout.read() merges the GDS into the current layout. If the
+# layout already contains cells with names that collide with the GDS cell
+# names (e.g. the default empty "TOP" created by mw.create_layout() colliding
+# with the Template's own "TOP"), KLayout resolves the conflict by renaming
+# pre-existing cells to auto-generated "*U<n>" ghost names and leaves a
+# hole in the cell index space (layout.cells() count includes the dead slot).
+# This breaks any code that iterates range(layout.cells()) and also leaves
+# the cellview's active cell holding a dangling reference, so the view
+# renders nothing. Clearing first makes the read a pure load and avoids
+# all of these side effects.
+_layout.clear()
+
+# Read the template GDS
+_layout.read(filepath)
+
+# Resolve the top cell (template should have exactly one)
+top_cell_indices = list(_layout.each_top_cell())
+if len(top_cell_indices) == 0:
+    raise RuntimeError("No top cells found after GDS import")
+elif len(top_cell_indices) == 1:
+    _top_cell = _layout.cell(top_cell_indices[0])
+else:
+    # Multiple top cells: pick the one with the largest bbox (the main design)
+    def _bbox_area(c):
+        bb = c.bbox()
+        if bb.empty():
+            return 0
+        return bb.width() * bb.height()
+    _top_cell = max((_layout.cell(i) for i in top_cell_indices), key=_bbox_area)
+
+# Explicitly bind the cellview to the resolved top cell. Without this, the
+# cellview may keep pointing at the stale placeholder cell that existed
+# before layout.clear() / layout.read(), and the view won't render anything.
+cv.cell = _top_cell
+
+# Ensure full hierarchy is rendered so cell instances are drawn as their
+# actual content instead of empty outlines.
+view.max_hier()
+
+result = {{"status": "ok", "cell": _top_cell.name, "loaded": True, "top_cells": len(top_cell_indices)}}
 """)
     print("  GDS template loaded")
 
@@ -347,16 +387,16 @@ view, layout, cell = _get_or_create_view()
 img = pya.Image(filepath)
 img.visible = True
 
+# Place at (x_min, y_min) with identity rotation. The warped PNG was
+# vertically flipped before saving so its row 0 now holds GDS-north data,
+# which pya.Image renders at the high-Y edge of the resulting bbox — so
+# the image occupies (x_min, y_min) to (x_min + W*ps, y_min + H*ps)
+# = (x_min, y_min) to (x_max, y_max) as intended.
 ps = {out_pixel_size}
-# 180 deg rotation pivots around displacement point, so offset by image extent
-# to keep the image in the same bounding box
-x_off = {x_origin} + {placement["width_um"]}
-y_off = {y_origin} + {placement["height_um"]}
-
-img.trans = pya.DCplxTrans(ps, 180, False, pya.DVector(x_off, y_off))
+img.trans = pya.DCplxTrans(ps, 0, False, pya.DVector({x_origin}, {y_origin}))
 view.insert_image(img)
 
-result = {{"status": "ok", "id": img.id()}}
+result = {{"status": "ok", "id": img.id(), "box": str(img.box())}}
 """)
     print("  Background image added")
 
@@ -375,18 +415,17 @@ result = {{"status": "ok", "id": img.id()}}
             pts = entry["contour_gds"]
             if len(pts) < 3:
                 continue
-            # Build points list for pya — closed path (border only)
-            closed_pts = pts + [pts[0]]  # close the contour
+            # Build points list for pya.Polygon (no closing point needed)
             pts_code = ", ".join(
                 f"pya.Point(int({x}/dbu), int({y}/dbu))"
-                for x, y in closed_pts
+                for x, y in pts
             )
             execute_script(f"""
 view, layout, cell = _get_or_create_view()
 dbu = layout.dbu
 li = layout.layer({layer}, {dt})
 pts = [{pts_code}]
-cell.shapes(li).insert(pya.Path(pts, int(0.2/dbu)))
+cell.shapes(li).insert(pya.Polygon(pts))
 result = {{"status": "ok"}}
 """)
             n_inserted += 1

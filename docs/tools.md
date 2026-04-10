@@ -10,7 +10,7 @@ All coordinates are in **microns**. The database unit (dbu) defaults to 0.001.
 
 ## create_layout
 
-Create a new layout with a top cell.
+Create a new empty layout in a **new KLayout tab** and switch focus to it.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -18,6 +18,11 @@ Create a new layout with a top cell.
 | `dbu` | number | no | 0.001 | Database unit in microns |
 
 **Returns:** `{"status": "ok", "top_cell": "TOP", "dbu": 0.001}`
+
+**Behavior:**
+- Each call adds a new tab (via `pya.MainWindow.create_layout(1)`). Existing tabs, their cells, polygons, and image annotations are left untouched.
+- `current_view()` automatically switches to the new tab, so subsequent MCP calls (`execute_script`, `get_layout_info`, etc.) operate on the fresh layout.
+- If you want to *replace* the current tab's contents instead of adding a new one, do that via `execute_script` (`layout.clear()` + `layout.read(...)` or similar) — this tool deliberately doesn't clobber existing work.
 
 ---
 
