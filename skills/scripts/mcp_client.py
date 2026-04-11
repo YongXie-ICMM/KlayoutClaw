@@ -29,6 +29,80 @@ MCP_URL = os.environ.get("KLAYOUT_MCP_URL") or _DEFAULT_URL
 _req_id = 0
 _session_id = None
 
+# Server labels accepted in a Claude-Code-style mcpServers block. The plugin's
+# own mcp_config.json labels the server "klayoutclaw", but qlaybot uses
+# "klayout" (agent/src/mcp/manager.ts KLAYOUT_KEY) or "klayout_mcp"
+# (agent/src/config.ts defaultConfig().mcp). The client only needs the URL
+# string, not the label, so we resolve generically rather than pinning a name.
+_KLAYOUT_KEY_HINTS = ("klayoutclaw", "klayout", "klayout_mcp")
+
+
+def _extract_mcp_url(cfg, source):
+    """Resolve the KlayoutClaw server URL from a parsed config dict.
+
+    Handles three shapes seen in the wild:
+
+    1. Claude-Code ``mcpServers`` block keyed by a known label (the plugin's
+       own ``klayoutclaw``, or qlaybot's ``klayout`` / ``klayout_mcp``).
+    2. Single-entry ``mcpServers`` block with an unknown label — trusted.
+    3. Flat qlaybot ``klayout.json``: ``{"url": "...", ...}``.
+
+    Also falls back to a URL-shape heuristic when multiple entries exist
+    with no known label.
+
+    Parameters
+    ----------
+    cfg : dict
+        Parsed config JSON.
+    source : str
+        Human-readable origin (path) used only in error messages.
+
+    Returns
+    -------
+    str
+        The resolved MCP server URL.
+
+    Raises
+    ------
+    KeyError
+        Nothing usable found. Message includes the labels actually present.
+    """
+    # Flat shape — qlaybot's klayout.json.
+    if isinstance(cfg, dict) and "mcpServers" not in cfg:
+        if "url" in cfg:
+            return cfg["url"]
+        raise KeyError(
+            f"{source}: no 'mcpServers' block and no top-level 'url' field"
+        )
+
+    servers = cfg.get("mcpServers") or {}
+
+    # Known labels in priority order.
+    for key in _KLAYOUT_KEY_HINTS:
+        entry = servers.get(key)
+        if isinstance(entry, dict) and "url" in entry:
+            return entry["url"]
+
+    # Single-entry config with an unrecognized label.
+    if len(servers) == 1:
+        only = next(iter(servers.values()))
+        if isinstance(only, dict) and "url" in only:
+            return only["url"]
+
+    # Multi-entry heuristic: any URL that looks like KlayoutClaw.
+    for entry in servers.values():
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url") or ""
+        if ":8765/mcp" in url or "klayout" in url.lower():
+            return url
+
+    raise KeyError(
+        f"{source}: no KlayoutClaw server entry found under 'mcpServers'. "
+        f"Tried keys {list(_KLAYOUT_KEY_HINTS)}; "
+        f"present keys: {list(servers.keys())}"
+    )
+
 
 def _script_dir():
     """Return the directory containing this script."""
@@ -63,7 +137,7 @@ def load_mcp_config(config_path=None):
             raise FileNotFoundError(f"MCP config not found: {config_path}")
         with open(config_path) as f:
             cfg = json.load(f)
-        url = cfg["mcpServers"]["klayoutclaw"]["url"]
+        url = _extract_mcp_url(cfg, config_path)
         MCP_URL = url
         return url
 
@@ -72,7 +146,7 @@ def load_mcp_config(config_path=None):
     if os.path.exists(cwd_cfg):
         with open(cwd_cfg) as f:
             cfg = json.load(f)
-        url = cfg["mcpServers"]["klayoutclaw"]["url"]
+        url = _extract_mcp_url(cfg, cwd_cfg)
         MCP_URL = url
         return url
 
@@ -82,7 +156,7 @@ def load_mcp_config(config_path=None):
     if os.path.exists(root_cfg):
         with open(root_cfg) as f:
             cfg = json.load(f)
-        url = cfg["mcpServers"]["klayoutclaw"]["url"]
+        url = _extract_mcp_url(cfg, root_cfg)
         MCP_URL = url
         return url
 
