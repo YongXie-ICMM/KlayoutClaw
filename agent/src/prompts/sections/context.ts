@@ -7,7 +7,7 @@ import { join } from "path";
 
 export function buildContextSection(workspaceDir: string): string {
   const sections: string[] = [];
-  const files = ["SOUL.md", "WORKFLOW.md", "TOOLS.md", "RULES.md"];
+  const files = ["SOUL.md", "TOOLS.md", "RULES.md"];
 
   for (const file of files) {
     const path = join(workspaceDir, file);

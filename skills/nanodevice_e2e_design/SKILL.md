@@ -170,8 +170,12 @@ Also take a `screenshot` for visual inspection.
 
 ## Step 7: SAVE
 
+> **BENCHMARK FORMAT WARNING**: If this task is a benchmark run, the required `result.json` schema is defined in the **task prompt itself**. Re-read the task prompt and use the exact schema it specifies. Do **NOT** fall back to the nested general-purpose format below — a schema mismatch makes the evaluator score 0.0.
+
 1. Call `save_layout` to export the GDS file
 2. Write `result.json` — **check if the task or benchmark specifies a required format first and use that exactly**. If no format is specified, use this general-purpose default:
+
+**General format (non-benchmark):**
    - `device_type`: from QUERY
    - `layer_map`: all layer assignments used (e.g. `{"mesa": [{"layer": 20, "datatype": 0}], ...}`)
    - `score`: final evaluation score from EVALUATE
@@ -179,8 +183,6 @@ Also take a `screenshot` for visual inspection.
    - `pipeline_status`: per-step pass/fail/retry counts
    - `checks`: the evaluation check configuration used
    - `feedback`: design notes and any user interventions
-
-> **Note for benchmark tasks**: Benchmarks often require a flat format where component names are top-level keys mapping to layer arrays (e.g., `{"mesa": [...], "contact_patch": [...], "bonding_pad": [...]}`). This differs from the general-purpose format above. Always follow the benchmark instruction's format specification.
 
 **Gate:** GDS file written and result.json contains all required fields.
 

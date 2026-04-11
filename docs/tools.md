@@ -4,7 +4,7 @@ All tools are called via MCP `tools/call` method over HTTP POST to `http://127.0
 
 All coordinates are in **microns**. The database unit (dbu) defaults to 0.001.
 
-**8 tools:** create_layout, execute_script, save_layout, get_layout_info, screenshot, auto_route, evaluate_design, validate_pixel_size
+**9 tools:** create_layout, execute_script, save_layout, get_layout_info, screenshot, auto_route, evaluate_design, validate_pixel_size, close_layout_view
 
 ---
 
@@ -110,16 +110,40 @@ Save the current layout to a file.
 
 Get summary information about the current layout. No parameters.
 
-**Returns:**
+**Returns:** a dict with explicit unit labels so agents never confuse dbu vs µm.
+
 ```json
 {
   "status": "ok",
   "dbu": 0.001,
+  "dbu_um": 0.001,
+  "units": "All *_um fields are micrometers; *_dbu fields are database units. dbu_um converts dbu->um.",
   "num_cells": 1,
   "cells": ["HALLBAR"],
-  "num_layers": 3
+  "cell_bboxes": {
+    "HALLBAR": {
+      "bbox_dbu": [0, 0, 50000, 50000],
+      "bbox_um":  [0.0, 0.0, 50.0, 50.0],
+      "bbox_units": "dbu and um (see bbox_dbu and bbox_um)"
+    }
+  },
+  "num_layers": 3,
+  "layers": {
+    "1/0": {
+      "shapes": 2,
+      "area_um2": 1200.0,
+      "bbox_um":  [0.0, 0.0, 50.0, 50.0],
+      "bbox_dbu": [0, 0, 50000, 50000],
+      "bbox_units": "bbox_um is micrometers, bbox_dbu is database units"
+    }
+  }
 }
 ```
+
+**Notes:**
+- `cells` is enumerated via `layout.each_cell()` (not index-based iteration) so it is stable across `layout.read()` merges.
+- `cell_bboxes` is emitted best-effort: cells with empty bboxes are omitted from the dict.
+- Use `dbu_um` to convert between dbu and micrometers (they happen to share the same numeric value — the alias makes the unit explicit).
 
 ---
 
@@ -132,12 +156,14 @@ Capture the current KLayout viewport as a PNG image. Returns exactly what the us
 | `filepath` | string | no | `/tmp/klayoutclaw_screenshot.png` | Output PNG file path |
 | `width` | integer | no | 1024 | Image width in pixels |
 | `height` | integer | no | 768 | Image height in pixels |
+| `zoom_box` | number[4] | no | (none) | Optional viewport box `[x1, y1, x2, y2]`. **UNIT: um** (micrometers, layout coordinates — NOT dbu). If provided, calls `layout_view.zoom_box(pya.DBox(x1,y1,x2,y2))` before saving the screenshot. |
 
 **Returns:** `{"status": "ok", "filepath": "/tmp/klayoutclaw_screenshot.png", "width": 1024, "height": 768}`
 
 **Notes:**
 - Uses `pya.LayoutView.save_image()` — captures the actual viewport, not a re-render
 - Preserves current zoom, pan, layer visibility, and color settings
+- If `zoom_box` is omitted, captures the current viewport as-is
 - No external dependencies required
 
 ---
@@ -160,13 +186,14 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 | `map_resolution` | number | no | 2.0 | Grid resolution in microns |
 | `conda_env` | string | no | "instrMCPdev" | Conda env with routing deps |
 | `python_path` | string | no | | Path to python binary (overrides conda_env) |
+| `timeout` | number | no | 120 | Subprocess timeout in seconds. Clamped to `[10, 600]` by the handler. |
+| `obs_damping_step` | number | no | 4 | Obstacle cost damping step for graduated damping pathfinder. Lower = stronger avoidance. |
 
 **Advanced tuning parameters** (passed through to `route_worker.py` config JSON — not exposed in MCP tool schema, but can be added to the config directly):
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `obs_hardness` | number | 20.0 | Max cost at obstacle boundary (higher = paths stay further) |
-| `obs_damping_step` | int | 4 | Gradient steps for obstacle avoidance field |
 | `pin_safe_distance_a_um` | number | 5.0 | Avoidance halo radius around Pin A shapes (um) |
 | `pin_safe_distance_b_um` | number | 5.0 | Avoidance halo radius around Pin B shapes (um) |
 | `pin_hardness` | number | 20.0 | Max cost at pin halo boundary |
@@ -213,7 +240,7 @@ Evaluate a device design against configurable geometric quality checks. Runs `to
 | `layer_map` | object | yes | | Map of component names to `[layer, datatype]` arrays. Keys are referenced by check args. |
 | `reference_gds` | string | no | | Path to reference GDS (for checks that need reference layers) |
 | `python_path` | string | no | | Path to python binary with gdstk/shapely/numpy (overrides `conda_env`) |
-| `conda_env` | string | no | `"base"` | Conda environment with gdstk/shapely/numpy |
+| `conda_env` | string | no | `"instrMCPdev"` | Conda environment with gdstk/shapely/numpy |
 
 **Returns:**
 ```json
@@ -222,10 +249,19 @@ Evaluate a device design against configurable geometric quality checks. Runs `to
   "overall": 0.8234,
   "checks": [
     {"name": "component_containment", "score": 0.95, "weight": 0.2, "detail": "component_containment: 0.9500"},
-    {"name": "contact_isolation", "score": 1.0, "weight": 0.15, "detail": "contact_isolation: 1.0000"}
+    {
+      "name": "contact_isolation",
+      "score": 0.8,
+      "weight": 0.15,
+      "detail": "contact_isolation: 0.8000",
+      "crossing_pairs": [[0, 1, 100.0], [0, 2, 100.0]],
+      "crossing_pairs_format": "[route_idx_A, route_idx_B, overlap_um2] — 0-based indices, A<B, pad junctions excluded"
+    }
   ]
 }
 ```
+
+**Per-check extras:** `contact_isolation` adds a `crossing_pairs` list with every detected mid-body short and a `crossing_pairs_format` legend line explaining the tuple layout. Other primitives return a plain score; `contact_isolation` uses a dict-return pattern that `main()` promotes to top-level fields.
 
 **Available check primitives (8):**
 - `component_overlap` — fraction of component area overlapping with region
@@ -279,3 +315,24 @@ Validate a microscope pixel size value and optionally compute marker spacing fro
 | 50x | 0.1 |
 | 20x | 0.25 |
 | 10x | 0.5 |
+
+---
+
+## close_layout_view
+
+Close one or more KLayout layout tabs to keep the MCP server healthy. Layout tabs accumulate memory over a long session and can eventually stall the server — call this tool to organize tabs after a task is finished (e.g. clean up intermediate template/import tabs, or drop everything except the current working layout).
+
+Dirty layouts are saved to a throwaway temp file before closing, so KLayout does not pop up its "Save changes?" dialog.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `index` | integer | no | | Optional 0-based view index to close. If omitted, falls back to `mode`. |
+| `mode` | string | no | `"others"` | Close strategy when `index` is omitted. One of: `"current"` (close only the active tab), `"others"` (close every tab except the active one — typical end-of-task cleanup), `"all"` (close every open tab). |
+
+**Returns:** `{"status": "ok", "closed": <N>, "remaining": <M>, "mode": "others"}` — with `"index": <i>` if called by index.
+
+**Behavior:**
+- Writes each dirty cellview to a throwaway temp file (via `LayoutView.save_as(ci, tmp_path, SaveLayoutOptions())`) before close, which clears KLayout's dirty flag and suppresses the save dialog. Temp files are left in `$TMPDIR`.
+- Re-acquires `_layout`, `_layout_view`, `_top_cell` handles after closing so subsequent tool calls don't hit dangling references.
+- If `mode="all"` leaves zero views, the next `create_layout` (or `execute_script` via `_get_or_create_view()`) rebuilds a fresh view automatically.
+- Never touches tabs the user opened manually vs. tabs the MCP server created — it closes whatever you tell it to.

@@ -9,7 +9,7 @@ Transforms all per-material detections into the full_stack coordinate system, pr
 
 ## Prerequisites
 
-- Conda env `base` with opencv, numpy
+- Conda env `instrMCPdev` with opencv, numpy
 - Completed align step (warp matrices, footprint mask)
 - Completed detect step (per-material masks/contours, detections.json)
 - All scripts run via `conda run -n instrMCPdev python <script>`

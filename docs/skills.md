@@ -345,11 +345,55 @@ conda run -n base python skills/nanodevice_gdsalign/scripts/commit_gds.py \
 - `opencv-python-headless` — template matching, image warp
 - `numpy`, `scipy` — transform computation, least-squares refinement
 
-Conda env: `base` (all deps pre-installed)
+Conda env: `instrMCPdev` (all deps pre-installed)
 
 ### Full Documentation
 
 See `skills/nanodevice_gdsalign/SKILL.md` for orchestrator workflow and `docs/superpowers/specs/2026-03-13-gdsalign-design.md` for design spec.
+
+---
+
+## GDS Import (klayout_gds_import)
+
+Safe GDS import that avoids the `Layout.read()` pitfalls documented in `CLAUDE.md`: cell-name collisions leaving orphaned cell indices, dangling `CellView.cell` after read, and multi-top-cell states after merging.
+
+### Script
+
+#### import_gds.py
+
+```bash
+python skills/klayout_gds_import/scripts/import_gds.py \
+    --filepath /abs/path/to/template.gds \
+    --flatten \
+    --merge-into-current
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--filepath` | string | — | **Required.** Absolute path to a `.gds` file |
+| `--flatten` / `--no-flatten` | bool | `true` | Flatten hierarchy into the top cell via `cell.flatten(-1, True)` |
+| `--merge-into-current` / `--no-merge-into-current` | bool | `true` | Merge into the currently focused layout (vs. open a fresh tab) |
+
+**Returns (stdout JSON):**
+```json
+{"status": "ok", "top_cell": "TOP", "shapes_added": 1342}
+```
+
+### Behavior
+
+1. Reads the GDS into the current layout (or a fresh tab via `mw.create_layout(1)` if `--no-merge-into-current`)
+2. Flattens hierarchy so there are no subcells left
+3. Collapses any residual multi-top-cell state into a single top cell (largest bbox wins; other tops' shapes are moved in layer-by-layer via `shapes().each() + insert()`)
+4. Rebinds `CellView.cell` to the resolved top, zooms fit, and refreshes the layer panel
+
+### Dependencies
+
+- `skills/scripts/mcp_client.py` (shared MCP client)
+- KLayout running with the KlayoutClaw plugin (the script dispatches pya code via `execute_script`)
+
+### Full Documentation
+
+See `skills/klayout_gds_import/SKILL.md`.
 
 ---
 

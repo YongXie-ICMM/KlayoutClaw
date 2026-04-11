@@ -6,11 +6,13 @@ import { existsSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 
 /**
- * Load workspace markdown files (SOUL.md, WORKFLOW.md, etc.).
+ * Load workspace markdown files (SOUL.md, TOOLS.md, RULES.md).
+ * Note: WORKFLOW.md was removed; the E2E design workflow now lives in
+ * skills/nanodevice_e2e_design/SKILL.md.
  */
 export function loadWorkspaceContext(workspaceDir: string): Record<string, string> {
   const files: Record<string, string> = {};
-  const mdFiles = ["SOUL.md", "WORKFLOW.md", "TOOLS.md", "RULES.md"];
+  const mdFiles = ["SOUL.md", "TOOLS.md", "RULES.md"];
 
   for (const file of mdFiles) {
     const path = join(workspaceDir, file);

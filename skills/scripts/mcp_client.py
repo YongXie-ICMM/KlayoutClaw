@@ -2,6 +2,16 @@
 """Shared MCP client for KlayoutClaw skills.
 
 Provides helpers to call the KlayoutClaw MCP server at 127.0.0.1:8765.
+
+Contract:
+    - ``load_mcp_config()`` honors the ``KLAYOUT_MCP_URL`` environment variable
+      before any config file lookup. This is the preferred injection point for
+      containerized deployments (e.g. Docker: ``host.docker.internal:8765``).
+    - ``mcp_call()`` raises ``RuntimeError`` on connection failure instead of
+      calling ``sys.exit(1)``. Callers may catch this to fall back to a local
+      mode; by default, an uncaught ``RuntimeError`` will terminate the script
+      with a traceback, which matches the previous hard-fail behavior for
+      scripts that do not install a handler.
 """
 
 import json
@@ -10,8 +20,12 @@ import sys
 import urllib.request
 import urllib.error
 
-MCP_URL = "http://127.0.0.1:8765/mcp"
 _DEFAULT_URL = "http://127.0.0.1:8765/mcp"
+# Seed MCP_URL from the KLAYOUT_MCP_URL env var at import time so every skill
+# script that imports this module picks up the Docker-friendly override even
+# if the caller never explicitly calls load_mcp_config(). If the env var is
+# unset the default host.loopback URL is used, matching legacy behavior.
+MCP_URL = os.environ.get("KLAYOUT_MCP_URL") or _DEFAULT_URL
 _req_id = 0
 _session_id = None
 
@@ -22,18 +36,27 @@ def _script_dir():
 
 
 def load_mcp_config(config_path=None):
-    """Load MCP server URL from a config file.
+    """Load MCP server URL from env var or a config file.
 
     Fallback order:
-      1. config_path (explicit --mcp-config flag)
-      2. .mcp.json in current working directory
-      3. mcp_config.json in the KlayoutClaw project root
-      4. klayout.json in the workspace and .qlaybot root directory.
-      5. Default http://127.0.0.1:8765/mcp
+      0. ``KLAYOUT_MCP_URL`` environment variable (highest priority — used in
+         Docker to point at ``http://host.docker.internal:8765/mcp``). If set,
+         this bypasses the entire config-file chain.
+      1. ``config_path`` (explicit ``--mcp-config`` flag)
+      2. ``.mcp.json`` in current working directory
+      3. ``mcp_config.json`` in the KlayoutClaw project root
+      4. ``klayout.json`` in the workspace or ``~/.qlaybot/config/``
+      5. Default ``http://127.0.0.1:8765/mcp``
 
-    Returns the resolved URL and sets the module-level MCP_URL.
+    Returns the resolved URL and sets the module-level ``MCP_URL``.
     """
     global MCP_URL
+
+    # Fallback 0: environment variable (highest priority, for Docker etc.)
+    env_url = os.environ.get("KLAYOUT_MCP_URL")
+    if env_url:
+        MCP_URL = env_url
+        return env_url
 
     if config_path is not None:
         if not os.path.exists(config_path):
@@ -62,12 +85,14 @@ def load_mcp_config(config_path=None):
         url = cfg["mcpServers"]["klayoutclaw"]["url"]
         MCP_URL = url
         return url
-    
-    #Fallback 3:klayout.json in the workspace and .qlaybot root directory
-    cwd_cfg = os.path.join(os.getcwd(), "klayout.json")
-    qlaybot_root_cfg = os.path.join('~/.qlaybot/config', "klayout.json")
-    if os.path.exists(cwd_cfg):
-        with open(cwd_cfg) as f:
+
+    # Fallback 3: klayout.json in the workspace or ~/.qlaybot/config
+    workspace_cfg = os.path.join(os.getcwd(), "klayout.json")
+    qlaybot_root_cfg = os.path.expanduser(
+        os.path.join("~/.qlaybot/config", "klayout.json")
+    )
+    if os.path.exists(workspace_cfg):
+        with open(workspace_cfg) as f:
             cfg = json.load(f)
         url = cfg["url"]
         MCP_URL = url
@@ -100,9 +125,13 @@ def mcp_call(method, params=None, timeout=30):
     try:
         r = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.URLError as e:
-        print(f"ERROR: Cannot connect to KLayout MCP server at {MCP_URL}", file=sys.stderr)
-        print(f"  Make sure KLayout is running with KlayoutClaw plugin.", file=sys.stderr)
-        sys.exit(1)
+        # Raise instead of sys.exit so callers can catch this and decide
+        # whether to fall back to a local mode. See module docstring.
+        raise RuntimeError(
+            f"Cannot connect to KLayout MCP at {MCP_URL}: {e}. "
+            f"Make sure KLayout is running with the KlayoutClaw plugin, "
+            f"or set KLAYOUT_MCP_URL to override the server URL."
+        ) from e
     _session_id = r.headers.get("Mcp-Session-Id", _session_id)
     data = json.loads(r.read().decode())
     if "error" in data:

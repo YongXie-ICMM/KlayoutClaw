@@ -7,9 +7,11 @@ description: Align microscope stack images to a GDS fabrication template using l
 
 Align microscope images to a GDS fabrication template by detecting lithographic markers in both domains and computing a similarity transform.
 
+> **Coordinate system after gdsalign**: Coordinates in `traces_gds.json` are in the **GDS reference frame** (floating-point micrometers). When using them in `execute_script`, convert to dbu via `int(value_um / layout.dbu)`. **Do NOT apply the flakedetect_commit image-center transform** — gdsalign already handles the coordinate mapping.
+
 ## Prerequisites
 
-- Conda env `base` with opencv, numpy, scipy, gdstk
+- Conda env `instrMCPdev` with opencv, numpy, scipy, gdstk
 - Template GDS file with L5/0 alignment markers (4 cross pairs)
 - flakedetect output: `traces.json` with material contours in pixel coordinates
 - All scripts: `conda run -n instrMCPdev python <script>`
@@ -98,7 +100,7 @@ Warps the microscope image and material contours into GDS coordinates using the 
 | `--image` | Full-stack microscope image |
 | `--pixel-size` | Image pixel size in um/px |
 | `--gds` | Template GDS file (loaded into KLayout during commit) |
-| `--output-dir` | Output directory for `traces_gds.json`, `full_stack_gds.png`, `image_placement.json` |
+| `--output-dir` | Optional output directory for warp results (default: current working directory). Set this to the agent's workspace directory to keep warp outputs scoped. Files written: `traces_gds.json`, `full_stack_gds.png`, `image_placement.json` |
 | `--warp-only` | Only produce warped files, skip KLayout commit |
 | `--mcp-config` | Path to MCP config JSON. Fallback chain: `.mcp.json` in CWD → `mcp_config.json` in project root → default `127.0.0.1:8765`. **In Docker**, pass a config pointing to `http://host.docker.internal:8765/mcp` |
 

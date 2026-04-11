@@ -91,6 +91,8 @@ Clears all shapes from the listed layers. Useful for re-routing without losing d
 
 ## Output Layers Convention
 
+> **Note**: These layers are **task-specific examples**. Always use the layer assignments from the task instruction, which may differ (benchmarks frequently use 20/0 for mesa, 22/0 for topgate, etc.).
+
 | Layer | Purpose | EBL Pass |
 |-------|---------|----------|
 | 1/0 | Mesa (graphene etch) | Pass 1 |

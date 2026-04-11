@@ -7,7 +7,7 @@ import { join } from "path";
 import { homedir } from "os";
 import type { CommandHandler, CommandContext, CommandResult } from "./index.js";
 
-const WORKSPACE_FILES = ["SOUL.md", "WORKFLOW.md", "TOOLS.md", "RULES.md"];
+const WORKSPACE_FILES = ["SOUL.md", "TOOLS.md", "RULES.md"];
 
 export const contextCommand: CommandHandler = {
   name: "context",

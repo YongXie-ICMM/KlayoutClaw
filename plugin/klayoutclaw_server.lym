@@ -19,6 +19,7 @@
 import sys
 import os
 import io
+import tempfile
 
 # KLayout GUI app has no terminal — sys.stdout defaults to ASCII encoding.
 # Reconfigure to UTF-8 so print() won't crash on non-ASCII characters.
@@ -230,7 +231,14 @@ TOOLS = [
             "properties": {
                 "filepath": {"type": "string", "description": "Output PNG file path", "default": "/tmp/klayoutclaw_screenshot.png"},
                 "width": {"type": "integer", "description": "Image width in pixels", "default": 1024},
-                "height": {"type": "integer", "description": "Image height in pixels", "default": 768}
+                "height": {"type": "integer", "description": "Image height in pixels", "default": 768},
+                "zoom_box": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "Optional viewport box [x1, y1, x2, y2]. UNIT: um (micrometers, layout coordinates — NOT dbu). If provided, calls layout_view.zoom_box(pya.DBox(x1,y1,x2,y2)) before saving the screenshot."
+                }
             }
         }
     },
@@ -254,7 +262,9 @@ TOOLS = [
                 "pin_safe_distance_a": {"type": "number", "description": "Avoidance halo around Pin A shapes in microns", "default": 5.0},
                 "pin_safe_distance_b": {"type": "number", "description": "Avoidance halo around Pin B shapes in microns", "default": 5.0},
                 "path_hardness": {"type": "number", "description": "Max cost near previously routed paths (higher = more spacing)", "default": 10.0},
-                "sort_pairs": {"type": "boolean", "description": "Route shortest pairs first (improves success rate)", "default": True}
+                "sort_pairs": {"type": "boolean", "description": "Route shortest pairs first (improves success rate)", "default": True},
+                "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds (default 120, max 600)"},
+                "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping step for graduated damping pathfinder (default 4, lower = stronger avoidance)"}
             },
             "required": ["pin_layer_a", "pin_layer_b"]
         }
@@ -301,6 +311,17 @@ TOOLS = [
                 "conda_env": {"type": "string", "default": "instrMCPdev", "description": "Conda environment with gdstk/shapely/numpy"}
             },
             "required": ["checks", "layer_map"]
+        }
+    },
+    {
+        "name": "close_layout_view",
+        "description": "Close one or more KLayout layout tabs to keep the MCP server healthy. Layout tabs accumulate memory over a long session and can eventually stall the server. Call this tool to organize KLayout tabs AFTER a task is finished — for example, to clean up intermediate template/import tabs before moving on, or to drop everything except the current working layout. Never touches tabs the user opened manually vs. tabs the MCP server created — it just closes whatever you tell it to by index or mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "Optional 0-based view index to close. If omitted, behavior depends on 'mode'."},
+                "mode": {"type": "string", "enum": ["current", "others", "all"], "default": "others", "description": "Close strategy when 'index' is omitted: 'current' closes only the active tab; 'others' closes every tab except the active one (default — typical end-of-task cleanup); 'all' closes every open tab."}
+            }
         }
     }
 ]
@@ -495,8 +516,24 @@ def _tool_get_layout_info(args):
     # Use each_cell() instead of range(layout.cells()) because the cell
     # count can include holes in the index space after Layout.read() merges
     # GDS content with cell-name collisions (KLayout leaves orphaned slots).
+    cell_bboxes = {}
     for c in _layout.each_cell():
         cells.append(c.name)
+        try:
+            bb = c.bbox()
+            if not bb.empty():
+                cell_bboxes[c.name] = {
+                    "bbox_dbu": [bb.left, bb.bottom, bb.right, bb.top],
+                    "bbox_um": [
+                        round(bb.left * _layout.dbu, 6),
+                        round(bb.bottom * _layout.dbu, 6),
+                        round(bb.right * _layout.dbu, 6),
+                        round(bb.top * _layout.dbu, 6),
+                    ],
+                    "bbox_units": "dbu and um (see bbox_dbu and bbox_um)",
+                }
+        except Exception:
+            pass
     dbu = _layout.dbu
     layers = {}
     for li in _layout.layer_indices():
@@ -514,8 +551,10 @@ def _tool_get_layout_info(args):
             rsi.next()
         area_um2 = round(region.area() * dbu * dbu, 6)
         bbox_um = None
+        bbox_dbu = None
         if not region.is_empty():
             bb = region.bbox()
+            bbox_dbu = [bb.left, bb.bottom, bb.right, bb.top]
             bbox_um = [
                 round(bb.left * dbu, 6),
                 round(bb.bottom * dbu, 6),
@@ -526,13 +565,18 @@ def _tool_get_layout_info(args):
             "shapes": shape_count,
             "area_um2": area_um2,
             "bbox_um": bbox_um,
+            "bbox_dbu": bbox_dbu,
+            "bbox_units": "bbox_um is micrometers, bbox_dbu is database units",
         }
     num_layers = len(layers)
     return json.dumps({
         "status": "ok",
         "dbu": dbu,
+        "dbu_um": dbu,  # micrometers per database unit (same as dbu; explicit label for clarity)
+        "units": "All *_um fields are micrometers; *_dbu fields are database units. dbu_um converts dbu->um.",
         "num_cells": len(cells),
         "cells": cells,
+        "cell_bboxes": cell_bboxes,
         "num_layers": num_layers,
         "layers": layers,
     })
@@ -548,7 +592,18 @@ def _tool_screenshot(args):
     filepath = args.get("filepath", "/tmp/klayoutclaw_screenshot.png")
     width = args.get("width", 1024)
     height = args.get("height", 768)
+    zoom_box = args.get("zoom_box", None)
     abs_path = os.path.abspath(filepath)
+
+    if zoom_box is not None:
+        if not isinstance(zoom_box, (list, tuple)) or len(zoom_box) != 4:
+            raise ValueError("zoom_box must be a 4-element list [x1, y1, x2, y2] in micrometers")
+        try:
+            x1, y1, x2, y2 = [float(v) for v in zoom_box]
+        except (TypeError, ValueError) as e:
+            raise ValueError("zoom_box values must be numeric: {}".format(e))
+        _layout_view.zoom_box(pya.DBox(x1, y1, x2, y2))
+        _log("screenshot: zoom_box set to [{}, {}, {}, {}]".format(x1, y1, x2, y2))
 
     _layout_view.save_image(abs_path, width, height)
     _log("screenshot: saved {}x{} to {}".format(width, height, abs_path))
@@ -581,6 +636,19 @@ def _tool_auto_route(args):
     pin_safe_distance_b = args.get("pin_safe_distance_b", 5.0)
     path_hardness = args.get("path_hardness", 10.0)
     sort_pairs = args.get("sort_pairs", True)
+    # Clamp timeout to [10, 600] seconds
+    try:
+        timeout_sec = float(args.get("timeout", 120))
+    except (TypeError, ValueError):
+        timeout_sec = 120.0
+    if timeout_sec &lt; 10:
+        timeout_sec = 10.0
+    elif timeout_sec &gt; 600:
+        timeout_sec = 600.0
+    try:
+        obs_damping_step = int(args.get("obs_damping_step", 4))
+    except (TypeError, ValueError):
+        obs_damping_step = 4
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_route_")
@@ -612,6 +680,7 @@ def _tool_auto_route(args):
         "pin_safe_distance_b_um": pin_safe_distance_b,
         "path_hardness": path_hardness,
         "sort_pairs": sort_pairs,
+        "obs_damping_step": obs_damping_step,
     }
     with open(config_json, "w") as f:
         json.dump(config, f)
@@ -656,10 +725,10 @@ def _tool_auto_route(args):
     try:
         proc = subprocess.run(
             ["bash", "-c", cmd],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=timeout_sec
         )
     except subprocess.TimeoutExpired:
-        raise ValueError("Routing timed out after 120 seconds. The layout may be too complex — try increasing map_resolution or reducing the number of obstacles.")
+        raise ValueError("Routing timed out after {} seconds. The layout may be too complex — try increasing map_resolution, reducing obstacles, or raising the 'timeout' parameter (max 600).".format(int(timeout_sec)))
     except Exception as e:
         raise ValueError("Failed to run route_worker.py subprocess: {}".format(e))
 
@@ -695,7 +764,7 @@ def _tool_auto_route(args):
         if len(pts) &lt; 2:
             continue
         path_obj = pya.Path(
-            [pya.Point(int(p[0]), int(p[1])) for p in pts],
+            [pya.Point(int(round(p[0])), int(round(p[1]))) for p in pts],
             path_width_dbu
         )
         _top_cell.shapes(layer_idx).insert(path_obj)
@@ -1010,6 +1079,131 @@ def _tool_validate_pixel_size(args):
     })
 
 
+def _tool_close_layout_view(args):
+    """Close one or more KLayout layout tabs.
+
+    Modes (when 'index' is omitted):
+      - 'others' (default) — close every tab except the currently active one
+      - 'current'          — close only the active tab
+      - 'all'              — close every open tab
+    If 'index' is provided, close that specific tab instead (by 0-based index).
+    After closing, re-acquires MCP handles so subsequent tool calls see a valid view.
+    """
+    global _layout, _layout_view, _top_cell
+    mw = pya.Application.instance().main_window()
+    if mw is None:
+        return json.dumps({"status": "error", "error": "no main window"})
+
+    initial_count = mw.views()
+    if initial_count == 0:
+        return json.dumps({"status": "ok", "closed": 0, "remaining": 0, "note": "no views to close"})
+
+    index = args.get("index")
+    mode = args.get("mode", "others")
+
+    # Snapshot the currently active view so we can keep it across closes
+    try:
+        cur_view = mw.current_view()
+        active_id = id(cur_view) if cur_view is not None else None
+    except Exception:
+        active_id = None
+
+    # Collect (index, id) for all open views up front — indices shift as we close
+    view_ids = []
+    for i in range(initial_count):
+        v = mw.view(i)
+        if v is not None:
+            view_ids.append(id(v))
+
+    # Decide which view ids to close
+    targets = []
+    if index is not None:
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            return json.dumps({"status": "error", "error": "'index' must be an integer"})
+        if idx &lt; 0 or idx &gt;= initial_count:
+            return json.dumps({"status": "error", "error": "index {} out of range [0, {})".format(idx, initial_count)})
+        targets.append(view_ids[idx])
+    elif mode == "current":
+        if active_id is not None:
+            targets.append(active_id)
+    elif mode == "all":
+        targets = list(view_ids)
+    elif mode == "others":
+        targets = [vid for vid in view_ids if vid != active_id]
+    else:
+        return json.dumps({"status": "error", "error": "mode must be one of: current, others, all"})
+
+    closed = 0
+    errors = []
+    for vid in targets:
+        # Re-find the view by id — indices shift after each close
+        found_idx = None
+        for i in range(mw.views()):
+            v = mw.view(i)
+            if v is not None and id(v) == vid:
+                found_idx = i
+                break
+        if found_idx is None:
+            continue
+        try:
+            # Mark the view's layouts as non-dirty so KLayout doesn't pop up
+            # a modal "Save changes?" dialog (which would block the MCP server
+            # on the Qt main thread). We do this by writing each cellview out
+            # to a throwaway temp file via LayoutView.save_as(cv_idx, path, opts)
+            # — KLayout considers a freshly-saved layout clean (is_dirty() flips
+            # to False after save_as). The temp file is left on disk (OS cleans
+            # /tmp / $TMPDIR).
+            target_view = mw.view(found_idx)
+            if target_view is not None:
+                try:
+                    if target_view.is_dirty():
+                        for ci in range(target_view.cellviews()):
+                            tmp_fd, tmp_path = tempfile.mkstemp(
+                                prefix="klayoutclaw_close_", suffix=".gds")
+                            os.close(tmp_fd)
+                            try:
+                                target_view.save_as(ci, tmp_path, pya.SaveLayoutOptions())
+                            except Exception as save_err:
+                                _log("close_layout_view: save_as failed for cv {} ({}); attempting close anyway".format(ci, save_err))
+                except Exception as mark_err:
+                    _log("close_layout_view: mark-clean pass failed: {}".format(mark_err))
+            mw.select_view(found_idx)
+            mw.close_current_view()
+            closed += 1
+        except Exception as e:
+            errors.append("failed to close view id={}: {}".format(vid, e))
+
+    remaining = mw.views()
+
+    # After closing, our module-level _layout / _layout_view / _top_cell may
+    # point at a destroyed object. Re-acquire handles so the next tool call
+    # doesn't segfault. If no views remain, the next create_layout will rebuild.
+    try:
+        if remaining &gt; 0:
+            _layout_view = mw.current_view()
+            if _layout_view is not None:
+                cv = _layout_view.active_cellview()
+                _layout = cv.layout() if cv is not None else None
+                _top_cell = cv.cell if cv is not None else None
+        else:
+            _layout = None
+            _layout_view = None
+            _top_cell = None
+    except Exception as e:
+        errors.append("handle refresh after close failed: {}".format(e))
+
+    _refresh_view() if remaining &gt; 0 else None
+
+    result = {"status": "ok", "closed": closed, "remaining": remaining, "mode": mode}
+    if index is not None:
+        result["index"] = int(index)
+    if errors:
+        result["errors"] = errors
+    return json.dumps(result)
+
+
 _TOOL_DISPATCH = {
     "create_layout": _tool_create_layout,
     "execute_script": _tool_execute_script,
@@ -1019,6 +1213,7 @@ _TOOL_DISPATCH = {
     "auto_route": _tool_auto_route,
     "evaluate_design": _tool_evaluate_design,
     "validate_pixel_size": _tool_validate_pixel_size,
+    "close_layout_view": _tool_close_layout_view,
 }
 
 

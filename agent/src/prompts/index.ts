@@ -49,7 +49,7 @@ export function buildSystemPrompt(ctx: PromptBuildContext): string {
     sections.push(buildMemorySection());
   }
 
-  // Workspace context (SOUL.md, WORKFLOW.md, etc.)
+  // Workspace context (SOUL.md, TOOLS.md, RULES.md)
   const context = buildContextSection(ctx.workspaceDir);
   if (context) sections.push(context);
 

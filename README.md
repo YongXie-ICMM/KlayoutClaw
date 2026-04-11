@@ -24,7 +24,7 @@ KlayoutClaw has three layers:
 
 | Layer | What it does |
 |-------|-------------|
-| **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 6 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs. Zero external dependencies. |
+| **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 9 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs, evaluate designs, validate pixel size, close layout tabs. Zero external dependencies. |
 | **Skills** | Claude Code plugin with 7 skills — geometry, display, visual, image, and 3 nanodevice pipelines (flakedetect, gdsalign, routing). Claude loads them automatically when relevant. |
 | **Tools** | Standalone utilities — GDS-to-PNG converter, subprocess routing engine. Used by the MCP server and skills internally. |
 
@@ -66,9 +66,12 @@ python tests/test_connection.py
 | `create_layout` | Create a new layout with a top cell |
 | `execute_script` | Run arbitrary Python/pya code in KLayout |
 | `save_layout` | Save layout as GDS2 or OASIS |
-| `get_layout_info` | Get layout summary (cells, layers, dbu) |
-| `screenshot` | Capture viewport as PNG (what the user sees) |
-| `auto_route` | Autoroute connections between pin pairs |
+| `get_layout_info` | Get layout summary (cells, layers, dbu/um bboxes) |
+| `screenshot` | Capture viewport as PNG, optional `zoom_box` in µm |
+| `auto_route` | Autoroute connections between pin pairs (configurable `timeout`, `obs_damping_step`) |
+| `evaluate_design` | Evaluate device design against configurable geometric checks (subprocess) |
+| `validate_pixel_size` | Validate microscope pixel size against known objective mappings |
+| `close_layout_view` | Close layout tabs by index or mode (current/others/all) — server health |
 
 `execute_script` is the power tool — it runs any Python code inside KLayout with access to `pya`, the current layout, and view. The other tools handle lifecycle and visualization. See [docs/tools.md](docs/tools.md) for full parameter schemas.
 
@@ -215,7 +218,7 @@ KlayoutClaw/
 │   ├── graphene_for_test.jpg     # Graphene microscope image
 │   └── ml08/                     # ML08 sample data
 ├── docs/
-│   ├── tools.md                  # MCP tool reference (6 tools)
+│   ├── tools.md                  # MCP tool reference (9 tools)
 │   ├── skills.md                 # Skills reference (7 skills)
 │   ├── ui-plugin.md              # UI plugin docs
 │   ├── plans/                    # Architecture design docs

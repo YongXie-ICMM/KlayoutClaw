@@ -7,6 +7,8 @@ description: Insert detected flake polygons into KLayout as GDS geometry using t
 
 Pure agent workflow using existing skills and MCP tools. No custom scripts needed.
 
+> **Scope**: This workflow is for **pre-gdsalign only**. If you have already run `nanodevice_gdsalign`, use the `contour_gds` coordinates from `traces_gds.json` directly and do **not** apply the image-center transform described below.
+
 ## When to Use
 
 After the combine step completes. Requires `traces.json` from `<out>/combine/`.

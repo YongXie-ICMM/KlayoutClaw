@@ -598,12 +598,12 @@ describe("WorkspaceBar", () => {
   it("shows expanded file list", () => {
     const files = [
       { name: "SOUL.md", path: "/ws/SOUL.md", description: "Agent soul" },
-      { name: "WORKFLOW.md", path: "/ws/WORKFLOW.md", description: "Design workflow" },
+      { name: "RULES.md", path: "/ws/RULES.md", description: "Design rules" },
     ];
     const text = renderText(React.createElement(WorkspaceBar, {
       expanded: true, files, integrity: { ok: true, fileCount: 2, issues: [] },
     }));
     expect(text).toContain("SOUL.md");
-    expect(text).toContain("WORKFLOW.md");
+    expect(text).toContain("RULES.md");
   });
 });

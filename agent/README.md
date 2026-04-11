@@ -111,8 +111,8 @@ Exit with `/plan exit` to resume full tool access.
 qlaybot v0.3
   ├── Agent Layer
   │   ├── SOUL.md (physicist persona)
-  │   ├── WORKFLOW.md (Plan → Design → Interact)
   │   ├── TOOLS.md / RULES.md (tool guide + design constraints)
+  │   │   (E2E workflow lives in skills/nanodevice_e2e_design/SKILL.md)
   │   └── Memory (SQLite FTS5: knowledge, procedures, preferences, log)
   ├── Command Layer
   │   ├── CommandRegistry (10 handlers including /compact)

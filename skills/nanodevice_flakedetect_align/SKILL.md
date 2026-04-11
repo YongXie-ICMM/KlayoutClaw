@@ -12,7 +12,7 @@ Register source microscope images to the full_stack target coordinate system.
 
 ## Prerequisites
 
-- Conda env `base` with opencv, numpy, scipy, scikit-learn
+- Conda env `instrMCPdev` with opencv, numpy, scipy, scikit-learn
 - Source images and full_stack reference image
 - All scripts: `conda run -n instrMCPdev python <script>`
 
@@ -210,7 +210,7 @@ Optional: `--gray-only` — use grayscale Otsu only, skip saturation intersectio
 SIFT-aligns bottom_part to target, computes LAB diff image, K-means on diff intensity. Isolates the top-placed flake from substrate. Splits disconnected blobs within clusters into sub-clusters before enumeration, so spatially separate flakes sharing the same intensity are treated independently.
 
 ```bash
-conda run -n base python skills/nanodevice_flakedetect_align/scripts/footprint.py \
+conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/footprint.py \
     --source <top_part> --target <full_stack_raw> \
     --bottom <bottom_part> [--mirror] \
     [--source-contour <out>/align/source_contour.npy] \

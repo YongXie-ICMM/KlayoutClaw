@@ -169,7 +169,7 @@ Commit and review don't write to disk — they use KLayout directly.
 
 ## Conventions
 
-- **Conda env:** `base` (has opencv, numpy, scipy, sklearn)
+- **Conda env:** `instrMCPdev` (has opencv, numpy, scipy, sklearn)
 - **Contour .npy format:** shape (N,2), dtype float64
 - **Masks:** uint8, values 0 or 255
 - **Warp matrices:** 2x3 float64 for cv2.warpAffine

@@ -3,7 +3,7 @@
 
 These tests validate that:
 - 4A: Existing SKILL.md files have been updated with required guidance
-- 4B: qlaybot workspace files (TOOLS/WORKFLOW/RULES) have new content
+- 4B: qlaybot workspace files (TOOLS/RULES) have new content
 - 4C: KlayoutClaw docs (tools.md, skills.md, CLAUDE.md) are updated
 - 4D: TypeScript source files have required annotations and skill scanning
 - 4D2: buildSkillsSection functional tests (separate .ts file, run via npx tsx)
@@ -30,7 +30,6 @@ DOCS_TOOLS = os.path.join(PROJECT_ROOT, "docs", "tools.md")
 DOCS_SKILLS = os.path.join(PROJECT_ROOT, "docs", "skills.md")
 CLAUDE_MD = os.path.join(PROJECT_ROOT, "CLAUDE.md")
 WS_TOOLS = os.path.join(AGENT_DIR, "workspace", "TOOLS.md")
-WS_WORKFLOW = os.path.join(AGENT_DIR, "workspace", "WORKFLOW.md")
 WS_RULES = os.path.join(AGENT_DIR, "workspace", "RULES.md")
 GDSALIGN_SKILL = os.path.join(SKILLS_DIR, "nanodevice_gdsalign", "SKILL.md")
 ROUTING_SKILL = os.path.join(SKILLS_DIR, "nanodevice_routing", "SKILL.md")
@@ -135,40 +134,6 @@ class TestWorkspaceTools:
         )
 
 
-class TestWorkspaceWorkflow:
-    """agent/workspace/WORKFLOW.md must have Phase 0 and design constraints."""
-
-    def test_has_phase0_query(self):
-        content = _read(WS_WORKFLOW)
-        # Phase 0 must exist with "Query" in its title
-        assert re.search(r'phase\s*0.*query|query.*phase\s*0', content, re.IGNORECASE), (
-            "WORKFLOW.md must have Phase 0 (Query) before Phase 1"
-        )
-
-    def test_phase0_before_phase1(self):
-        content = _read(WS_WORKFLOW)
-        # Phase 0 heading must appear before Phase 1 heading
-        p0 = re.search(r'phase\s*0', content, re.IGNORECASE)
-        p1 = re.search(r'phase\s*1', content, re.IGNORECASE)
-        assert p0 is not None, "WORKFLOW.md must have Phase 0"
-        assert p1 is not None, "WORKFLOW.md must have Phase 1"
-        assert p0.start() < p1.start(), "Phase 0 must appear before Phase 1"
-
-    def test_hallbar_design_constraints_summary(self):
-        content = _read(WS_WORKFLOW)
-        lower = content.lower()
-        assert "hallbar" in lower or "hall bar" in lower or "hall_bar" in lower, (
-            "WORKFLOW.md must include hallbar design constraints summary"
-        )
-
-    def test_evaluate_iterate_loop(self):
-        content = _read(WS_WORKFLOW)
-        lower = content.lower()
-        assert "evaluate" in lower and "iterate" in lower, (
-            "WORKFLOW.md must describe evaluate -> iterate loop"
-        )
-
-
 class TestWorkspaceRules:
     """agent/workspace/RULES.md must have pixel_size and hallbar geometry constraints."""
 
@@ -232,22 +197,16 @@ class TestDocsTools:
             "docs/tools.md must mention validate_pixel_size tool"
         )
 
-    def test_tool_count_8(self):
+    def test_tool_count_9(self):
         content = _read(DOCS_TOOLS)
-        # The tool summary line should say 8 tools
-        assert re.search(r'8\s*tools', content, re.IGNORECASE), (
-            "docs/tools.md must indicate 8 tools total"
+        # The tool summary line should say 9 tools
+        assert re.search(r'9\s*tools', content, re.IGNORECASE), (
+            "docs/tools.md must indicate 9 tools total"
         )
 
 
 class TestDocsSkills:
     """docs/skills.md must mention new skills."""
-
-    def test_mentions_nanodevice_hallbar(self):
-        content = _read(DOCS_SKILLS)
-        assert "nanodevice_hallbar" in content, (
-            "docs/skills.md must mention nanodevice_hallbar"
-        )
 
     def test_mentions_nanodevice_e2e_design(self):
         content = _read(DOCS_SKILLS)
@@ -255,15 +214,21 @@ class TestDocsSkills:
             "docs/skills.md must mention nanodevice_e2e_design"
         )
 
+    def test_mentions_klayout_gds_import(self):
+        content = _read(DOCS_SKILLS)
+        assert "klayout_gds_import" in content, (
+            "docs/skills.md must mention klayout_gds_import"
+        )
+
 
 class TestClaudeMd:
     """CLAUDE.md must have updated tool count, new skills, and evaluate_worker."""
 
-    def test_tool_count_8(self):
+    def test_tool_count_9(self):
         content = _read(CLAUDE_MD)
-        # Must say "8 total" somewhere in the MCP Tools section
-        assert re.search(r'MCP\s+Tools\s*\(\s*8\s+total\s*\)', content, re.IGNORECASE), (
-            "CLAUDE.md must have 'MCP Tools (8 total)' header"
+        # Must say "9 total" somewhere in the MCP Tools section
+        assert re.search(r'MCP\s+Tools\s*\(\s*9\s+total\s*\)', content, re.IGNORECASE), (
+            "CLAUDE.md must have 'MCP Tools (9 total)' header"
         )
 
     def test_mentions_evaluate_worker(self):
@@ -272,10 +237,10 @@ class TestClaudeMd:
             "CLAUDE.md must list evaluate_worker.py in tools/ directory"
         )
 
-    def test_mentions_nanodevice_hallbar_in_structure(self):
+    def test_mentions_close_layout_view(self):
         content = _read(CLAUDE_MD)
-        assert "nanodevice_hallbar" in content, (
-            "CLAUDE.md must mention nanodevice_hallbar in directory structure"
+        assert "close_layout_view" in content, (
+            "CLAUDE.md must list close_layout_view in MCP Tools table"
         )
 
     def test_mentions_nanodevice_e2e_design_in_structure(self):

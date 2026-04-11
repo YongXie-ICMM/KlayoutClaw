@@ -74,10 +74,10 @@ KlayoutClaw/
 │   └── e2e_judge/
 │       ├── SKILL.md              # Agentic E2E test harness with LLM judge
 │       └── scripts/              # conftest, harness, judge, verifier, run_tests
-├── agent/                          # qlaybot v0.4.1 — Pi-Agent SDK wrapper
+├── agent/                          # qlaybot v0.4.2 — Pi-Agent SDK wrapper
 │   ├── src/                        # TypeScript source (see agent/CLAUDE.md)
 │   ├── tests/                      # 697 tests: unit / integration / e2e
-│   ├── workspace/                  # Domain knowledge (SOUL, WORKFLOW, TOOLS, RULES)
+│   ├── workspace/                  # Domain knowledge (SOUL, TOOLS, RULES)
 │   ├── package.json
 │   └── CLAUDE.md                   # Agent dev instructions
 ├── tests/
@@ -116,7 +116,7 @@ KlayoutClaw/
 └── TODO.md                       # Task tracking
 ```
 
-## MCP Tools (8 total)
+## MCP Tools (9 total)
 
 | Tool | Description |
 |------|-------------|
@@ -128,6 +128,7 @@ KlayoutClaw/
 | `auto_route` | Autoroute pin pairs (subprocess, needs conda env) |
 | `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess) |
 | `validate_pixel_size` | Validate pixel_size against known objectives |
+| `close_layout_view` | Close one or more layout tabs to keep the server healthy (modes: current/others/all, or by index) |
 
 See `docs/tools.md` for full parameter schemas.
 

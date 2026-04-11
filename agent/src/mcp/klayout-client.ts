@@ -100,26 +100,42 @@ export class KLayoutMCPClient {
     namespacedName: string,
     args: Record<string, unknown>,
   ): Promise<MCPToolResult> {
-    // Parse: klayout_native_execute_script -> group=native, tool=execute_script
-    //        klayout_geometry_add_rect -> group=geometry, tool=add_rect
+    // Routing: prefer exact lookup against the registered tool, fall back to
+    // native-prefix detection. The old code split on the first `_` after the
+    // `klayout_` prefix to derive the group, which breaks on multi-level
+    // groups like `klayout_nanodevice_flakedetect_detect` (group parsed as
+    // `nanodevice` instead of `nanodevice_flakedetect`). Domain tools carry
+    // their `group` as a registered field — just honor it.
     const prefix = `${KLAYOUT_PREFIX}_`;
     if (!namespacedName.startsWith(prefix)) {
       throw new Error(`Not a KLayout tool: ${namespacedName}`);
     }
-    const rest = namespacedName.slice(prefix.length);
-    const underscoreIdx = rest.indexOf("_");
-    if (underscoreIdx === -1) {
-      throw new Error(`Invalid tool name format: ${namespacedName}`);
-    }
-    const group = rest.slice(0, underscoreIdx);
-    const toolName = rest.slice(underscoreIdx + 1);
 
-    if (group === "native") {
-      // Forward directly to MCP server
+    // Try exact lookup among domain tools first (handles multi-level groups).
+    const domainTool = this.domainTools.find((t) => t.name === namespacedName);
+    if (domainTool) {
+      if (domainTool.group === "native") {
+        // Degenerate registration — shouldn't happen, but honor it.
+        const { result, sessionId } = await callTool(
+          this.url,
+          domainTool.originalName,
+          args,
+          this.sessionId,
+          this.timeout,
+        );
+        this.sessionId = sessionId;
+        return result;
+      }
+
+      const codeGen = (domainTool as NamespacedTool & { generateCode?: (args: Record<string, unknown>) => string }).generateCode;
+      if (!codeGen) {
+        throw new Error(`Domain tool ${namespacedName} has no code generator`);
+      }
+      const pyaCode = codeGen(args);
       const { result, sessionId } = await callTool(
         this.url,
-        toolName,
-        args,
+        "execute_script",
+        { code: pyaCode },
         this.sessionId,
         this.timeout,
       );
@@ -127,25 +143,21 @@ export class KLayoutMCPClient {
       return result;
     }
 
-    // Domain tool: find it, generate pya code, execute via execute_script
-    const domainTool = this.domainTools.find(
-      (t) => t.name === namespacedName,
-    );
-    if (!domainTool) {
-      throw new Error(`Unknown domain tool: ${namespacedName}`);
+    // Not a registered domain tool — must be a native tool of the form
+    // `klayout_native_<toolName>`. Everything after `klayout_native_` is the
+    // original MCP tool name.
+    const nativePrefix = `${KLAYOUT_PREFIX}_native_`;
+    if (!namespacedName.startsWith(nativePrefix)) {
+      throw new Error(`Unknown tool: ${namespacedName}`);
     }
-
-    // Domain tools have a `generateCode` property (added by the tool registration)
-    const codeGen = (domainTool as NamespacedTool & { generateCode?: (args: Record<string, unknown>) => string }).generateCode;
-    if (!codeGen) {
-      throw new Error(`Domain tool ${namespacedName} has no code generator`);
+    const toolName = namespacedName.slice(nativePrefix.length);
+    if (!toolName) {
+      throw new Error(`Invalid native tool name: ${namespacedName}`);
     }
-
-    const pyaCode = codeGen(args);
     const { result, sessionId } = await callTool(
       this.url,
-      "execute_script",
-      { code: pyaCode },
+      toolName,
+      args,
       this.sessionId,
       this.timeout,
     );

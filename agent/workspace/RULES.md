@@ -5,17 +5,20 @@
 - Outer EBL window: 0.5 um minimum feature
 - Bonding pad minimum: 80 x 80 um
 
-## Layer Assignments (Default)
-| Layer | Purpose |
-|-------|---------|
-| 1/0 | Mesa / active area |
-| 2/0 | Bottom gate |
-| 3/0 | Top gate |
-| 4/0 | Contact / ohmic |
-| 5/0 | Alignment markers |
-| 6/0 | Bonding pads |
-| 10/0 | Inner EBL write field |
-| 11/0 | Outer EBL write field |
+## Layer Assignments
+
+> **Layer Assignments**: Layer assignments are **task-specific**. Always read the task instruction for correct layers. The table below is an EXAMPLE ONLY — benchmark tasks often use different layers.
+
+| Layer | Purpose (example) |
+|-------|-------------------|
+| 1/0 | (example) Mesa / active area |
+| 2/0 | (example) Bottom gate |
+| 3/0 | (example) Top gate |
+| 4/0 | (example) Contact / ohmic |
+| 5/0 | (example) Alignment markers |
+| 6/0 | (example) Bonding pads |
+| 10/0 | (example) Inner EBL write field |
+| 11/0 | (example) Outer EBL write field |
 
 ## Fabrication Safety
 - No overlapping geometry on the same layer

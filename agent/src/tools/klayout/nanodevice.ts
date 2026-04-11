@@ -41,9 +41,55 @@ function makeNanoTool(
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-/** Build a JSON result dict string (returned as pya `result`). */
+/**
+ * Serialize a JS value as a Python literal expression.
+ *
+ * Critical: `JSON.stringify` emits `true`/`false`/`null`, but Python's `exec()`
+ * only knows `True`/`False`/`None`. Dumping JSON into pya code raises NameError.
+ * This walker produces strings that `exec()` can evaluate directly.
+ *
+ * String handling: Python's literal syntax accepts JSON-style double-quoted
+ * strings with standard backslash escapes (\n, \t, \", \\, \uXXXX). We delegate
+ * to `JSON.stringify` for the string case — no ambiguity, no token-regex risk.
+ */
+export function pyLiteral(v: unknown): string {
+  if (v === null || v === undefined) return "None";
+  if (v === true) return "True";
+  if (v === false) return "False";
+  if (typeof v === "number") {
+    if (Number.isNaN(v)) return "float('nan')";
+    if (v === Infinity) return "float('inf')";
+    if (v === -Infinity) return "float('-inf')";
+    return String(v);
+  }
+  if (typeof v === "bigint") return v.toString();
+  if (typeof v === "string") return JSON.stringify(v);
+  if (Array.isArray(v)) {
+    return "[" + v.map(pyLiteral).join(", ") + "]";
+  }
+  if (typeof v === "object") {
+    const entries = Object.entries(v as Record<string, unknown>).map(
+      ([k, val]) => `${JSON.stringify(k)}: ${pyLiteral(val)}`,
+    );
+    return "{" + entries.join(", ") + "}";
+  }
+  // Fallback: serialize to JSON-safe form
+  return JSON.stringify(v);
+}
+
+/**
+ * Build a Python-literal `result = ...` assignment wrapped as a workflow_plan.
+ *
+ * Every nanodevice domain tool returns a *plan* (scripts to run, pipeline
+ * metadata), not execution results. To make this unambiguous to the agent,
+ * every payload is wrapped with `type: "workflow_plan"` as the first key —
+ * the agent can see at a glance this is a plan, not a tool execution result.
+ *
+ * Also fixes the Q1 JSON→Python literal bug (true/false/null → True/False/None).
+ */
 function instructionResult(obj: Record<string, unknown>): string {
-  return `result = ${JSON.stringify(obj, null, 2)}`;
+  const wrapped: Record<string, unknown> = { type: "workflow_plan", ...obj };
+  return `result = ${pyLiteral(wrapped)}`;
 }
 
 // ─── Flake Detection ────────────────────────────────────────────────────────

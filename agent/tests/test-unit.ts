@@ -295,6 +295,29 @@ describe("visual tools", () => {
     expect(tools.length).toBe(1);
     expect(tools[0].name).toBe("klayout_visual_capture");
   });
+
+  it("klayout_visual_capture returns an instruction-only workflow_plan", () => {
+    const tools = registerVisualTools();
+    const t = tools[0] as typeof tools[0] & { generateCode: (args: Record<string, unknown>) => string };
+    const code = t.generateCode({
+      filepath: "/tmp/test.png",
+      dpi: 150,
+      gds_path: "/tmp/test.gds",
+    });
+    // No JS literal leak (Q1 pyLiteral invariant)
+    expect(code).not.toMatch(/\btrue\b|\bfalse\b|\bnull\b/);
+    // Workflow_plan wrapper (T1 + T4 instruction-only convention)
+    expect(code).toContain('"type": "workflow_plan"');
+    // Two explicit steps: save layout + render PNG
+    expect(code).toContain('"1_save_layout"');
+    expect(code).toContain('"2_render_png"');
+    // Filepath + dpi + gds_path interpolated through pyLiteral
+    expect(code).toContain("/tmp/test.png");
+    expect(code).toContain("/tmp/test.gds");
+    expect(code).toContain("150");
+    // Explicit distinction from klayout_native_screenshot
+    expect(code).toContain("klayout_native_screenshot");
+  });
 });
 
 describe("nanodevice tools", () => {
@@ -1145,8 +1168,8 @@ describe("/compact command", () => {
 // ============================================================
 
 describe("package.json version", () => {
-  it("version is 0.4.1", () => {
+  it("version is 0.4.2", () => {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
-    expect(pkg.version).toBe("0.4.1");
+    expect(pkg.version).toBe("0.4.2");
   });
 });

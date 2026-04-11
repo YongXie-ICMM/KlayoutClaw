@@ -55,7 +55,7 @@ npm link   # Global CLI (optional)
   - StreamingBar, ErrorBanner, StatusBar
   - WorkspaceBar, BackgroundBar
 - `src/rpc.ts` — JSON-RPC server (initialize, prompt, get_session_info, dispose, shutdown)
-- `workspace/` — Domain knowledge (SOUL, WORKFLOW, TOOLS, RULES)
+- `workspace/` — Domain knowledge (SOUL, TOOLS, RULES)
 - `workspace/compaction/COMPACT.md` — KLayout-domain compaction instruction template
 
 ## Commands (v0.4)

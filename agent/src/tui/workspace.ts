@@ -101,7 +101,7 @@ export function openFile(filePath: string): void {
 export function checkWorkspaceIntegrity(): { ok: boolean; fileCount: number; issues: string[] } {
   const wsDir = getWorkspaceDir();
   const issues: string[] = [];
-  const expectedFiles = ["SOUL.md", "WORKFLOW.md", "TOOLS.md", "RULES.md"];
+  const expectedFiles = ["SOUL.md", "TOOLS.md", "RULES.md"];
 
   if (!existsSync(wsDir)) {
     return { ok: false, fileCount: 0, issues: ["Workspace directory does not exist"] };

@@ -266,6 +266,11 @@ def _is_junction(intersection_geom, eps_a, eps_b, tolerance=2.0):
     return near_a and near_b
 
 
+# Inline format legend for crossing_pairs (surfaced in the evaluate_design
+# response so agents don't need to look up the docstring).
+_CROSSING_PAIRS_HELP = "[route_idx_A, route_idx_B, overlap_um2] — 0-based indices, A<B, pad junctions excluded"
+
+
 def _crossing_penalty(crossing):
     """Steep penalty curve for route crossings.
 
@@ -286,14 +291,17 @@ def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
     Distinguishes junctions (endpoint-to-endpoint) from real crossings
     (mid-body shorts).  Penalises crossings steeply — shorts are
     dead-or-alive, not a fractional metric.
+
+    Returns a dict {"score": float, "extra": {"crossing_pairs": [[i, j, area_um2], ...]}}
+    so the caller can surface per-crossing diagnostics in the check detail.
     """
     route_comp = args.get("component", "contact_route")
     spec = layer_map.get(route_comp)
     if spec is None:
-        return 0.0
+        return {"score": 0.0, "extra": {"crossing_pairs": [], "crossing_pairs_format": _CROSSING_PAIRS_HELP}}
     pairs = _normalize_layer_spec(spec)
     if not pairs:
-        return 0.0
+        return {"score": 0.0, "extra": {"crossing_pairs": [], "crossing_pairs_format": _CROSSING_PAIRS_HELP}}
 
     all_routes = []
     all_eps = []
@@ -305,9 +313,10 @@ def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
 
     n = len(all_routes)
     if n < 2:
-        return 1.0 if all_routes else 0.0
+        score = 1.0 if all_routes else 0.0
+        return {"score": score, "extra": {"crossing_pairs": [], "crossing_pairs_format": _CROSSING_PAIRS_HELP}}
 
-    crossing = 0
+    crossing_pairs = []
     for i in range(n):
         for j in range(i + 1, n):
             ix = all_routes[i].intersection(all_routes[j])
@@ -318,9 +327,15 @@ def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
                     continue
             elif ix.area <= 1.0:
                 continue
-            crossing += 1
+            crossing_pairs.append([i, j, round(float(ix.area), 6)])
 
-    return _crossing_penalty(crossing)
+    return {
+        "score": _crossing_penalty(len(crossing_pairs)),
+        "extra": {
+            "crossing_pairs": crossing_pairs,
+            "crossing_pairs_format": _CROSSING_PAIRS_HELP,
+        },
+    }
 
 
 def _prim_connectivity(out_lib, ref_lib, layer_map, args):
@@ -555,19 +570,38 @@ def main():
         name = check["name"]
         args = check.get("args", {})
         weight = check.get("weight", 1.0 / len(checks))
+        extra = None
         try:
-            score = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
+            raw = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
+            # Primitives may return a plain float (score) or a dict
+            # {"score": float, "extra": {...}} for diagnostics such as
+            # contact_isolation's crossing_pairs.
+            if isinstance(raw, dict):
+                score = raw.get("score", 0.0)
+                extra = raw.get("extra")
+            else:
+                score = raw
             score = max(0.0, min(1.0, float(score)))
             detail = "{}: {:.4f}".format(name, score)
         except Exception as e:
             score = 0.0
             detail = "{}: ERROR — {}".format(name, e)
-        results.append({
+        entry = {
             "name": name,
             "score": score,
             "weight": weight,
             "detail": detail,
-        })
+        }
+        if extra is not None:
+            # Promote extra diagnostic fields to the top level of the
+            # check result so agents can read them directly (e.g.
+            # result.checks[i].crossing_pairs for contact_isolation).
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    entry[k] = v
+            else:
+                entry["extra"] = extra
+        results.append(entry)
 
     # Compute overall score (weighted sum)
     total_weight = sum(c["weight"] for c in results)
