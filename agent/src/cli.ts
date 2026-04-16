@@ -261,6 +261,29 @@ async function runInteractivePlain(
   });
 }
 
+/**
+ * Check if the last assistant message in the session was thinking-only
+ * (no text, no tool calls). This indicates the model emitted a stop token
+ * prematurely after a thinking block — the SDK treats it as "done" but
+ * the agent was still mid-task.
+ */
+function isThinkingOnlyTermination(session: { messages: any[] }): boolean {
+  const msgs = session.messages;
+  if (msgs.length === 0) return false;
+  const last = msgs[msgs.length - 1];
+  if (last.role !== "assistant" || !Array.isArray(last.content)) return false;
+  const hasThinking = last.content.some(
+    (c: any) => c.type === "thinking" && c.thinking?.trim().length > 0,
+  );
+  const hasText = last.content.some(
+    (c: any) => c.type === "text" && c.text?.trim().length > 0,
+  );
+  const hasToolCall = last.content.some((c: any) => c.type === "toolCall");
+  return hasThinking && !hasText && !hasToolCall;
+}
+
+const THINKING_ONLY_MAX_RETRIES = 5;
+
 async function runJSON(args: CLIArgs): Promise<void> {
   if (!args.message) {
     console.error("Error: --message required for JSON mode");
@@ -281,6 +304,27 @@ async function runJSON(args: CLIArgs): Promise<void> {
   try {
     botSession.history.recordPrompt(args.message);
     await botSession.session.prompt(args.message);
+
+    // Guard against premature termination: if the model stopped after a
+    // thinking-only response (no text, no tool call), re-prompt to continue.
+    let retries = 0;
+    while (
+      isThinkingOnlyTermination(botSession.session) &&
+      retries < THINKING_ONLY_MAX_RETRIES
+    ) {
+      retries++;
+      console.error(
+        `[qlaybot] thinking-only termination detected (attempt ${retries}/${THINKING_ONLY_MAX_RETRIES}), re-prompting...`,
+      );
+      await botSession.session.prompt("Continue. You stopped mid-task after a thinking block — keep working.");
+    }
+
+    if (retries > 0 && isThinkingOnlyTermination(botSession.session)) {
+      console.error(
+        `[qlaybot] still thinking-only after ${THINKING_ONLY_MAX_RETRIES} retries, giving up`,
+      );
+    }
+
     const output = { status: "completed", response: chunks.join("") };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {

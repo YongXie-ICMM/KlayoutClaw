@@ -37,6 +37,28 @@ _session_id = None
 _KLAYOUT_KEY_HINTS = ("klayoutclaw", "klayout", "klayout_mcp")
 
 
+def _entry_url(entry):
+    """Extract the MCP server URL from a server entry dict.
+
+    Handles two shapes:
+    - Direct URL: ``{"url": "http://..."}``
+    - stdio via mcp-remote: ``{"command": "npx", "args": ["mcp-remote", "http://...", ...]}``
+
+    Returns the URL string, or None if not extractable.
+    """
+    if not isinstance(entry, dict):
+        return None
+    # Direct "url" field (HTTP/SSE transport).
+    if "url" in entry:
+        return entry["url"]
+    # stdio transport via mcp-remote: URL is the first http arg.
+    args = entry.get("args") or []
+    for arg in args:
+        if isinstance(arg, str) and arg.startswith("http"):
+            return arg
+    return None
+
+
 def _extract_mcp_url(cfg, source):
     """Resolve the KlayoutClaw server URL from a parsed config dict.
 
@@ -80,21 +102,21 @@ def _extract_mcp_url(cfg, source):
     # Known labels in priority order.
     for key in _KLAYOUT_KEY_HINTS:
         entry = servers.get(key)
-        if isinstance(entry, dict) and "url" in entry:
-            return entry["url"]
+        url = _entry_url(entry)
+        if url:
+            return url
 
     # Single-entry config with an unrecognized label.
     if len(servers) == 1:
         only = next(iter(servers.values()))
-        if isinstance(only, dict) and "url" in only:
-            return only["url"]
+        url = _entry_url(only)
+        if url:
+            return url
 
     # Multi-entry heuristic: any URL that looks like KlayoutClaw.
     for entry in servers.values():
-        if not isinstance(entry, dict):
-            continue
-        url = entry.get("url") or ""
-        if ":8765/mcp" in url or "klayout" in url.lower():
+        url = _entry_url(entry)
+        if url and (":8765/mcp" in url or "klayout" in url.lower()):
             return url
 
     raise KeyError(
