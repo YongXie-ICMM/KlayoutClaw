@@ -525,25 +525,73 @@ def route(config: dict) -> dict:
             dy = pins_a[i][1] - pins_b[j][1]
             dist_matrix[i, j] = math.sqrt(dx * dx + dy * dy)
 
-    row_ind, col_ind = linear_sum_assignment(dist_matrix)
+    # P3: explicit pairing override takes precedence over Hungarian matching.
+    pin_pairs_override = config.get("pin_pairs_override", None)
+    if pin_pairs_override is not None:
+        if not isinstance(pin_pairs_override, list):
+            return {
+                "status": "failed",
+                "routed_pairs": 0,
+                "total_pins_a": n_a,
+                "total_pins_b": n_b,
+                "paths": [],
+                "errors": [
+                    "pin_pairs_override must be a list of [a_idx, b_idx] pairs."
+                ],
+            }
+        bad = []
+        for k, entry in enumerate(pin_pairs_override):
+            if (not isinstance(entry, (list, tuple)) or len(entry) != 2
+                    or not isinstance(entry[0], int)
+                    or not isinstance(entry[1], int)):
+                bad.append(
+                    f"pin_pairs_override entry {k}: must be [a_idx, b_idx]; "
+                    f"got {entry!r}")
+                continue
+            if entry[0] < 0 or entry[0] >= n_a:
+                bad.append(
+                    f"pin_pairs_override entry {k}: a_idx {entry[0]} out of "
+                    f"range (n_a={n_a})")
+            if entry[1] < 0 or entry[1] >= n_b:
+                bad.append(
+                    f"pin_pairs_override entry {k}: b_idx {entry[1]} out of "
+                    f"range (n_b={n_b})")
+        expected_len = min(n_a, n_b)
+        if len(pin_pairs_override) != expected_len:
+            bad.append(
+                f"pin_pairs_override length ({len(pin_pairs_override)}) does "
+                f"not match expected pair count ({expected_len}). Run with "
+                f"dry_run=true first to see the Hungarian order.")
+        if bad:
+            return {
+                "status": "failed",
+                "routed_pairs": 0,
+                "total_pins_a": n_a,
+                "total_pins_b": n_b,
+                "paths": [],
+                "errors": ["pin_pairs_override validation errors:"] + bad,
+            }
+        pairs = [(int(a), int(b)) for a, b in pin_pairs_override]
+    else:
+        row_ind, col_ind = linear_sum_assignment(dist_matrix)
 
-    # Build matched pairs and filter dummy assignments
-    pairs = []
-    for idx in range(len(row_ind)):
-        i, j = row_ind[idx], col_ind[idx]
-        if i >= n_a or j >= n_b:
-            continue
-        pairs.append((i, j))
+        # Build matched pairs and filter dummy assignments
+        pairs = []
+        for idx in range(len(row_ind)):
+            i, j = row_ind[idx], col_ind[idx]
+            if i >= n_a or j >= n_b:
+                continue
+            pairs.append((i, j))
 
-    # Sort pairs by ascending distance (short pairs first)
-    if sort_pairs:
-        pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
+        # Sort pairs by ascending distance (short pairs first)
+        if sort_pairs:
+            pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
 
-    # Dry-run early-exit: return Hungarian assignments without running the
+    # Dry-run early-exit: return pair assignments without running the
     # (expensive) find_path loop. Lets the caller veto obviously bad pair
     # assignments before committing routing cost. Output schema stays
     # compatible with the success path (paths[] is empty, pairs[] carries
-    # the preview).
+    # the preview). Respects pin_pairs_override if both are supplied.
     if dry_run:
         preview = []
         for i, j in pairs:
@@ -556,7 +604,9 @@ def route(config: dict) -> dict:
                 "pin_b_um": [round(pb[0] * dbu, 4), round(pb[1] * dbu, 4)],
                 "distance_um": round(float(dist_matrix[i, j]) * dbu, 4),
             })
-        dry_note = ["dry_run: Hungarian matching only, no routes inserted."]
+        dry_note = ["dry_run: matching only, no routes inserted."]
+        if pin_pairs_override is not None:
+            dry_note[0] = "dry_run: pin_pairs_override applied, no routes inserted."
         if auto_map_note is not None:
             dry_note.append(auto_map_note)
         return {
