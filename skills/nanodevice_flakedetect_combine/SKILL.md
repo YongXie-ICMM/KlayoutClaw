@@ -105,7 +105,9 @@ For LUT overlay: reads dx, dy from combine_report.json and shifts contours befor
 - `mask_composite.png` — all material masks color-coded at 50% alpha
 - Appends `overlay_files` section to `combine_report.json`
 
-### rank_candidate_pairs.py — rank (graphene, graphite) pairs by overlap
+### rank_candidate_pairs.py — rank material pairs by overlap (default graphene × graphite)
+
+Ranks every pair across two detected material lists by intersection area. Useful whenever a downstream design step requires a material pair with non-trivial overlap and the rank-0 detections do not always satisfy that constraint. Defaults to `--material-a graphene --material-b graphite` for the vdW-Hall-bar workflow, but any two material keys that exist in `traces.json` will work (e.g. `--material-a top_hBN --material-b bottom_hBN` to rank encapsulation pairs).
 
 ```bash
 conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/rank_candidate_pairs.py \
@@ -120,12 +122,12 @@ conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/ra
 - `--top-k` — How many top pairs to echo on stdout (default 5). The JSON file always contains all pairs.
 - `--material-a`, `--material-b` — Material keys to pair (default graphene × graphite)
 
-Computes polygon intersection area between every (material_a, material_b) candidate pair, ranks by overlap area descending, and writes an ordered list. Use this before designing the Hall bar mesa so you pick a pair that actually has overlap — the rank-0 flakedetect detection is not always the physically correct pair.
+Computes polygon intersection area between every (material_a, material_b) candidate pair, ranks by overlap area descending, and writes an ordered list.
 
 **Outputs:**
 - `candidate_ranking.json` — ordered list with fields: `{rank, graphene_id, graphite_id, overlap_um2, graphene_area_um2, graphite_area_um2, centroid_distance_um}`
 
-**When to run:** When a first-pass design session discovers the auto-picked graphene/graphite pair has `overlap_um2 ≈ 0` (ml09/ml11 benchmark failure mode). The ranking surfaces the correct pair without brute-force iteration.
+**When to run:** When a first-pass design session discovers the auto-picked material-A × material-B pair has `overlap_um2 ≈ 0`. The ranking surfaces a pair with non-trivial overlap without brute-force iteration. (Observed failure mode: ml09 / ml11 benchmarks where default graphene × graphite had no overlap.)
 
 ## Workflow
 
