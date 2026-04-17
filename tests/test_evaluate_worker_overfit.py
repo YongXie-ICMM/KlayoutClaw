@@ -287,3 +287,53 @@ class TestNextStepSanitized:
         suggestion = result.get("next_step_suggestion", "")
         assert len(suggestion) >= 50, (
             f"next_step_suggestion too short: {suggestion!r}")
+
+
+# ---------------------------------------------------------------------------
+# Task 1.4 — evaluate_design layer_map schema must not bake benchmark map
+# ---------------------------------------------------------------------------
+
+class TestLayerMapSchemaExample:
+    """The inline layer_map example inside evaluate_design's schema
+    description must not present the Hall-bar benchmark layer map as
+    canonical. Agents copy schema examples verbatim."""
+
+    def test_no_concrete_hallbar_example(self):
+        import re
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        # Locate the evaluate_design tool block by finding its "name" then
+        # the next top-level tool boundary (bracket-aware scan is brittle in
+        # a single regex; we cap the block at 4000 chars — sufficient for
+        # the schema description but small enough to exclude later tools).
+        m = re.search(r'"name":\s*"evaluate_design"', src)
+        assert m, "evaluate_design block not found in plugin"
+        block = src[m.start():m.start() + 6000]
+        # Concrete Hall-bar bake: all of mesa=20/0 + contact_patch=21/0 +
+        # bonding_pad=2/0 together in one place is the canonical tell.
+        concrete = ('"mesa": [20, 0]' in block
+                    and '"contact_patch": [21, 0]' in block
+                    and '"bonding_pad": [2, 0]' in block)
+        assert not concrete, (
+            "evaluate_design's layer_map example bakes the Hall-bar "
+            "benchmark layer map ({\"mesa\": [20,0], \"contact_patch\": [21,0], "
+            "\"bonding_pad\": [2,0], ...}). Replace with a device-agnostic "
+            "placeholder like {\"device_body\": [L, D], \"peripheral\": [L, D]}.")
+
+    def test_layer_map_description_mentions_placeholder(self):
+        """After sanitising, the description must still give SOME example
+        shape so agents know what the value type looks like. The example
+        should be clearly marked as illustrative."""
+        import re
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        m = re.search(r'"name":\s*"evaluate_design"', src)
+        block = src[m.start():m.start() + 6000]
+        # Must still mention benchmark dependency OR an abstract placeholder
+        signals = ["illustrative", "placeholder", "benchmark instruction",
+                   "device_body", "[L, D]", "[L,D]"]
+        assert any(s in block for s in signals), (
+            "layer_map description has been over-sanitised; it should still "
+            "give an illustrative example so agents know the value shape.")
