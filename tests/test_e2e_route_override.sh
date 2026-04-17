@@ -152,8 +152,9 @@ resp = urllib.request.urlopen(req, timeout=30)
 body = json.loads(resp.read().decode())
 inner = json.loads(body["result"]["content"][0]["text"])
 # execute_script merges the user's `result = {...}` dict directly at the
-# top level alongside status / stdout / stderr — NOT nested under "result".
-assert inner.get("status") == "ok", f"execute_script failed: {inner}"
+# top level alongside stdout / stderr. An "error" key appears only when
+# the user's code raised. On success, just grab `paths` directly.
+assert "error" not in inner, f"execute_script raised: {inner.get('error')!r}"
 paths = inner["paths"]
 assert len(paths) >= 2, f"expected >=2 route shapes on L10/0, got {len(paths)}: {paths}"
 # For a crossed pair: at least one route endpoint-pair must span >50 um in y.
