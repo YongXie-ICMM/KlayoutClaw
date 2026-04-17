@@ -477,6 +477,196 @@ def _prim_spacing(out_lib, ref_lib, layer_map, args):
     return ok / total if total > 0 else 1.0
 
 
+def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
+    """Fraction of component area contained within a caller-declared bulk region.
+
+    Distinct from component_containment: this check is meant to score the
+    body of a device against a bulk region, without penalising peripherals
+    that intentionally extend into single-material zones.  Two ways to
+    specify the bulk:
+
+    - Pass ``bulk_region`` as a region expression (layer_map key or list of
+      keys), same semantics as ``component_containment``'s region arg. Pair
+      with ``region_op`` (union / intersection / difference).
+    - Pass ``materials`` as a list of layer_map keys; the primitive will
+      intersect those layers to form the bulk region. Useful when the bulk
+      is the overlap of two materials. The caller names the keys; no
+      defaults are assumed.
+
+    Optional ``core_bbox=[x1, y1, x2, y2]`` (um) clips the component to a
+    rectangular core before containment scoring.
+
+    Raises ValueError if neither bulk_region nor materials is provided.
+    """
+    comp = _component_union(out_lib, layer_map, args["component"])
+    if comp.is_empty:
+        return 0.0
+
+    core_bbox = args.get("core_bbox")
+    if core_bbox is not None and len(core_bbox) == 4:
+        x1, y1, x2, y2 = core_bbox
+        core = sg.box(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        comp = comp.intersection(core)
+        if comp.is_empty:
+            return 0.0
+
+    if "bulk_region" in args:
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 args["bulk_region"],
+                                 args.get("region_op", "union"))
+    elif "materials" in args:
+        mats = args["materials"]
+        if not isinstance(mats, list) or not mats:
+            raise ValueError(
+                "bulk_containment: 'materials' must be a non-empty list of "
+                "layer_map keys (e.g. ['channel_a', 'channel_b']).")
+        region = _resolve_region(out_lib, ref_lib, layer_map, mats, "intersection")
+    else:
+        raise ValueError(
+            "bulk_containment requires either 'bulk_region' (single key or "
+            "list) OR 'materials' (list of layer_map keys whose intersection "
+            "defines the bulk). No default material names are assumed.")
+
+    if region.is_empty:
+        return 0.0
+    return comp.intersection(region).area / comp.area
+
+
+def _prim_material_overlap_report(out_lib, ref_lib, layer_map, args):
+    """Compute pairwise and multi-way intersections of a set of material
+    layers. Returns a dict with score=1.0 (always) plus a ``report`` side-
+    data field that main() promotes onto the check.
+
+    Args:
+        materials: list of layer_map keys (required, min 2).
+
+    Report schema, per region key:
+        {
+          "<key>": {
+              "area_um2": float,
+              "bbox_um": [x1, y1, x2, y2],
+              "centroid_um": [cx, cy],
+              "num_polygons": int
+          }
+        }
+
+    Region key naming:
+      - "<name>_only"         — that material minus the union of the others
+      - "<a>_and_<b>"         — pairwise intersection
+      - "<a>_and_<b>_and_<c>" — higher-order intersections
+    """
+    mats = args.get("materials")
+    if not isinstance(mats, list) or len(mats) < 2:
+        raise ValueError(
+            "material_overlap_report: 'materials' must be a list of at "
+            "least two layer_map keys (e.g. ['A', 'B']).")
+
+    # Resolve each material to its shapely region.
+    regions = {}
+    for key in mats:
+        regions[key] = _resolve_region(out_lib, ref_lib, layer_map, key, "union")
+
+    report = {}
+
+    def _summarize(region):
+        if region.is_empty:
+            return {"area_um2": 0.0, "bbox_um": [0.0, 0.0, 0.0, 0.0],
+                    "centroid_um": [0.0, 0.0], "num_polygons": 0}
+        minx, miny, maxx, maxy = region.bounds
+        c = region.centroid
+        try:
+            n = len(region.geoms) if hasattr(region, "geoms") else 1
+        except Exception:
+            n = 1
+        return {
+            "area_um2": round(float(region.area), 4),
+            "bbox_um": [round(float(minx), 4), round(float(miny), 4),
+                        round(float(maxx), 4), round(float(maxy), 4)],
+            "centroid_um": [round(float(c.x), 4), round(float(c.y), 4)],
+            "num_polygons": int(n),
+        }
+
+    # "<name>_only" regions: each material minus the union of the others.
+    for key in mats:
+        others = [regions[k] for k in mats if k != key]
+        if others:
+            others_union = others[0]
+            for r in others[1:]:
+                others_union = others_union.union(r)
+            only_r = regions[key].difference(others_union)
+        else:
+            only_r = regions[key]
+        report["{}_only".format(key)] = _summarize(only_r)
+
+    # Pairwise + higher-order intersections.
+    from itertools import combinations
+    for r_size in range(2, len(mats) + 1):
+        for combo in combinations(mats, r_size):
+            label = "_and_".join(combo)
+            inter = regions[combo[0]]
+            for k in combo[1:]:
+                inter = inter.intersection(regions[k])
+            report[label] = _summarize(inter)
+
+    return {
+        "score": 1.0,
+        "report": report,
+        "detail": "material_overlap_report: {} materials, {} regions".format(
+            len(mats), len(report)),
+    }
+
+
+def _prim_arm_material_class(out_lib, ref_lib, layer_map, args):
+    """Score arms/contacts by how cleanly they land in *exactly one* material class.
+
+    Each shape on the component layer (typically contact_patch or mesa arms)
+    is checked against a list of mutually-exclusive class regions (e.g.
+    graphene_only, graphite_only, overlap).  A shape "belongs to" a class
+    if >= ``containment_threshold`` of its area is inside that class region.
+    A shape scores 1.0 if it belongs to exactly one class, 0.0 if it
+    belongs to none or straddles multiple.
+
+    Args:
+        component: component name (required) — shapes are evaluated individually
+        classes: list of class dicts (required), each:
+            {"name": str,
+             "region": layer_map key or list of keys,
+             "region_op": "union" (default) / "intersection" / "difference"}
+        containment_threshold: float, default 0.9
+    """
+    shapes = _component_list(out_lib, layer_map, args["component"])
+    if not shapes:
+        return 0.0
+
+    classes_spec = args.get("classes")
+    if not isinstance(classes_spec, list) or not classes_spec:
+        return 0.0
+
+    threshold = float(args.get("containment_threshold", 0.9))
+
+    resolved_classes = []
+    for cls in classes_spec:
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 cls["region"],
+                                 cls.get("region_op", "union"))
+        resolved_classes.append(region)
+
+    ok = 0
+    for s in shapes:
+        if s.area <= 0:
+            continue
+        memberships = 0
+        for region in resolved_classes:
+            if region.is_empty:
+                continue
+            frac = s.intersection(region).area / s.area
+            if frac >= threshold:
+                memberships += 1
+        if memberships == 1:
+            ok += 1
+    return ok / len(shapes)
+
+
 # ---------------------------------------------------------------------------
 # Primitive registry
 # ---------------------------------------------------------------------------
@@ -484,6 +674,9 @@ def _prim_spacing(out_lib, ref_lib, layer_map, args):
 PRIMITIVES = {
     "component_overlap": _prim_component_overlap,
     "component_containment": _prim_component_containment,
+    "bulk_containment": _prim_bulk_containment,
+    "arm_material_class": _prim_arm_material_class,
+    "material_overlap_report": _prim_material_overlap_report,
     "contact_isolation": _prim_contact_isolation,
     "connectivity": _prim_connectivity,
     "route_endpoints": _prim_route_endpoints,
@@ -502,6 +695,69 @@ def _write_error(output_path, message):
     with open(output_path, "w") as f:
         json.dump(result, f)
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# next_step_suggestion builder
+# ---------------------------------------------------------------------------
+
+def _build_next_step(overall, results, empty_components):
+    """Emit a concise, static suggestion pointing the caller at relevant
+    inspection tools. Device-agnostic — do not hard-code material names
+    or device topology vocabulary."""
+    if not results:
+        return ("No checks ran. Re-read the task instruction and the saved "
+                "checklist, then call evaluate_design with the target "
+                "layer_map and checks list.")
+
+    parts = []
+    low = [c for c in results if c.get("score", 0.0) < 0.8]
+
+    if overall >= 0.9 and not low:
+        parts.append("Overall score passes. Re-read the task instruction "
+                     "and checklist to confirm every benchmark requirement "
+                     "is met (schema fields, deliverable file names, etc.) "
+                     "before save.")
+    else:
+        parts.append("Re-read the task instruction and checklist. Verify "
+                     "the design addresses every requirement before the "
+                     "next iteration.")
+
+    names = {c["name"] for c in low}
+    if "contact_isolation" in names:
+        parts.append(
+            "For contact_isolation < 0.8: call route_inspect with the same "
+            "route_layer / contact_layers / pad_layer you used when routing, "
+            "then screenshot(zoom_box=...) over each crossing to inspect.")
+    if "component_containment" in names or "bulk_containment" in names:
+        parts.append(
+            "For containment < 0.8: call screenshot(zoom_box=...) on the "
+            "component bbox to visually confirm placement. If the component "
+            "has a core area plus peripherals that intentionally sit outside "
+            "the target region, switch from component_containment to "
+            "bulk_containment and pass a bulk_region (or materials list) "
+            "matching only the core.")
+    if "arm_material_class" in names:
+        parts.append(
+            "For arm_material_class < 0.8: shapes land in zero classes or "
+            "straddle multiple. Screenshot each ambiguous shape and confirm "
+            "the class regions you passed cover the intended placement.")
+    if "connectivity" in names or "route_endpoints" in names:
+        parts.append(
+            "For connectivity/route_endpoints < 0.8: call route_inspect to "
+            "see which endpoints are unmapped, then screenshot(zoom_box=...) "
+            "over the unreached contacts.")
+    if "adjacency" in names or "spacing" in names:
+        parts.append(
+            "For adjacency/spacing < 0.8: call screenshot(zoom_box=...) "
+            "near the flagged components to inspect the geometry.")
+
+    if empty_components:
+        parts.append(
+            "Warnings list empty components — either add geometry to those "
+            "layers or drop the corresponding checks before re-running.")
+
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +827,7 @@ def main():
         args = check.get("args", {})
         weight = check.get("weight", 1.0 / len(checks))
         extra = None
+        raw = None
         try:
             raw = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
             # Primitives may return a plain float (score) or a dict
@@ -582,7 +839,10 @@ def main():
             else:
                 score = raw
             score = max(0.0, min(1.0, float(score)))
-            detail = "{}: {:.4f}".format(name, score)
+            if isinstance(raw, dict) and "detail" in raw:
+                detail = raw["detail"]
+            else:
+                detail = "{}: {:.4f}".format(name, score)
         except Exception as e:
             score = 0.0
             detail = "{}: ERROR — {}".format(name, e)
@@ -601,6 +861,9 @@ def main():
                     entry[k] = v
             else:
                 entry["extra"] = extra
+        # Promote top-level side-data fields from dict-returning primitives.
+        if isinstance(raw, dict) and "report" in raw:
+            entry["report"] = raw["report"]
         results.append(entry)
 
     # Compute overall score (weighted sum)
@@ -614,6 +877,7 @@ def main():
         "status": "ok",
         "overall": overall,
         "checks": results,
+        "next_step_suggestion": _build_next_step(overall, results, empty_components),
     }
     if empty_components:
         output["warnings"] = [

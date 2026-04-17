@@ -193,6 +193,11 @@ def build_parser():
     parser.add_argument("--mcp-config", default=None,
                         help="Path to MCP config JSON file (fallback: "
                              ".mcp.json in CWD, mcp_config.json in project root, then default)")
+    parser.add_argument("--verify", action="store_true",
+                        help="After commit, count shapes on each material "
+                             "layer (L10/11/12/13) and fail loudly if any "
+                             "expected layer has zero polygons. Catches the "
+                             "silent partial-commit failure mode.")
     return parser
 
 
@@ -304,12 +309,44 @@ def main():
     load_mcp_config(args.mcp_config)
 
     print("Connecting to KLayout MCP server...")
-    init_session()
+    try:
+        init_session()
+    except Exception as exc:
+        # Surface a concrete message for the most common misconfig: wrong
+        # MCP URL (especially inside Docker where the agent forgot
+        # --mcp-config host.docker.internal:8765). Without this, the
+        # underlying urllib error is opaque and agents often retry with
+        # the same bad config.
+        print(
+            f"ERROR: Could not connect to KLayout MCP server: {exc}\n"
+            f"  - If running inside Docker, pass --mcp-config pointing to "
+            f"host.docker.internal:8765.\n"
+            f"  - If running on the host, verify the KlayoutClaw plugin is "
+            f"loaded (open /Applications/klayout.app).\n"
+            f"  - Verified MCP endpoints are searched in: .mcp.json (CWD), "
+            f"mcp_config.json (project root), then default 127.0.0.1:8765.",
+            file=sys.stderr)
+        sys.exit(1)
+
+    def _run_step(step_name, code):
+        """Wrap execute_script with a structured error message naming the step.
+
+        Rationale: commit_gds is a chain — template load, image overlay,
+        polygon insertion. A half-finished chain leaves KLayout in a
+        confusing partial state. Tagging exceptions with the step name
+        makes it obvious where the chain broke so the agent can resume
+        from the right place rather than re-running from scratch.
+        """
+        try:
+            return execute_script(code)
+        except Exception as exc:
+            raise RuntimeError(
+                f"commit_gds step '{step_name}' failed: {exc}") from exc
 
     # Step 3a: Load Template.gds into KLayout
     gds_abs = os.path.abspath(args.gds)
     print(f"Loading GDS template: {gds_abs}")
-    execute_script(f"""
+    _run_step("3a_load_template", f"""
 import os
 filepath = "{gds_abs}"
 if not os.path.exists(filepath):
@@ -377,7 +414,7 @@ result = {{"status": "ok", "cell": _top_cell.name, "loaded": True, "top_cells": 
     y_origin = placement["origin_um"][1]
     out_pixel_size = placement["pixel_size_um"]
     print(f"Adding warped image overlay at ({x_origin:.1f}, {y_origin:.1f}) um...")
-    execute_script(f"""
+    _run_step("3b_image_overlay", f"""
 import os
 filepath = "{warped_abs}"
 if not os.path.exists(filepath):
@@ -403,6 +440,7 @@ result = {{"status": "ok", "id": img.id(), "box": str(img.box())}}
     # Step 3c: Insert material contour polygons
     print("Inserting material polygons...")
     n_inserted = 0
+    total_candidate_polygons = 0
     for mat_name, mat_list in traces_gds["materials"].items():
         layer_dt = LAYER_MAP.get(mat_name)
         if layer_dt is None:
@@ -415,12 +453,13 @@ result = {{"status": "ok", "id": img.id(), "box": str(img.box())}}
             pts = entry["contour_gds"]
             if len(pts) < 3:
                 continue
+            total_candidate_polygons += 1
             # Build points list for pya.Polygon (no closing point needed)
             pts_code = ", ".join(
                 f"pya.Point(int({x}/dbu), int({y}/dbu))"
                 for x, y in pts
             )
-            execute_script(f"""
+            _run_step(f"3c_insert_polygon({mat_name})", f"""
 view, layout, cell = _get_or_create_view()
 dbu = layout.dbu
 li = layout.layer({layer}, {dt})
@@ -431,16 +470,61 @@ result = {{"status": "ok"}}
             n_inserted += 1
             print(f"  {mat_name}: polygon with {len(pts)} points on L{layer}/{dt}")
 
-    print(f"Inserted {n_inserted} polygons")
+    # Summary line — agents can grep for this string to verify without
+    # re-opening KLayout. Emitted even when verify is off so the "silent
+    # partial commit" case from QB ml11 is at least visible on stdout.
+    print(f"Committed {n_inserted}/{total_candidate_polygons} polygons")
 
     # Step 3d: Refresh view and zoom to fit
-    execute_script("""
+    _run_step("3d_zoom_fit", """
 view = pya.Application.instance().main_window().current_view()
 if view is not None:
     view.zoom_fit()
     view.max_hier()
 result = {"status": "ok"}
 """)
+
+    # Step 3e (optional): Verify all material layers received >=1 polygon.
+    # Only checks layers for materials that actually had contour_gds entries
+    # in traces_gds — a material missing from traces_gds is legitimately
+    # expected to land on an empty layer, so we don't flag it.
+    if args.verify:
+        expected_layers = []
+        for mat_name, mat_list in traces_gds["materials"].items():
+            layer_dt = LAYER_MAP.get(mat_name)
+            if layer_dt is None:
+                continue
+            if any("contour_gds" in e for e in mat_list):
+                expected_layers.append((mat_name, layer_dt[0], layer_dt[1]))
+        verify_code = """
+view, layout, cell = _get_or_create_view()
+counts = {}
+expected = """ + json.dumps([(m, l, d) for m, l, d in expected_layers]) + """
+for mat_name, layer, dt in expected:
+    try:
+        li = layout.layer(layer, dt)
+        n = 0
+        for _ in cell.shapes(li).each():
+            n += 1
+        counts[mat_name] = n
+    except Exception as e:
+        counts[mat_name] = f"error: {e}"
+missing = [m for (m, l, d) in expected if counts.get(m, 0) == 0]
+result = {"counts": counts, "missing": missing}
+"""
+        verify_result = _run_step("3e_verify", verify_code)
+        # verify_result is the JSON-decoded dict returned by execute_script
+        if isinstance(verify_result, dict):
+            counts = verify_result.get("counts", {})
+            missing = verify_result.get("missing", [])
+            print(f"Verify: shapes per material layer = {counts}")
+            if missing:
+                print(
+                    f"ERROR: --verify failed. Missing polygons on layers for materials: {missing}. "
+                    f"Template loaded but polygons were not committed — this usually indicates "
+                    f"a silent pya exception in step 3c.",
+                    file=sys.stderr)
+                sys.exit(2)
 
     print("Done. KLayout updated with warped image + material polygons.")
     sys.exit(0)

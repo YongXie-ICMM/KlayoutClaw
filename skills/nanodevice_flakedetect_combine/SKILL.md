@@ -105,18 +105,44 @@ For LUT overlay: reads dx, dy from combine_report.json and shifts contours befor
 - `mask_composite.png` — all material masks color-coded at 50% alpha
 - Appends `overlay_files` section to `combine_report.json`
 
+### rank_candidate_pairs.py — rank material pairs by overlap (default graphene × graphite)
+
+Ranks every pair across two detected material lists by intersection area. Useful whenever a downstream design step requires a material pair with non-trivial overlap and the rank-0 detections do not always satisfy that constraint. Defaults to `--material-a graphene --material-b graphite` for the vdW-Hall-bar workflow, but any two material keys that exist in `traces.json` will work (e.g. `--material-a top_hBN --material-b bottom_hBN` to rank encapsulation pairs).
+
+```bash
+conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/rank_candidate_pairs.py \
+    --traces <combine/traces.json> \
+    [--output candidate_ranking.json] \
+    [--top-k 5] \
+    [--material-a graphene] [--material-b graphite]
+```
+
+- `--traces` — Path to traces.json (works on both pre- and post-gdsalign traces: uses `contour_gds` if present, falls back to `contour_um`)
+- `--output` — Path to the ranking JSON (default: alongside traces.json)
+- `--top-k` — How many top pairs to echo on stdout (default 5). The JSON file always contains all pairs.
+- `--material-a`, `--material-b` — Material keys to pair (default graphene × graphite)
+
+Computes polygon intersection area between every (material_a, material_b) candidate pair, ranks by overlap area descending, and writes an ordered list.
+
+**Outputs:**
+- `candidate_ranking.json` — ordered list with fields: `{rank, graphene_id, graphite_id, overlap_um2, graphene_area_um2, graphite_area_um2, centroid_distance_um}`
+
+**When to run:** When a first-pass design session discovers the auto-picked material-A × material-B pair has `overlap_um2 ≈ 0`. The ranking surfaces a pair with non-trivial overlap without brute-force iteration. (Observed failure mode: ml09 / ml11 benchmarks where default graphene × graphite had no overlap.)
+
 ## Workflow
 
 Run in order:
 1. `ecc_register.py` (if LUT image available)
 2. `transform.py`
 3. `overlay.py`
+4. `rank_candidate_pairs.py` — only when the auto-picked pair has zero overlap; otherwise skip.
 
-The `combine_report.json` is a multi-writer file: ecc_register creates it, transform adds to it, overlay adds to it. Each script reads the existing file and appends its section.
+The `combine_report.json` is a multi-writer file: ecc_register creates it, transform adds to it, overlay adds to it. Each script reads the existing file and appends its section. `rank_candidate_pairs.py` writes a separate `candidate_ranking.json` and does not touch `combine_report.json`.
 
 ## Output Files
 
 All outputs go in the combine output directory:
 - `traces.json` — the main pipeline output consumed by review and commit
 - `combine_report.json` — metadata for diagnostics
+- `candidate_ranking.json` — (optional) ranking of candidate material pairs
 - Per-material transformed masks and overlay images

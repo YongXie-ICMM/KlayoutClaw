@@ -76,6 +76,40 @@ def extract_pin_centers(cell: kdb.Cell, layout: kdb.Layout, layer_num: int,
     return centers
 
 
+def extract_pin_bboxes(cell: kdb.Cell, layout: kdb.Layout, layer_num: int,
+                       datatype: int) -> list[tuple[int, int, int, int]]:
+    """Extract (left, bottom, right, top) bboxes in dbu for all shapes on a layer."""
+    layer_idx = layout.find_layer(layer_num, datatype)
+    if layer_idx is None:
+        return []
+    bbs = []
+    for shape in cell.shapes(layer_idx).each():
+        bb = shape.bbox()
+        bbs.append((bb.left, bb.bottom, bb.right, bb.top))
+    return bbs
+
+
+def min_pin_edge_um(pin_bboxes_a: list[tuple[int, int, int, int]],
+                    pin_bboxes_b: list[tuple[int, int, int, int]],
+                    dbu: float) -> float | None:
+    """Return the shortest pin bbox edge in um across both pin layers, or None
+    if either list is empty. Used to auto-derive map_resolution."""
+    if not pin_bboxes_a or not pin_bboxes_b:
+        return None
+    min_edge_dbu = None
+    for bb in pin_bboxes_a + pin_bboxes_b:
+        w = bb[2] - bb[0]
+        h = bb[3] - bb[1]
+        e = min(w, h)
+        if e <= 0:
+            continue
+        if min_edge_dbu is None or e < min_edge_dbu:
+            min_edge_dbu = e
+    if min_edge_dbu is None:
+        return None
+    return min_edge_dbu * dbu
+
+
 # ---------------------------------------------------------------------------
 # Obstacle rasterization
 # ---------------------------------------------------------------------------
@@ -332,8 +366,13 @@ def route(config: dict) -> dict:
     path_damping_step = config.get("path_damping_step", 5)
     sort_pairs = config.get("sort_pairs", True)
 
-    # Convert um to dbu
-    resolution_dbu = int(round(map_res_um / dbu))
+    # P4 additions
+    dry_run = bool(config.get("dry_run", False))
+    per_pair_obs_layers = config.get("per_pair_obstacle_layers", None)
+    auto_map_res = bool(config.get("auto_map_resolution", False))
+
+    # Convert um to dbu (resolution will be recomputed after auto_map_resolution
+    # override below if requested)
     obs_safe_dbu = int(round(obs_safe_um / dbu))
     path_width_dbu = int(round(path_width_um / dbu))
 
@@ -375,6 +414,23 @@ def route(config: dict) -> dict:
                 "total_pins_a": len(pins_a), "total_pins_b": len(pins_b),
                 "paths": [],
                 "errors": [f"No pins found: {'; '.join(missing)}. Check that the layer specs match your layout and that polygons exist on those layers."]}
+
+    # Auto-derive map_resolution from smallest pin bbox edge if requested.
+    # Rule: resolution = min_edge_um / 3, rounded to 0.1 um, clamped to [0.2, 5.0].
+    # This ensures fine pins (e.g. 3x2 um contacts) don't get under-resolved on
+    # large layouts where the default 2.0 um grid can miss them entirely.
+    auto_map_note = None
+    if auto_map_res:
+        bbs_a = extract_pin_bboxes(cell, layout, la, da)
+        bbs_b = extract_pin_bboxes(cell, layout, lb, db)
+        min_edge = min_pin_edge_um(bbs_a, bbs_b, dbu)
+        if min_edge is not None and min_edge > 0:
+            chosen = max(0.2, min(5.0, round(min_edge / 3.0, 1)))
+            auto_map_note = f"auto_map_resolution: min_pin_edge_um={min_edge:.2f}, map_resolution_um set to {chosen}"
+            map_res_um = chosen
+
+    # Convert map resolution to dbu now that any auto override is applied
+    resolution_dbu = int(round(map_res_um / dbu))
 
     obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
 
@@ -469,19 +525,112 @@ def route(config: dict) -> dict:
             dy = pins_a[i][1] - pins_b[j][1]
             dist_matrix[i, j] = math.sqrt(dx * dx + dy * dy)
 
-    row_ind, col_ind = linear_sum_assignment(dist_matrix)
+    # P3: explicit pairing override takes precedence over Hungarian matching.
+    pin_pairs_override = config.get("pin_pairs_override", None)
+    if pin_pairs_override is not None:
+        if not isinstance(pin_pairs_override, list):
+            return {
+                "status": "failed",
+                "routed_pairs": 0,
+                "total_pins_a": n_a,
+                "total_pins_b": n_b,
+                "paths": [],
+                "errors": [
+                    "pin_pairs_override must be a list of [a_idx, b_idx] pairs."
+                ],
+            }
+        bad = []
+        for k, entry in enumerate(pin_pairs_override):
+            if (not isinstance(entry, (list, tuple)) or len(entry) != 2
+                    or not isinstance(entry[0], int)
+                    or not isinstance(entry[1], int)):
+                bad.append(
+                    f"pin_pairs_override entry {k}: must be [a_idx, b_idx]; "
+                    f"got {entry!r}")
+                continue
+            if entry[0] < 0 or entry[0] >= n_a:
+                bad.append(
+                    f"pin_pairs_override entry {k}: a_idx {entry[0]} out of "
+                    f"range (n_a={n_a})")
+            if entry[1] < 0 or entry[1] >= n_b:
+                bad.append(
+                    f"pin_pairs_override entry {k}: b_idx {entry[1]} out of "
+                    f"range (n_b={n_b})")
+        expected_len = min(n_a, n_b)
+        if len(pin_pairs_override) != expected_len:
+            bad.append(
+                f"pin_pairs_override length ({len(pin_pairs_override)}) does "
+                f"not match expected pair count ({expected_len}). Run with "
+                f"dry_run=true first to see the Hungarian order.")
+        if bad:
+            return {
+                "status": "failed",
+                "routed_pairs": 0,
+                "total_pins_a": n_a,
+                "total_pins_b": n_b,
+                "paths": [],
+                "errors": ["pin_pairs_override validation errors:"] + bad,
+            }
+        pairs = [(int(a), int(b)) for a, b in pin_pairs_override]
+    else:
+        row_ind, col_ind = linear_sum_assignment(dist_matrix)
 
-    # Build matched pairs and filter dummy assignments
-    pairs = []
-    for idx in range(len(row_ind)):
-        i, j = row_ind[idx], col_ind[idx]
-        if i >= n_a or j >= n_b:
-            continue
-        pairs.append((i, j))
+        # Build matched pairs and filter dummy assignments
+        pairs = []
+        for idx in range(len(row_ind)):
+            i, j = row_ind[idx], col_ind[idx]
+            if i >= n_a or j >= n_b:
+                continue
+            pairs.append((i, j))
 
-    # Sort pairs by ascending distance (short pairs first)
-    if sort_pairs:
-        pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
+        # Sort pairs by ascending distance (short pairs first)
+        if sort_pairs:
+            pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
+
+    # Dry-run early-exit: return pair assignments without running the
+    # (expensive) find_path loop. Lets the caller veto obviously bad pair
+    # assignments before committing routing cost. Output schema stays
+    # compatible with the success path (paths[] is empty, pairs[] carries
+    # the preview). Respects pin_pairs_override if both are supplied.
+    if dry_run:
+        preview = []
+        for i, j in pairs:
+            pa = pins_a[i]
+            pb = pins_b[j]
+            preview.append({
+                "pin_a_idx": int(i),
+                "pin_b_idx": int(j),
+                "pin_a_um": [round(pa[0] * dbu, 4), round(pa[1] * dbu, 4)],
+                "pin_b_um": [round(pb[0] * dbu, 4), round(pb[1] * dbu, 4)],
+                "distance_um": round(float(dist_matrix[i, j]) * dbu, 4),
+            })
+        dry_note = ["dry_run: matching only, no routes inserted."]
+        if pin_pairs_override is not None:
+            dry_note[0] = "dry_run: pin_pairs_override applied, no routes inserted."
+        if auto_map_note is not None:
+            dry_note.append(auto_map_note)
+        return {
+            "status": "dry_run",
+            "routed_pairs": 0,
+            "total_pins_a": n_a,
+            "total_pins_b": n_b,
+            "paths": [],
+            "pairs": preview,
+            "errors": dry_note,
+        }
+
+    # Validate per_pair_obstacle_layers length if provided. Must equal the
+    # number of matched pairs (post-Hungarian, post-sort).
+    if per_pair_obs_layers is not None:
+        if not isinstance(per_pair_obs_layers, list):
+            errors.append(
+                f"per_pair_obstacle_layers must be a list of lists; got {type(per_pair_obs_layers).__name__}")
+            per_pair_obs_layers = None
+        elif len(per_pair_obs_layers) != len(pairs):
+            errors.append(
+                f"per_pair_obstacle_layers length ({len(per_pair_obs_layers)}) != "
+                f"matched pairs ({len(pairs)}); ignoring per-pair obstacles.")
+            per_pair_obs_layers = None
 
     # Route each matched pair with per-pair pin recovery
     result_paths = []
@@ -504,13 +653,46 @@ def route(config: dict) -> dict:
         saved_pin_costs = cost[pair_pin_grid].copy()
         cost[pair_pin_grid] = 1.0
 
+        # Step 1b: Apply per-pair obstacle layers (if provided). These are
+        # rasterised on top of the existing cost grid as impassable cells,
+        # and restored after this pair's path is found. The per-pair region
+        # excludes this pair's own pin footprints (which must stay walkable
+        # for the endpoint snap to succeed).
+        per_pair_grid = None
+        saved_per_pair_costs = None
+        pair_obs_specs = None
+        if per_pair_obs_layers is not None:
+            try:
+                pair_obs_specs = per_pair_obs_layers[pair_idx]
+            except IndexError:
+                pair_obs_specs = None
+        if pair_obs_specs:
+            pair_obs_region = build_obstacle_region(
+                cell, layout, list(pair_obs_specs), 0)
+            # Cut the pin footprints out so we don't re-block the pair's
+            # start/end cells after just making them walkable above.
+            pair_obs_region = pair_obs_region - pair_pin_region
+            per_pair_grid = rasterize_region_kdb(
+                pair_obs_region, bbox, resolution_dbu)
+            if per_pair_grid.any():
+                saved_per_pair_costs = cost[per_pair_grid].copy()
+                cost[per_pair_grid] = -1.0
+
         # Step 2: Find path
         path_rc = find_path(cost, start_rc, end_rc)
         if path_rc is None:
             errors.append(f"No path found for pin pair {i}->{j}")
+            # Restore per-pair obstacles first (reverse order of apply)
+            if per_pair_grid is not None and saved_per_pair_costs is not None:
+                cost[per_pair_grid] = saved_per_pair_costs
             # Restore pin cells
             cost[pair_pin_grid] = saved_pin_costs
             continue
+
+        # Restore per-pair obstacle cells before marking the path (so the next
+        # pair sees a clean global cost grid again, only modified by path cells).
+        if per_pair_grid is not None and saved_per_pair_costs is not None:
+            cost[per_pair_grid] = saved_per_pair_costs
 
         # Step 3: Convert grid path to dbu coordinates and snap endpoints to pins
         path_dbu = []
@@ -554,13 +736,21 @@ def route(config: dict) -> dict:
         # Step 5: Restore this pair's pin footprint to blocked (-2)
         cost[pair_pin_grid] = -2.0
 
+    # Emit the auto_map_resolution note as an info message so the agent can
+    # see what resolution was actually used (still routed under errors key
+    # because the worker has no separate info channel; route_worker output
+    # consumers treat errors[] as freeform notes when status == "success").
+    if auto_map_note is not None:
+        errors.append(auto_map_note)
+
     return {
-        "status": "success" if not errors else "partial",
+        "status": "success" if not errors else ("success" if all(n.startswith("auto_map_resolution") for n in errors) else "partial"),
         "routed_pairs": len(result_paths),
         "total_pins_a": n_a,
         "total_pins_b": n_b,
         "paths": result_paths,
         "errors": errors,
+        "map_resolution_um_used": map_res_um,
     }
 
 

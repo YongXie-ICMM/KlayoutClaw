@@ -197,12 +197,74 @@ class TestDocsTools:
             "docs/tools.md must mention validate_pixel_size tool"
         )
 
-    def test_tool_count_9(self):
+    def test_tool_count_10(self):
         content = _read(DOCS_TOOLS)
-        # The tool summary line should say 9 tools
-        assert re.search(r'9\s*tools', content, re.IGNORECASE), (
-            "docs/tools.md must indicate 9 tools total"
+        # The tool summary line should say 10 tools (route_inspect added in P2)
+        assert re.search(r'10\s*tools', content, re.IGNORECASE), (
+            "docs/tools.md must indicate 10 tools total"
         )
+
+    def test_mentions_route_inspect(self):
+        content = _read(DOCS_TOOLS)
+        assert "route_inspect" in content, (
+            "docs/tools.md must mention route_inspect tool"
+        )
+
+    def test_tools_md_no_hallbar_defaults_in_descriptions(self):
+        """docs/tools.md must not describe bulk_containment as 'use instead of
+        component_containment for Hall-bar-style shapes'. That description is
+        overfit to the Hall-bar benchmark and biases agents."""
+        content = _read(DOCS_TOOLS)
+        banned = [
+            "use instead of component_containment for Hall-bar-style shapes",
+            "use instead of `component_containment` for Hall-bar-style shapes",
+            "for Hall-bar-style shapes where arms intentionally sit outside",
+        ]
+        for phrase in banned:
+            assert phrase not in content, (
+                f"docs/tools.md still contains overfit description {phrase!r}")
+
+    def test_material_overlap_report_registered_in_plugin(self):
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        assert "material_overlap_report" in src, (
+            "material_overlap_report primitive not registered in "
+            "klayoutclaw_server.lym; evaluate_design schema must list it "
+            "alongside bulk_containment / arm_material_class.")
+
+    def test_pin_pairs_override_in_auto_route_schema(self):
+        """auto_route's inputSchema must list pin_pairs_override as a valid
+        property so agents know it exists."""
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        # Isolate the auto_route tool block (~2000 char window is enough)
+        import re
+        m = re.search(r'"name":\s*"auto_route"', src)
+        assert m, "auto_route tool block not found"
+        block = src[m.start():m.start() + 4000]
+        assert '"pin_pairs_override"' in block, (
+            "pin_pairs_override not declared in auto_route inputSchema")
+
+    def test_tools_md_no_hallbar_default_layer_numbers_in_route_inspect(self):
+        """The route_inspect parameter table in docs/tools.md must not show
+        ['21/0'] / '2/0' as defaults. Those are the Hall-bar benchmark
+        numbers; making them required in Task 1.2 removed them from the
+        schema, so the docs must also reflect required-ness."""
+        import re
+        content = _read(DOCS_TOOLS)
+        # Isolate the route_inspect section.
+        m = re.search(r'## route_inspect.*?(?=\n## |\Z)', content, flags=re.DOTALL)
+        assert m, "route_inspect section not found in docs/tools.md"
+        section = m.group(0)
+        # Split off the Returns block so we only check the parameter table
+        # above it (returns example may legitimately show values).
+        param_table = section.split("**Returns:**")[0]
+        assert '`["21/0"]`' not in param_table, (
+            "route_inspect docs still show ['21/0'] as default contact_layers.")
+        assert '`"2/0"`' not in param_table, (
+            "route_inspect docs still show '2/0' as default pad_layer.")
 
 
 class TestDocsSkills:
@@ -224,11 +286,18 @@ class TestDocsSkills:
 class TestClaudeMd:
     """CLAUDE.md must have updated tool count, new skills, and evaluate_worker."""
 
-    def test_tool_count_9(self):
+    def test_tool_count_10(self):
         content = _read(CLAUDE_MD)
-        # Must say "9 total" somewhere in the MCP Tools section
-        assert re.search(r'MCP\s+Tools\s*\(\s*9\s+total\s*\)', content, re.IGNORECASE), (
-            "CLAUDE.md must have 'MCP Tools (9 total)' header"
+        # Must say "10 total" somewhere in the MCP Tools section
+        # (route_inspect added in P2 of the 2026-04-14/15 benchmark review)
+        assert re.search(r'MCP\s+Tools\s*\(\s*10\s+total\s*\)', content, re.IGNORECASE), (
+            "CLAUDE.md must have 'MCP Tools (10 total)' header"
+        )
+
+    def test_claudemd_mentions_route_inspect(self):
+        content = _read(CLAUDE_MD)
+        assert "route_inspect" in content, (
+            "CLAUDE.md must mention route_inspect in the MCP Tools table"
         )
 
     def test_mentions_evaluate_worker(self):
@@ -260,6 +329,25 @@ class TestClaudeMd:
         assert "validate_pixel_size" in content, (
             "CLAUDE.md must mention validate_pixel_size in tool table"
         )
+
+    def test_claudemd_route_inspect_row_notes_required_args(self):
+        """CLAUDE.md's route_inspect row must reflect Task 1.2 — the tool
+        now requires contact_layers + pad_layer. A stale row would mislead
+        agents into thinking the defaults are still there."""
+        content = _read(CLAUDE_MD)
+        # The row appears in the MCP Tools table.
+        assert "route_inspect" in content, "route_inspect missing from CLAUDE.md"
+        # Must mention that contact_layers / pad_layer are required, or at
+        # minimum not advertise Hall-bar layer defaults 21/0 / 2/0.
+        import re
+        # Isolate a ~300-char window around route_inspect
+        m = re.search(r'route_inspect.{0,400}', content, re.DOTALL)
+        window = m.group(0)
+        # No stale default advertisements:
+        assert '`["21/0"]`' not in window, (
+            "CLAUDE.md's route_inspect description still advertises default ['21/0'].")
+        assert "default '2/0'" not in window and 'default "2/0"' not in window, (
+            "CLAUDE.md's route_inspect description still advertises default '2/0'.")
 
 
 # ===========================================================================
