@@ -486,3 +486,67 @@ class TestMaterialOverlapReport:
             assert (check.get("score") == 0.0
                     and "ERROR" in check.get("detail", "")), (
                 f"Single-element materials list must error. Got: {check!r}")
+
+
+# ---------------------------------------------------------------------------
+# Task 4.1 — contact_isolation.crossing_pairs must populate on real crossings
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def crossing_routes_gds(tmp_path):
+    """Two mid-body route rectangles on L3/0 that cross at their centres,
+    plus two pads on L2/0 placed far from the crossing so the junction
+    filter does not suppress the mid-body overlap."""
+    if gdstk is None:
+        pytest.skip("gdstk not installed")
+    lib = gdstk.Library()
+    top = lib.new_cell("TOP")
+    # Route A: horizontal wire from (0,50) to (100,50), width 2
+    top.add(gdstk.rectangle((0, 49), (100, 51), layer=3, datatype=0))
+    # Route B: vertical wire from (50,0) to (50,100), width 2 — crosses A at centre
+    top.add(gdstk.rectangle((49, 0), (51, 100), layer=3, datatype=0))
+    # Pads placed far from the crossing so junction filter doesn't apply
+    top.add(gdstk.rectangle((200, 200), (210, 210), layer=2, datatype=0))
+    top.add(gdstk.rectangle((300, 300), (310, 310), layer=2, datatype=0))
+    p = tmp_path / "x.gds"
+    lib.write_gds(str(p))
+    return str(p)
+
+
+class TestCrossingPairsContract:
+    """contact_isolation must populate crossing_pairs side-data on real
+    mid-body crossings. Without this, agents see a low score but have no
+    way to identify which routes collide — forcing reverse-engineering
+    from bbox order (ml11 + ml14 pain point)."""
+
+    def test_crossing_pairs_populated_when_crossings_exist(self, crossing_routes_gds):
+        result = _run_evaluate(
+            crossing_routes_gds,
+            [{"name": "contact_isolation",
+              "args": {"component": "contact_route"},
+              "weight": 1.0}],
+            {"contact_route": [3, 0], "bonding_pad": [2, 0]},
+        )
+        assert result["status"] == "ok", result
+        check = result["checks"][0]
+        # Score must drop because of the crossing
+        assert check["score"] < 1.0, (
+            "contact_isolation scored 1.0 despite obvious mid-body crossing; "
+            "detection broken")
+        cp = check.get("crossing_pairs")
+        assert cp is not None, (
+            "crossing_pairs field missing — evaluate_worker main() failed "
+            "to promote the dict-return side-data onto the check result")
+        assert len(cp) > 0, (
+            "crossing_pairs is EMPTY despite low score — agents can see "
+            "the penalty but not which routes are guilty. Fix main()'s "
+            "side-data forwarding or _prim_contact_isolation's detection.")
+        for tup in cp:
+            assert isinstance(tup, (list, tuple)) and len(tup) == 3, (
+                f"crossing_pairs entries must be [i, j, area_um2] tuples; "
+                f"got {tup!r}")
+            assert tup[0] != tup[1], tup
+            assert tup[2] > 0, tup
+        # crossing_pairs_format should document the schema
+        assert check.get("crossing_pairs_format"), (
+            "crossing_pairs_format legend missing from check result")
