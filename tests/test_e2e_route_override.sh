@@ -103,26 +103,63 @@ test -f "$RESULT_JSON" || {
 
 python - <<'PY'
 import json
+# The plugin's auto_route response includes summary stats but not per-path
+# geometry (paths are inserted into the layout, not returned). Compare the
+# override response's pair assignment against the dry_run's to prove the
+# override actually changed the Hungarian assignment.
 with open("/tmp/e2e_route_override.json") as f:
     r = json.load(f)
-# Override must have succeeded (status success OR partial — not failed)
+with open("/tmp/e2e_route_override_dryrun.json") as f:
+    d = json.load(f)
+
 assert r["status"] in ("success", "partial"), r
 assert r["routed_pairs"] == 2, r
-paths = r.get("paths", [])
-assert len(paths) == 2, paths
-# Each path's endpoints (in um) must span y=0..100 diagonally (dy >= 50 um);
-# Hungarian parallel routes would have dy ~ 0.
-for p in paths:
-    # Support either points_um or points_dbu (worker chooses)
-    if "points_um" in p:
-        pts = p["points_um"]
-    elif "points_dbu" in p:
-        pts = [[x * 0.001, y * 0.001] for x, y in p["points_dbu"]]
-    else:
-        raise AssertionError(f"path missing points_um/points_dbu: {p}")
-    dy = abs(pts[-1][1] - pts[0][1])
-    assert dy > 50, f"override did not apply; dy={dy} suggests straight Hungarian paths. path={p!r}"
-print("PASS: pin_pairs_override produced crossed pairing; routes committed.")
+assert not r.get("errors"), f"unexpected errors: {r['errors']}"
+
+# Dry run should have produced the parallel (Hungarian) pairing: (0,0)+(1,1)
+dry_pairs = [(p["pin_a_idx"], p["pin_b_idx"]) for p in d["pairs"]]
+assert sorted(dry_pairs) == [(0, 0), (1, 1)], (
+    f"Hungarian dry_run unexpectedly matched crossed pairs: {dry_pairs}. "
+    f"The override's distinctness check below is meaningless.")
+
+# The override's resulting routed_pairs count + success status, combined
+# with the dry_run showing a different (parallel) baseline, proves the
+# override took effect. To further validate the geometry is crossed, query
+# the MCP for shapes on output_layer=10/0 and verify their endpoints span
+# the full y-range (not just the short y-slice Hungarian would produce).
+import urllib.request
+MCP = "http://127.0.0.1:8765/mcp"
+code = """
+view, layout, cell = _get_or_create_view()
+li = layout.layer(10, 0)
+dbu = layout.dbu
+paths = []
+for s in cell.shapes(li).each():
+    if s.is_path():
+        pts = [(p.x * dbu, p.y * dbu) for p in s.path.each_point()]
+        paths.append(pts)
+    elif s.is_polygon() or s.is_box():
+        bb = s.bbox()
+        paths.append([(bb.left * dbu, bb.bottom * dbu),
+                      (bb.right * dbu, bb.top * dbu)])
+result = {"paths": paths}
+"""
+req = urllib.request.Request(MCP, data=json.dumps({
+    "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+    "params": {"name": "execute_script", "arguments": {"code": code}}
+}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+resp = urllib.request.urlopen(req, timeout=30)
+body = json.loads(resp.read().decode())
+inner = json.loads(body["result"]["content"][0]["text"])
+paths = inner["result"]["paths"]
+assert len(paths) >= 2, f"expected >=2 route shapes on L10/0, got {len(paths)}: {paths}"
+# For a crossed pair: at least one route endpoint-pair must span >50 um in y.
+spanning = [p for p in paths if abs(p[-1][1] - p[0][1]) > 50]
+assert spanning, (
+    f"No route spans the y-gap; override did NOT produce crossed pairing. "
+    f"paths={paths}")
+print(f"PASS: pin_pairs_override produced crossed pairing; "
+      f"{len(paths)} route shapes committed, {len(spanning)} span the y-gap.")
 PY
 
 echo "=== E2E: pin_pairs_override PASSED ==="
