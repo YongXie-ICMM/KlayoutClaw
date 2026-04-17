@@ -346,3 +346,143 @@ class TestLayerMapSchemaExample:
         assert any(s in block for s in signals), (
             "layer_map description has been over-sanitised; it should still "
             "give an illustrative example so agents know the value shape.")
+
+
+# ---------------------------------------------------------------------------
+# Task 2.1 — material_overlap_report primitive
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def two_material_gds(tmp_path):
+    """L11 (material_a) + L13 (material_b) with a known 4x4 um overlap."""
+    if gdstk is None:
+        pytest.skip("gdstk not installed")
+    lib = gdstk.Library()
+    top = lib.new_cell("TOP")
+    # material_a is 10x10 at origin
+    top.add(gdstk.rectangle((0, 0), (10, 10), layer=11, datatype=0))
+    # material_b is 10x10 at (6, 6); overlap is 4x4 square at (6,6)-(10,10)
+    top.add(gdstk.rectangle((6, 6), (16, 16), layer=13, datatype=0))
+    p = tmp_path / "two_mat.gds"
+    lib.write_gds(str(p))
+    return str(p)
+
+
+class TestMaterialOverlapReport:
+    """material_overlap_report returns structured areas + bboxes + centroids
+    for each of {A-only, B-only, overlap} regions. Score is always 1.0; the
+    information lives in the side-data ``report`` field promoted to the
+    check result."""
+
+    def test_report_has_expected_regions_and_areas(self, two_material_gds):
+        result = _run_evaluate(
+            two_material_gds,
+            [{"name": "material_overlap_report",
+              "args": {"materials": ["material_a", "material_b"]},
+              "weight": 1.0}],
+            {"material_a": [11, 0], "material_b": [13, 0]},
+        )
+        assert result["status"] == "ok", result
+        check = result["checks"][0]
+        report = check.get("report")
+        assert report is not None, (
+            "material_overlap_report must promote a 'report' dict into the "
+            "check result")
+        # Regions: each material's "_only" + the pair intersection
+        expected_keys = {"material_a_only", "material_b_only",
+                         "material_a_and_material_b"}
+        assert set(report.keys()) >= expected_keys, (
+            f"report missing keys; got {sorted(report.keys())}")
+        # Areas: each is 10*10 - 4*4 = 84 um^2 for *_only; 4*4 = 16 for overlap
+        assert 83 <= report["material_a_only"]["area_um2"] <= 85
+        assert 83 <= report["material_b_only"]["area_um2"] <= 85
+        assert 15 <= report["material_a_and_material_b"]["area_um2"] <= 17
+        # Bboxes: list of 4 floats
+        for key in expected_keys:
+            bb = report[key]["bbox_um"]
+            assert isinstance(bb, list) and len(bb) == 4, (
+                f"{key} bbox wrong shape: {bb!r}")
+        # Centroids: list of 2 floats
+        for key in expected_keys:
+            c = report[key]["centroid_um"]
+            assert isinstance(c, list) and len(c) == 2, (
+                f"{key} centroid wrong shape: {c!r}")
+        # num_polygons: int
+        for key in expected_keys:
+            assert isinstance(report[key]["num_polygons"], int)
+
+    def test_three_material_combinations(self, tmp_path):
+        """With 3 materials the primitive emits pairwise + triple regions."""
+        if gdstk is None:
+            pytest.skip("gdstk not installed")
+        lib = gdstk.Library()
+        top = lib.new_cell("TOP")
+        # Three 10x10 rectangles, each shifted so every pair and the triple
+        # intersection is non-empty.
+        top.add(gdstk.rectangle((0, 0), (10, 10), layer=11, datatype=0))   # A
+        top.add(gdstk.rectangle((5, 0), (15, 10), layer=12, datatype=0))   # B
+        top.add(gdstk.rectangle((0, 5), (15, 15), layer=13, datatype=0))   # C
+        p = tmp_path / "three.gds"
+        lib.write_gds(str(p))
+        result = _run_evaluate(
+            str(p),
+            [{"name": "material_overlap_report",
+              "args": {"materials": ["A", "B", "C"]},
+              "weight": 1.0}],
+            {"A": [11, 0], "B": [12, 0], "C": [13, 0]},
+        )
+        assert result["status"] == "ok", result
+        report = result["checks"][0]["report"]
+        # Expect all 7 combination keys: 3 singles + 3 pairs + 1 triple
+        for key in ["A_only", "B_only", "C_only",
+                    "A_and_B", "A_and_C", "B_and_C",
+                    "A_and_B_and_C"]:
+            assert key in report, (
+                f"missing region {key!r}; got {sorted(report.keys())}")
+        # A_and_B_and_C must have non-zero area in this geometry
+        assert report["A_and_B_and_C"]["area_um2"] > 0
+
+    def test_raises_on_empty_materials_list(self, two_material_gds):
+        """The primitive must refuse an empty materials list, not silently
+        return an empty report."""
+        result = _run_evaluate(
+            two_material_gds,
+            [{"name": "material_overlap_report",
+              "args": {"materials": []},
+              "weight": 1.0}],
+            {"material_a": [11, 0], "material_b": [13, 0]},
+        )
+        # First assert the primitive is registered (not "unknown primitive")
+        assert result.get("status") != "error" or "unknown primitive" not in result.get(
+            "error", ""), (
+            "material_overlap_report is not yet registered as a primitive — "
+            "implement it in Task 2.2 before validating input guards")
+        # Either subprocess exit signals an error (status != ok) or the
+        # check surfaces an error detail
+        if result["status"] == "ok":
+            check = result["checks"][0]
+            # score 0.0 + ERROR marker OR explicit 'error' field
+            assert (check.get("score") == 0.0
+                    and "ERROR" in check.get("detail", "")), (
+                f"Empty materials list must produce an error path. Got: {check!r}")
+
+    def test_raises_on_single_material(self, two_material_gds):
+        """A single material yields trivial intersections; the primitive
+        should require at least 2 materials."""
+        result = _run_evaluate(
+            two_material_gds,
+            [{"name": "material_overlap_report",
+              "args": {"materials": ["material_a"]},
+              "weight": 1.0}],
+            {"material_a": [11, 0], "material_b": [13, 0]},
+        )
+        # First assert the primitive is registered (not "unknown primitive")
+        assert result.get("status") != "error" or "unknown primitive" not in result.get(
+            "error", ""), (
+            "material_overlap_report is not yet registered as a primitive — "
+            "implement it in Task 2.2 before validating input guards")
+        if result["status"] == "ok":
+            check = result["checks"][0]
+            assert (check.get("score") == 0.0
+                    and "ERROR" in check.get("detail", "")), (
+                f"Single-element materials list must error. Got: {check!r}")
