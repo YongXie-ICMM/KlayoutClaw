@@ -310,16 +310,25 @@ class TestLayerMapSchemaExample:
         m = re.search(r'"name":\s*"evaluate_design"', src)
         assert m, "evaluate_design block not found in plugin"
         block = src[m.start():m.start() + 6000]
-        # Concrete Hall-bar bake: all of mesa=20/0 + contact_patch=21/0 +
-        # bonding_pad=2/0 together in one place is the canonical tell.
-        concrete = ('"mesa": [20, 0]' in block
-                    and '"contact_patch": [21, 0]' in block
-                    and '"bonding_pad": [2, 0]' in block)
-        assert not concrete, (
-            "evaluate_design's layer_map example bakes the Hall-bar "
-            "benchmark layer map ({\"mesa\": [20,0], \"contact_patch\": [21,0], "
-            "\"bonding_pad\": [2,0], ...}). Replace with a device-agnostic "
-            "placeholder like {\"device_body\": [L, D], \"peripheral\": [L, D]}.")
+        # The .lym stores schema descriptions as Python string literals, so
+        # the Hall-bar bake appears as `\"mesa\": [20, 0]` (escaped-quote).
+        # Also tolerate the raw form in case future refactors change the
+        # embedding. Use a regex that's agnostic to quoting style.
+        # Red flag: three specific Hall-bar mappings together in one place.
+        # Both opening and closing quotes may be backslash-escaped in the
+        # .lym Python string literal, so allow optional `\` on either side.
+        patterns = [
+            re.compile(r'\\?"mesa\\?"\s*:\s*\[\s*20\s*,\s*0\s*\]'),
+            re.compile(r'\\?"contact_patch\\?"\s*:\s*\[\s*21\s*,\s*0\s*\]'),
+            re.compile(r'\\?"bonding_pad\\?"\s*:\s*\[\s*2\s*,\s*0\s*\]'),
+        ]
+        hits = sum(1 for p in patterns if p.search(block))
+        assert hits < 2, (
+            "evaluate_design's layer_map example still bakes the Hall-bar "
+            "benchmark layer map (mesa=20/0, contact_patch=21/0, "
+            "bonding_pad=2/0 appearing together). Replace with a "
+            "device-agnostic placeholder like "
+            "{\"device_body\": [L, D], \"peripheral\": [L, D]}.")
 
     def test_layer_map_description_mentions_placeholder(self):
         """After sanitising, the description must still give SOME example
