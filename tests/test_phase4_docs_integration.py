@@ -224,6 +224,15 @@ class TestDocsTools:
             assert phrase not in content, (
                 f"docs/tools.md still contains overfit description {phrase!r}")
 
+    def test_material_overlap_report_registered_in_plugin(self):
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        assert "material_overlap_report" in src, (
+            "material_overlap_report primitive not registered in "
+            "klayoutclaw_server.lym; evaluate_design schema must list it "
+            "alongside bulk_containment / arm_material_class.")
+
     def test_tools_md_no_hallbar_default_layer_numbers_in_route_inspect(self):
         """The route_inspect parameter table in docs/tools.md must not show
         ['21/0'] / '2/0' as defaults. Those are the Hall-bar benchmark
