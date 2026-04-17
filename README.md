@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="KLayout_Claw.PNG" alt="KlayoutClaw" width="640">
+  <img src="KLayout_Claw.webp" alt="KlayoutClaw" width="640">
 </p>
 
 # KlayoutClaw
