@@ -225,3 +225,65 @@ class TestRouteInspectSchema:
         assert re.search(r'if\s+not\s+pad_(spec|layer)|pad_(spec|layer)\s+is\s+None',
                          body), (
             "_tool_route_inspect must explicitly reject missing pad_layer")
+
+
+# ---------------------------------------------------------------------------
+# Task 1.3 — next_step_suggestion must not reference Hall-bar vocabulary
+# ---------------------------------------------------------------------------
+
+class TestNextStepSanitized:
+    """The evaluate_worker's next_step_suggestion string must not contain
+    Hall-bar-specific vocabulary. An agent working on a different device
+    should not be told to 'consider bulk_containment for Hall-bar-style arms'
+    or to reason about 'graphene_only / graphite_only / overlap'."""
+
+    def _eval_with_low_score(self, tmp_path):
+        """Build a trivial layout that scores low on component_containment
+        and return the evaluate_worker output."""
+        if gdstk is None:
+            pytest.skip("gdstk not installed")
+        gds_path = str(tmp_path / "t.gds")
+        lib = gdstk.Library()
+        top = lib.new_cell("TOP")
+        top.add(gdstk.rectangle((0, 0), (10, 10), layer=30, datatype=0))
+        # L31 is tiny + far away, so containment will score low
+        top.add(gdstk.rectangle((100, 100), (101, 101), layer=31, datatype=0))
+        lib.write_gds(gds_path)
+        return _run_evaluate(
+            gds_path,
+            [{"name": "component_containment",
+              "args": {"component": "thing", "region": "bulk"},
+              "weight": 0.5},
+             {"name": "bulk_containment",
+              "args": {"component": "thing", "bulk_region": "bulk"},
+              "weight": 0.5}],
+            {"thing": [30, 0], "bulk": [31, 0]},
+        )
+
+    def test_no_hallbar_vocab_in_next_step(self, tmp_path):
+        result = self._eval_with_low_score(tmp_path)
+        assert result["status"] == "ok"
+        suggestion = result.get("next_step_suggestion", "")
+        # banned substrings — each is a Hall-bar-specific term that locks
+        # the agent's mental model to that one benchmark.
+        banned = ["Hall-bar", "hall bar", "Hall bar", "graphene_only",
+                  "graphite_only", "graphene/graphite"]
+        lowered = suggestion.lower()
+        for word in banned:
+            assert word.lower() not in lowered, (
+                f"next_step_suggestion contains overfit vocabulary {word!r}: "
+                f"{suggestion!r}")
+        # But suggestion must still mention SOME follow-up tool — not over-sanitized
+        assert ("route_inspect" in suggestion
+                or "screenshot" in suggestion
+                or "checklist" in suggestion), (
+            "next_step_suggestion has been over-sanitized; it should still "
+            "point at a follow-up tool. Got: {!r}".format(suggestion))
+
+    def test_suggestion_still_has_substance(self, tmp_path):
+        """After sanitizing, the suggestion must still be non-empty and
+        give actionable guidance when a check scores low."""
+        result = self._eval_with_low_score(tmp_path)
+        suggestion = result.get("next_step_suggestion", "")
+        assert len(suggestion) >= 50, (
+            f"next_step_suggestion too short: {suggestion!r}")

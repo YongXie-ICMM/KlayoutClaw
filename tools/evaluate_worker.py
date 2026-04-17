@@ -617,46 +617,60 @@ def _write_error(output_path, message):
 # ---------------------------------------------------------------------------
 
 def _build_next_step(overall, results, empty_components):
-    """Emit a concise, static suggestion string for the agent.
-
-    The intent (per benchmark review) is NOT to parse result.json or validate
-    a schema — it is to nudge the agent back to the task instruction +
-    checklist whenever any check underperforms, and to name the specific
-    inspection tools relevant to the failing check.  The agent picks up the
-    hint and decides what to do.
-    """
+    """Emit a concise, static suggestion pointing the caller at relevant
+    inspection tools. Device-agnostic — do not hard-code material names
+    or device topology vocabulary."""
     if not results:
         return ("No checks ran. Re-read the task instruction and the saved "
-                "checklist.md, then call evaluate_design with the "
-                "benchmark-specified layer_map and checks list.")
+                "checklist, then call evaluate_design with the target "
+                "layer_map and checks list.")
 
     parts = []
     low = [c for c in results if c.get("score", 0.0) < 0.8]
 
     if overall >= 0.9 and not low:
-        parts.append("Overall score passes. Re-read the task instruction and "
-                     "checklist.md to confirm every benchmark requirement is "
-                     "met (mcp_feedback_* fields, result.json schema, etc.) "
+        parts.append("Overall score passes. Re-read the task instruction "
+                     "and checklist to confirm every benchmark requirement "
+                     "is met (schema fields, deliverable file names, etc.) "
                      "before save.")
     else:
-        parts.append("Re-read the task instruction and checklist.md. Verify "
-                     "the design addresses every requirement before the next "
-                     "iteration.")
+        parts.append("Re-read the task instruction and checklist. Verify "
+                     "the design addresses every requirement before the "
+                     "next iteration.")
 
     names = {c["name"] for c in low}
     if "contact_isolation" in names:
-        parts.append("For contact_isolation < 0.8: call route_inspect (route_layer + contact_layers + pad_layer) to see crossings with route IDs.")
+        parts.append(
+            "For contact_isolation < 0.8: call route_inspect with the same "
+            "route_layer / contact_layers / pad_layer you used when routing, "
+            "then screenshot(zoom_box=...) over each crossing to inspect.")
     if "component_containment" in names or "bulk_containment" in names:
-        parts.append("For containment < 0.8: call screenshot(zoom_box=...) on the mesa region to visually verify bulk placement, and consider bulk_containment (with core_bbox) instead of component_containment for Hall-bar-style arms.")
+        parts.append(
+            "For containment < 0.8: call screenshot(zoom_box=...) on the "
+            "component bbox to visually confirm placement. If the component "
+            "has a core area plus peripherals that intentionally sit outside "
+            "the target region, switch from component_containment to "
+            "bulk_containment and pass a bulk_region (or materials list) "
+            "matching only the core.")
     if "arm_material_class" in names:
-        parts.append("For arm_material_class < 0.8: the arms/contacts straddle material boundaries. Run screenshot over each ambiguous arm and re-check the contact classes against graphene_only / graphite_only / overlap.")
+        parts.append(
+            "For arm_material_class < 0.8: shapes land in zero classes or "
+            "straddle multiple. Screenshot each ambiguous shape and confirm "
+            "the class regions you passed cover the intended placement.")
     if "connectivity" in names or "route_endpoints" in names:
-        parts.append("For connectivity/route_endpoints < 0.8: call route_inspect then screenshot(zoom_box=...) over each unreached contact to spot broken routes or missing endpoints.")
+        parts.append(
+            "For connectivity/route_endpoints < 0.8: call route_inspect to "
+            "see which endpoints are unmapped, then screenshot(zoom_box=...) "
+            "over the unreached contacts.")
     if "adjacency" in names or "spacing" in names:
-        parts.append("For adjacency/spacing < 0.8: call screenshot(zoom_box=...) near the flagged components to inspect geometry.")
+        parts.append(
+            "For adjacency/spacing < 0.8: call screenshot(zoom_box=...) "
+            "near the flagged components to inspect the geometry.")
 
     if empty_components:
-        parts.append("Warnings list empty components — either add geometry to those layers or drop the corresponding checks before re-running.")
+        parts.append(
+            "Warnings list empty components — either add geometry to those "
+            "layers or drop the corresponding checks before re-running.")
 
     return " ".join(parts)
 
