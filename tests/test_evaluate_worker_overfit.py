@@ -135,3 +135,89 @@ class TestBulkContainmentDefaults:
         assert result["status"] == "ok"
         score = result["checks"][0]["score"]
         assert 0.60 <= score <= 0.68, f"expected ~0.64, got {score}"
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2 — route_inspect must not default to 21/0 + 2/0
+# ---------------------------------------------------------------------------
+
+class TestRouteInspectSchema:
+    """The route_inspect tool schema in klayoutclaw_server.lym must not
+    default contact_layers to ['21/0'] or pad_layer to '2/0'. Those are the
+    Hall-bar benchmark layer numbers, not general-purpose defaults."""
+
+    def test_contact_layers_has_no_overfit_default(self):
+        import re
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        # Locate the route_inspect tool block
+        block_match = re.search(
+            r'"name":\s*"route_inspect".*?"required":\s*\[.*?\]',
+            src, flags=re.DOTALL)
+        assert block_match, "route_inspect tool block not found"
+        block = block_match.group(0)
+        # Must not have a default value of ["21/0"] for contact_layers
+        assert re.search(r'"contact_layers".*?"default":\s*\["21/0"\]',
+                         block, re.DOTALL) is None, (
+            "contact_layers still defaults to ['21/0'] — overfit default")
+        # contact_layers MUST be in the required list
+        req_match = re.search(r'"required":\s*\[(.*?)\]', block, re.DOTALL)
+        assert req_match, "required[] not found in route_inspect"
+        required = req_match.group(1)
+        assert '"contact_layers"' in required, (
+            "contact_layers should be required now (was defaulted to ['21/0']).")
+
+    def test_pad_layer_has_no_overfit_default(self):
+        import re
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        block_match = re.search(
+            r'"name":\s*"route_inspect".*?"required":\s*\[.*?\]',
+            src, flags=re.DOTALL)
+        block = block_match.group(0)
+        assert re.search(r'"pad_layer".*?"default":\s*"2/0"',
+                         block, re.DOTALL) is None, (
+            "pad_layer still defaults to '2/0' — overfit default")
+        req_match = re.search(r'"required":\s*\[(.*?)\]', block, re.DOTALL)
+        required = req_match.group(1)
+        assert '"pad_layer"' in required, (
+            "pad_layer should be required now (was defaulted to '2/0').")
+
+    def test_runtime_raises_when_contact_layers_missing(self):
+        """The _tool_route_inspect function must raise ValueError naming
+        'contact_layers' when the argument is absent. Static analysis: find
+        the function in the .lym source and verify the explicit error path
+        is present (since we can't invoke it without a live MCP session)."""
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        # Find _tool_route_inspect body (from def to next def)
+        import re
+        m = re.search(
+            r'def\s+_tool_route_inspect\s*\([^)]*\)\s*:(.*?)(?=\ndef\s+_tool_|\nclass\s+|\Z)',
+            src, flags=re.DOTALL)
+        assert m, "_tool_route_inspect function not found"
+        body = m.group(1)
+        # Explicit check for contact_layers required
+        assert re.search(r'contact_layers.*?is\s+None', body, re.DOTALL) or \
+               re.search(r'if\s+not\s+contact_layers', body), (
+            "_tool_route_inspect must explicitly reject missing contact_layers")
+        assert "is required" in body.lower() or "required" in body.lower(), (
+            "_tool_route_inspect must raise with a 'required' message")
+
+    def test_runtime_raises_when_pad_layer_missing(self):
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        import re
+        m = re.search(
+            r'def\s+_tool_route_inspect\s*\([^)]*\)\s*:(.*?)(?=\ndef\s+_tool_|\nclass\s+|\Z)',
+            src, flags=re.DOTALL)
+        body = m.group(1)
+        assert re.search(r'pad_layer', body), "pad_layer not referenced"
+        # Accepts: `if not pad_spec`, `if pad_spec is None`, `if pad_layer is None`, etc.
+        assert re.search(r'if\s+not\s+pad_(spec|layer)|pad_(spec|layer)\s+is\s+None',
+                         body), (
+            "_tool_route_inspect must explicitly reject missing pad_layer")

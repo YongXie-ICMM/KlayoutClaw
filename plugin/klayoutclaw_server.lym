@@ -328,13 +328,12 @@ TOOLS = [
                 "contact_layers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Layer specs for contact patches that route endpoints may land on (default ['21/0']). Accepts a list or single string.",
-                    "default": ["21/0"]
+                    "description": "Layer specs for contact shapes that route endpoints may land on. Accepts a list of layer specs. Required — there is no default."
                 },
-                "pad_layer": {"type": "string", "description": "Layer spec for bonding pads (default '2/0').", "default": "2/0"},
+                "pad_layer": {"type": "string", "description": "Layer spec for bonding pads. Required — there is no default."},
                 "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 5.0).", "default": 5.0}
             },
-            "required": ["route_layer"]
+            "required": ["route_layer", "contact_layers", "pad_layer"]
         }
     },
     {
@@ -963,10 +962,19 @@ def _tool_route_inspect(args):
     if rl is None:
         raise ValueError("Invalid route_layer spec '{}'. Expected 'L/DT' (e.g. '3/0').".format(route_spec))
 
-    contact_specs = args.get("contact_layers", ["21/0"])
+    contact_specs = args.get("contact_layers")
+    if contact_specs is None:
+        raise ValueError(
+            "route_inspect: 'contact_layers' is required (list of layer specs "
+            "the route endpoints land on). No default is assumed.")
     if isinstance(contact_specs, str):
         contact_specs = [contact_specs]
-    pad_spec = args.get("pad_layer", "2/0")
+
+    pad_spec = args.get("pad_layer")
+    if not pad_spec:
+        raise ValueError(
+            "route_inspect: 'pad_layer' is required (layer spec for bonding "
+            "pads). No default is assumed.")
     tolerance_um = float(args.get("tolerance_um", 5.0))
 
     dbu = _layout.dbu
