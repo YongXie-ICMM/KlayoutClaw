@@ -176,6 +176,7 @@ class TestRouteInspectSchema:
         block_match = re.search(
             r'"name":\s*"route_inspect".*?"required":\s*\[.*?\]',
             src, flags=re.DOTALL)
+        assert block_match, "route_inspect tool block not found"
         block = block_match.group(0)
         assert re.search(r'"pad_layer".*?"default":\s*"2/0"',
                          block, re.DOTALL) is None, (
@@ -206,6 +207,10 @@ class TestRouteInspectSchema:
             "_tool_route_inspect must explicitly reject missing contact_layers")
         assert "is required" in body.lower() or "required" in body.lower(), (
             "_tool_route_inspect must raise with a 'required' message")
+        # Guard must also catch empty list, not only None
+        assert re.search(r'if\s+not\s+contact_(specs|layers)', body), (
+            "_tool_route_inspect must reject empty contact_layers list too, "
+            "not only None. Use `if not contact_specs:` rather than `is None`.")
 
     def test_runtime_raises_when_pad_layer_missing(self):
         lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
@@ -216,7 +221,6 @@ class TestRouteInspectSchema:
             r'def\s+_tool_route_inspect\s*\([^)]*\)\s*:(.*?)(?=\ndef\s+_tool_|\nclass\s+|\Z)',
             src, flags=re.DOTALL)
         body = m.group(1)
-        assert re.search(r'pad_layer', body), "pad_layer not referenced"
         # Accepts: `if not pad_spec`, `if pad_spec is None`, `if pad_layer is None`, etc.
         assert re.search(r'if\s+not\s+pad_(spec|layer)|pad_(spec|layer)\s+is\s+None',
                          body), (

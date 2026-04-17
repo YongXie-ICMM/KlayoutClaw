@@ -963,10 +963,10 @@ def _tool_route_inspect(args):
         raise ValueError("Invalid route_layer spec '{}'. Expected 'L/DT' (e.g. '3/0').".format(route_spec))
 
     contact_specs = args.get("contact_layers")
-    if contact_specs is None:
+    if not contact_specs:
         raise ValueError(
-            "route_inspect: 'contact_layers' is required (list of layer specs "
-            "the route endpoints land on). No default is assumed.")
+            "route_inspect: 'contact_layers' is required and must be a non-empty "
+            "list of layer specs the route endpoints land on. No default is assumed.")
     if isinstance(contact_specs, str):
         contact_specs = [contact_specs]
 
