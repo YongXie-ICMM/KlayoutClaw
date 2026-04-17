@@ -478,33 +478,25 @@ def _prim_spacing(out_lib, ref_lib, layer_map, args):
 
 
 def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
-    """Fraction of component area contained within a *bulk* region.
+    """Fraction of component area contained within a caller-declared bulk region.
 
     Distinct from component_containment: this check is meant to score the
-    Hall-bar-style "channel bulk" against the material overlap region,
-    without penalising arms that intentionally extend into single-material
-    zones.  Two ways to restrict the measurement to bulk-only geometry:
+    body of a device against a bulk region, without penalising peripherals
+    that intentionally extend into single-material zones.  Two ways to
+    specify the bulk:
 
-    - Pass ``core_bbox: [x1, y1, x2, y2]`` (um) to clip the component to a
-      rectangular core before containment scoring — only the clipped portion
-      is evaluated.
-    - Pass ``bulk_region`` directly as a region expression (layer_map key or
-      list of keys), same semantics as ``component_containment``'s region
-      arg.  Default bulk region is the intersection of ``material_a`` and
-      ``material_b`` (default keys: "graphene" and "graphite"), matching
-      the overlap region used by Hall bar geometry.
+    - Pass ``bulk_region`` as a region expression (layer_map key or list of
+      keys), same semantics as ``component_containment``'s region arg. Pair
+      with ``region_op`` (union / intersection / difference).
+    - Pass ``materials`` as a list of layer_map keys; the primitive will
+      intersect those layers to form the bulk region. Useful when the bulk
+      is the overlap of two materials. The caller names the keys; no
+      defaults are assumed.
 
-    Args:
-        component: component name (required)
-        bulk_region: region spec (optional; default: intersection of
-            material_a and material_b)
-        region_op: "union"/"intersection"/"difference" for multi-key
-            bulk_region (default: "union")
-        material_a: layer_map key (default "graphene") — only used when
-            bulk_region is not provided
-        material_b: layer_map key (default "graphite") — only used when
-            bulk_region is not provided
-        core_bbox: [x1, y1, x2, y2] in um (optional)
+    Optional ``core_bbox=[x1, y1, x2, y2]`` (um) clips the component to a
+    rectangular core before containment scoring.
+
+    Raises ValueError if neither bulk_region nor materials is provided.
     """
     comp = _component_union(out_lib, layer_map, args["component"])
     if comp.is_empty:
@@ -522,11 +514,18 @@ def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
         region = _resolve_region(out_lib, ref_lib, layer_map,
                                  args["bulk_region"],
                                  args.get("region_op", "union"))
+    elif "materials" in args:
+        mats = args["materials"]
+        if not isinstance(mats, list) or not mats:
+            raise ValueError(
+                "bulk_containment: 'materials' must be a non-empty list of "
+                "layer_map keys (e.g. ['channel_a', 'channel_b']).")
+        region = _resolve_region(out_lib, ref_lib, layer_map, mats, "intersection")
     else:
-        mat_a = args.get("material_a", "graphene")
-        mat_b = args.get("material_b", "graphite")
-        region = _resolve_region(out_lib, ref_lib, layer_map,
-                                 [mat_a, mat_b], "intersection")
+        raise ValueError(
+            "bulk_containment requires either 'bulk_region' (single key or "
+            "list) OR 'materials' (list of layer_map keys whose intersection "
+            "defines the bulk). No default material names are assumed.")
 
     if region.is_empty:
         return 0.0
