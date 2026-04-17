@@ -11,7 +11,7 @@ Save the current KLayout layout to a temporary GDS file, convert it to PNG, and 
 
 - KLayout running with KlayoutClaw plugin (v0.3+)
 - A layout with geometry must be open
-- Python packages: `gdstk`, `matplotlib` (in the conda environment)
+- Python packages: `gdstk`, `matplotlib`, `numpy` (available in the `instrMCPdev` conda env)
 
 ## Script
 

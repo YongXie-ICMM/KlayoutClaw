@@ -9,7 +9,7 @@ Transforms all per-material detections into the full_stack coordinate system, pr
 
 ## Prerequisites
 
-- Conda env `instrMCPdev` with opencv, numpy
+- Conda env `instrMCPdev` with opencv, numpy, shapely (`rank_candidate_pairs.py` uses shapely)
 - Completed align step (warp matrices, footprint mask)
 - Completed detect step (per-material masks/contours, detections.json)
 - All scripts run via `conda run -n instrMCPdev python <script>`

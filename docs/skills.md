@@ -12,7 +12,7 @@ Skills are Claude Code plugins that wrap KlayoutClaw MCP tools into task-oriente
 /plugin install klayoutclaw@klayoutclaw
 ```
 
-After installation, skills are available as `/klayoutclaw:geometry`, `/klayoutclaw:display`, `/klayoutclaw:image`, and `/klayoutclaw:visual`. Claude also loads them automatically when relevant.
+After installation the four core skills are directly invocable as `/klayoutclaw:{geometry,display,image,visual}`. The nanodevice pipelines (`nanodevice_flakedetect`, `nanodevice_gdsalign`, `nanodevice_routing`, `nanodevice_e2e_design`) and `klayout_gds_import` auto-load by description when the user's request matches — Claude picks them without a slash command.
 
 All scripts share a common MCP client (`skills/scripts/mcp_client.py`) that connects to KLayout at `127.0.0.1:8765`.
 
@@ -295,7 +295,7 @@ Align microscope stack images to a GDS fabrication template by detecting lithogr
 Parse GDS template, extract the 4 innermost L5/0 marker pairs (8 squares total).
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/extract_markers.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/extract_markers.py \
     --gds Template.gds --output-dir output/gdsalign/
 ```
 
@@ -304,7 +304,7 @@ conda run -n base python skills/nanodevice_gdsalign/scripts/extract_markers.py \
 Detect marker pairs in microscope image via multi-scale, multi-rotation template matching.
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/detect_markers.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/detect_markers.py \
     --image full_stack_raw.jpg --pixel-size 0.087 \
     --gds-markers output/gdsalign/gds_markers.json --output-dir output/gdsalign/
 ```
@@ -314,7 +314,7 @@ conda run -n base python skills/nanodevice_gdsalign/scripts/detect_markers.py \
 Exhaustive 2-point correspondence enumeration to compute similarity transform (image_um → GDS_um).
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/align_gds.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/align_gds.py \
     --gds-markers output/gdsalign/gds_markers.json \
     --image-markers output/gdsalign/image_markers.json \
     --output-dir output/gdsalign/
@@ -325,7 +325,7 @@ conda run -n base python skills/nanodevice_gdsalign/scripts/align_gds.py \
 Apply warp to image + contours, commit to KLayout. Use `--warp-only` for offline testing.
 
 ```bash
-conda run -n base python skills/nanodevice_gdsalign/scripts/commit_gds.py \
+conda run -n instrMCPdev python skills/nanodevice_gdsalign/scripts/commit_gds.py \
     --warp output/gdsalign/gds_warp.npy --traces output/combine/traces.json \
     --image full_stack_raw.jpg --pixel-size 0.087 \
     --gds Template.gds --output-dir output/gdsalign/ [--warp-only]
@@ -427,12 +427,60 @@ Each step runs as a subagent that reads its SKILL.md from `skills/nanodevice_fla
 - `numpy` — array operations
 - `scipy` — KDTree, optimization (Chamfer alignment)
 - `scikit-learn` — k-means clustering
+- `shapely` — polygon ops in `rank_candidate_pairs.py`
 
-Conda env: `base` (all deps pre-installed)
+Conda env: `instrMCPdev` (all deps pre-installed)
 
 ### Full Documentation
 
 See `skills/nanodevice_flakedetect/SKILL.md` for the orchestrator workflow, and each sub-skill's SKILL.md for detailed script references and tuning guides.
+
+---
+
+## Nanodevice Routing (nanodevice_routing)
+
+Multi-window EBL routing: place bonding pads around the field perimeter, then run two-pass routing (inner fine + outer coarse + boundary patches) to connect device contacts to pads.
+
+### Scripts
+
+#### place_pads.py
+
+```bash
+python skills/nanodevice_routing/scripts/place_pads.py \
+    --field 2000 --pad-size 80 --pads-per-edge 12 [--layer 2/0] [--margin 60]
+```
+
+Places bonding pads around the EBL write-field perimeter and drops pin markers on a companion layer for the router.
+
+#### route_multiwindow.py
+
+```bash
+python skills/nanodevice_routing/scripts/route_multiwindow.py \
+    --pin-contacts 100/0 --pin-pads 101/0 \
+    --inner-window 800 --outer-window 2000 \
+    --inner-width 0.5 --outer-width 1.0 \
+    --inner-layer 3/0 --outer-layer 4/0 --patch-layer 5/0 \
+    --obstacle-layers 1/0
+```
+
+Two-pass router: contacts → boundary (fine), boundary patches, boundary → pads (coarse).
+
+#### clear_routes.py
+
+```bash
+python skills/nanodevice_routing/scripts/clear_routes.py 3/0 4/0 5/0
+```
+
+Removes shapes from the listed layers so you can re-route without touching device geometry.
+
+### Dependencies
+
+- `numpy`, `scipy`, `scikit-image` — backing `auto_route` subprocess
+- Conda env: `instrMCPdev`
+
+### Full Documentation
+
+See `skills/nanodevice_routing/SKILL.md` for the multi-window workflow, the `python_path` fallback for hosts without `instrMCPdev`, and manual-route fallbacks for pairs `auto_route` can't solve.
 
 ---
 
@@ -447,8 +495,8 @@ This is a pure-text orchestrator skill with no scripts directory. The agent disp
 2. PREPARE — run flake detection + GDS alignment (optional, only if microscope images provided)
 3. ANALYZE — study material regions, compute overlaps/exclusions
 4. DESIGN — create device geometry via `execute_script`
-5. ROUTE — connect contacts to bonding pads via `auto_route`
-6. EVALUATE — run configurable evaluator with device-appropriate checks
+5. ROUTE — connect contacts to bonding pads via `auto_route`; for dense layouts start with `dry_run=true` and re-call with `pin_pairs_override` when Hungarian matching assigns pins wrongly. Inspect each route with `route_inspect` to surface crossings.
+6. EVALUATE — run configurable evaluator with device-appropriate checks. Newer primitives worth knowing: `bulk_containment`, `arm_material_class`, `material_overlap_report`. The response's `next_step_suggestion` names the specific follow-up tool for any check scoring below 0.8.
 7. SAVE — export GDS + write result.json
 
 Steps are conditional: QUERY is skipped if all info is provided, PREPARE is skipped if no images are given, ROUTE is skipped if the device has no external contacts.
@@ -461,17 +509,10 @@ See `skills/nanodevice_e2e_design/SKILL.md` for the complete methodology, gate c
 
 ## Tests
 
-### test_visual.py
+The canonical test suites live at the repo root in `tests/`:
 
-End-to-end test for the visual capture workflow.
+- `tests/test_phase*.py` — pytest-based functional tests (phase 0-4). Run: `pytest -m mcp tests/`.
+- `tests/test_e2e_*.sh` — shell-driven E2E bundles (regression, alt-device, crossing_pairs, material_overlap, route_override, non-Hall-bar, heavy-script). Run: `bash tests/test_e2e_regression.sh` to sweep every phase sequentially.
+- `tests/test_connection.sh`, `tests/test_hallbar.sh`, `tests/test_autoroute.sh` — legacy single-purpose E2E scripts.
 
-```bash
-python plugins/klayoutclaw/tests/test_visual.py
-```
-
-Tests:
-1. `capture.py` with default paths — verifies GDS and PNG files are created with valid sizes
-2. `capture.py` with custom paths — verifies `--output`, `--gds`, `--dpi` flags work
-3. PNG validity — verifies the output has correct PNG magic bytes
-
-Requires KLayout running with KlayoutClaw plugin.
+All suites require KLayout running with the KlayoutClaw plugin at `127.0.0.1:8765`.

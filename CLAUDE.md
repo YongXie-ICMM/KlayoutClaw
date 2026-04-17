@@ -99,15 +99,17 @@ KlayoutClaw/
 │   ├── test_hallbar.sh           # E2E Hall bar test (Claude + tmux)
 │   └── test_autoroute.sh         # E2E autoroute test
 ├── docs/
-│   ├── tools.md                  # MCP tool reference (8 tools)
+│   ├── tools.md                  # MCP tool reference (10 tools)
 │   ├── skills.md                 # Skills CLI reference (geometry, display, image, visual, nanodevice_flakedetect, nanodevice_gdsalign, nanodevice_routing, nanodevice_e2e_design)
 │   ├── ui-plugin.md              # UI plugin architecture + pya Qt pitfalls
-│   └── plans/                    # Architecture design docs
-│       ├── 2026-03-08-qtcpserver-mcp-design.md
-│       ├── 2026-03-08-ui-plugin-design.md
-│       ├── 2026-03-08-ui-plugin-impl.md
-│       ├── 2026-03-08-autorouter-design.md
-│       └── 2026-03-08-autorouter-impl.md
+│   ├── plans/                    # Architecture design docs
+│   │   ├── 2026-03-08-qtcpserver-mcp-design.md
+│   │   ├── 2026-03-08-ui-plugin-design.md
+│   │   ├── 2026-03-08-ui-plugin-impl.md
+│   │   ├── 2026-03-08-autorouter-design.md
+│   │   └── 2026-03-08-autorouter-impl.md
+│   ├── 2026-04-17-benchmark-review-update.md  # 2026-04-14/15 benchmark-review fix report
+│   └── superpowers/plans/2026-04-17-benchmark-review-fixes.md  # Fix plan (TRD)
 ├── .claude-plugin/
 │   ├── plugin.json               # Claude Code plugin manifest
 │   └── marketplace.json          # Claude Code marketplace catalog
@@ -137,6 +139,7 @@ See `docs/tools.md` for full parameter schemas.
 - `pya.QTcpServer` on Qt main thread — no Python threads, no GIL issues
 - MCP server itself has no external dependencies — only stdlib + pya
 - `auto_route` tool spawns a subprocess for heavy computation (numpy/scipy/scikit-image in conda env `instrMCPdev`)
+- `evaluate_design` tool spawns a subprocess in the same `instrMCPdev` env (gdstk + shapely + numpy)
 - JSON-RPC 2.0 over HTTP (plain JSON, no SSE)
 - All pya calls execute on the main thread directly
 - See `docs/plans/` for design decisions and the GIL/threading problem

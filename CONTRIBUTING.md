@@ -27,14 +27,15 @@ python tests/test_connection.py
 # Protocol-level connection test
 python tests/test_connection.py
 
-# Hall bar creation + structural eval
-python tests/create_hallbar.py /tmp/hallbar.gds
-python tests/evaluate_gds.py /tmp/hallbar.gds
+# Functional MCP tests (phase 0-4)
+pytest -m mcp tests/ -v
 
-# Autoroute test (needs conda env instrMCPdev)
+# Full phase-by-phase E2E regression (every phase sequentially)
+bash tests/test_e2e_regression.sh
+
+# Autoroute / Hall bar / connection E2E (individual)
 bash tests/test_autoroute.sh
-
-# Full E2E (installs plugin, launches KLayout, tests connection)
+bash tests/test_hallbar.sh
 bash tests/test_connection.sh
 ```
 
@@ -43,6 +44,7 @@ bash tests/test_connection.sh
 - **`pya.QTcpServer`** on Qt main thread — no Python threads, no GIL issues
 - **No external dependencies** for the server — only Python stdlib + pya
 - **`auto_route`** spawns a subprocess for heavy computation (numpy/scipy/scikit-image in conda env `instrMCPdev`)
+- **`evaluate_design`** also spawns a subprocess in `instrMCPdev` (gdstk + shapely + numpy)
 - **JSON-RPC 2.0** over HTTP (plain JSON, no SSE)
 - `.lym` XML: escape `<` `>` `&` as `&lt;` `&gt;` `&amp;` in Python code
 

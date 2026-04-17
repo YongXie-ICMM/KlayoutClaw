@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="KLayout_Claw.PNG" alt="KlayoutClaw" width="640">
+</p>
+
 # KlayoutClaw
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -12,11 +16,17 @@ Built for device physicists working on 2D material devices, superconducting qubi
 
 ![Demo](docs/demo.gif)
 
-### Real Sample Nanodevice Demo
+### Full End-to-End Demo
 
-Full nanodevice fabrication pipeline on a real van der Waals heterostructure sample: load a GDS template, overlay flake detection results from the `flakedetect` and `gdsalign` pipelines, generate a 8 pin Hall bar, and route 11 pins to bonding pads using multi-window routing.
+A full autonomous run of the nanodevice fabrication pipeline on a real van der Waals heterostructure sample: load a GDS template, overlay flake detection results from the `flakedetect` and `gdsalign` pipelines, generate a Hall bar, and route every pin to bonding pads using multi-window routing — all driven by one agent prompt.
 
-![Real Sample Demo](docs/ml08_demo.gif)
+<p align="center">
+  <video src="docs/Demo.mp4" controls width="720">
+    Your browser does not support inline video playback.
+  </video>
+</p>
+
+> Not rendering inline on your client? [Download `docs/Demo.mp4`](docs/Demo.mp4) (~13 MB) or watch it via the [GitHub file view](docs/Demo.mp4).
 
 ## What's Inside
 
@@ -24,8 +34,8 @@ KlayoutClaw has three layers:
 
 | Layer | What it does |
 |-------|-------------|
-| **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 9 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs, evaluate designs, validate pixel size, close layout tabs. Zero external dependencies. |
-| **Skills** | Claude Code plugin with 7 skills — geometry, display, visual, image, and 3 nanodevice pipelines (flakedetect, gdsalign, routing). Claude loads them automatically when relevant. |
+| **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 10 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs, inspect route metadata, evaluate designs, validate pixel size, close layout tabs. Zero external dependencies. |
+| **Skills** | Claude Code plugin with 9 skills — geometry, display, visual, image, klayout_gds_import, and 4 nanodevice skills (flakedetect, gdsalign, routing, e2e_design). Claude loads them automatically when relevant. |
 | **Tools** | Standalone utilities — GDS-to-PNG converter, subprocess routing engine. Used by the MCP server and skills internally. |
 
 ```
@@ -68,8 +78,9 @@ python tests/test_connection.py
 | `save_layout` | Save layout as GDS2 or OASIS |
 | `get_layout_info` | Get layout summary (cells, layers, dbu/um bboxes) |
 | `screenshot` | Capture viewport as PNG, optional `zoom_box` in µm |
-| `auto_route` | Autoroute connections between pin pairs (configurable `timeout`, `obs_damping_step`) |
-| `evaluate_design` | Evaluate device design against configurable geometric checks (subprocess) |
+| `auto_route` | Autoroute pin pairs (Hungarian + Dijkstra). Supports `dry_run` preview, `pin_pairs_override` for manual pairing, `per_pair_obstacle_layers`, `auto_map_resolution` |
+| `route_inspect` | Per-route metadata (contact, pad, length, crossings) on a given layer; `route_id` cross-refs `evaluate_design.crossing_pairs` |
+| `evaluate_design` | Evaluate device design against configurable check primitives (`bulk_containment`, `arm_material_class`, `material_overlap_report`, `contact_isolation`, `connectivity`, `route_endpoints`, …) with `next_step_suggestion` hints |
 | `validate_pixel_size` | Validate microscope pixel size against known objective mappings |
 | `close_layout_view` | Close layout tabs by index or mode (current/others/all) — server health |
 
@@ -77,7 +88,9 @@ python tests/test_connection.py
 
 ### Autorouter
 
-`auto_route` automatically connects pin pairs using Hungarian matching and cost-based pathfinding. It runs as a subprocess with numpy/scipy/scikit-image, supporting obstacle avoidance, configurable path spacing, and graduated damping cost fields. See [docs/tools.md](docs/tools.md) for tuning parameters.
+`auto_route` automatically connects pin pairs using Hungarian matching and cost-based pathfinding. It runs as a subprocess with numpy/scipy/scikit-image, supporting obstacle avoidance, configurable path spacing, and graduated damping cost fields.
+
+For dense layouts where Hungarian matching assigns pins the wrong way, call `auto_route(dry_run=true)` first to see the `pairs[]` assignment, then re-call with `pin_pairs_override=[[a_idx, b_idx], ...]` to force the correct pairing. See [docs/tools.md](docs/tools.md) for tuning parameters.
 
 ### Example: Create a rectangle via MCP
 
@@ -109,6 +122,35 @@ result = {"status": "ok", "shape": "rectangle"}
 mcp("tools/call", {"name": "save_layout",
     "arguments": {"filepath": "/tmp/example.gds"}}, 4)
 ```
+
+## Dependencies & Conda Environment
+
+The MCP server itself has **zero external dependencies** — Python stdlib + KLayout's bundled `pya` only. The server runs inside KLayout's Python, so you don't need to install anything extra just to talk to it.
+
+The subprocess tools (`auto_route`, `evaluate_design`) and the nanodevice skill scripts (flakedetect, gdsalign, routing) do need a standard scientific Python stack. We recommend creating a dedicated conda env named **`instrMCPdev`** — both MCP tools default to this env name, and every skill's SKILL.md references it. Portable one-liner:
+
+```bash
+conda create -n instrMCPdev python=3.11 -y
+conda activate instrMCPdev
+
+pip install \
+    numpy scipy \
+    scikit-image scikit-learn \
+    opencv-python-headless \
+    gdstk shapely \
+    matplotlib \
+    klayout==0.30.3
+```
+
+| Tool / skill family | Imports (subprocess) |
+|----|----|
+| `auto_route` → `tools/route_worker.py` | numpy, scipy, scikit-image, klayout |
+| `evaluate_design` → `tools/evaluate_worker.py` | gdstk, shapely, numpy |
+| `visual` → `tools/gds_to_image.py` | gdstk, matplotlib, numpy |
+| `nanodevice_flakedetect*` | opencv-python-headless, numpy, scipy, scikit-learn, shapely |
+| `nanodevice_gdsalign` | gdstk, opencv-python-headless, numpy, scipy |
+
+If you already have these packages in a differently-named env, pass `python_path=/path/to/your/envs/<name>/bin/python` when calling `auto_route` or `evaluate_design` — that bypasses conda activation entirely.
 
 ## Using with Claude Code
 
@@ -150,9 +192,11 @@ claude --plugin-dir ./path/to/KlayoutClaw
 | `display` | `/klayoutclaw:display` | Toggle layer visibility, show/hide layers |
 | `visual` | `/klayoutclaw:visual` | Capture layout as PNG for visual inspection |
 | `image` | `/klayoutclaw:image` | Load reference images (microscope, SEM) as background overlay |
+| `klayout_gds_import` | -- | Safe GDS import (flattens + merges top cells, avoids `Layout.read()` pitfalls) |
 | `nanodevice:flakedetect` | -- | Detect vdW heterostructure material boundaries (hBN, graphene, graphite) from optical images |
 | `nanodevice:gdsalign` | -- | Align GDS templates to microscope images using lithographic marker detection |
 | `nanodevice:routing` | -- | Place bonding pads and autoroute connections between device features |
+| `nanodevice:e2e_design` | -- | Device-agnostic end-to-end orchestrator (QUERY → PREPARE → ANALYZE → DESIGN → ROUTE → EVALUATE → SAVE) |
 
 Claude loads these skills automatically when relevant (e.g., "draw a rectangle" triggers the geometry skill).
 
@@ -201,13 +245,25 @@ KlayoutClaw/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
 │   ├── capture_demo.py           # Simple Hall bar demo capture script
 │   ├── capture_ml08_demo.py      # ML08 nanodevice demo
-│   └── route_worker.py           # Subprocess routing engine
+│   ├── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
+│   └── evaluate_worker.py        # Subprocess design evaluator (gdstk/shapely/numpy)
 ├── tests/
 │   ├── test_connection.py        # Protocol-level MCP test
-│   ├── test_connection.sh        # E2E connection test
-│   ├── test_flakedetect.py       # Flakedetect pipeline tests
-│   ├── test_gdsalign.py          # GDS alignment tests (12 tests)
-│   ├── test_utf8_body_corruption.py  # UTF-8 body corruption regression test
+│   ├── test_connection.sh        # E2E connection test (install + launch + verify)
+│   ├── test_phase0_func.py       # Phase 0: connection + geometry functional
+│   ├── test_phase0_mcp.py        # Phase 0: MCP protocol
+│   ├── test_phase1_mcp.py        # Phase 1: LYM server MCP
+│   ├── test_phase1_worker.py     # Phase 1: route/evaluate worker
+│   ├── test_phase2_phase3_func.py # Phase 2-3: skills + flakedetect
+│   ├── test_phase4_docs_integration.py # Phase 4: docs integration
+│   ├── test_phase4_mcp.py        # Phase 4: GDS alignment + routing MCP
+│   ├── test_e2e_regression.sh    # Full phase-by-phase E2E regression bundle
+│   ├── test_e2e_alt_device.sh    # Alt-device full pipeline (de-overfit guard)
+│   ├── test_e2e_crossing_pairs.sh # crossing_pairs end-to-end
+│   ├── test_e2e_material_overlap.sh # material_overlap_report end-to-end
+│   ├── test_e2e_route_override.sh # pin_pairs_override end-to-end
+│   ├── test_e2e_non_hallbar.sh   # non-Hall-bar evaluate_design pipeline
+│   ├── test_e2e_heavy_script.sh  # execute_script heavy-state regression
 │   ├── create_hallbar.py         # Hall bar creation test
 │   ├── create_hallbar_unrouted.py # Unrouted Hall bar (autorouter input)
 │   ├── evaluate_gds.py           # Hall bar structural evaluation
@@ -218,8 +274,8 @@ KlayoutClaw/
 │   ├── graphene_for_test.jpg     # Graphene microscope image
 │   └── ml08/                     # ML08 sample data
 ├── docs/
-│   ├── tools.md                  # MCP tool reference (9 tools)
-│   ├── skills.md                 # Skills reference (7 skills)
+│   ├── tools.md                  # MCP tool reference (10 tools)
+│   ├── skills.md                 # Skills reference (9 skills)
 │   ├── ui-plugin.md              # UI plugin docs
 │   ├── plans/                    # Architecture design docs
 │   └── superpowers/              # Design specs and implementation plans
@@ -233,7 +289,8 @@ KlayoutClaw/
 - **`pya.QTcpServer`** on Qt main thread -- no Python threads, no GIL issues
 - **No external dependencies** for the server -- only Python stdlib + pya
 - **JSON-RPC 2.0** over HTTP (plain JSON, no SSE)
-- **`auto_route`** spawns a subprocess for heavy computation (numpy/scipy/scikit-image)
+- **`auto_route`** spawns a subprocess in the `instrMCPdev` conda env for heavy computation (numpy/scipy/scikit-image)
+- **`evaluate_design`** also spawns a subprocess in `instrMCPdev` (gdstk + shapely + numpy)
 - All pya calls execute on the main thread directly
 
 See [docs/plans/](docs/plans/) for design decisions and the threading problem that led to this architecture.
@@ -254,13 +311,16 @@ bash tests/test_autoroute.sh
 # Full E2E (installs plugin, launches KLayout, tests connection)
 bash tests/test_connection.sh
 
-# Nanodevice skill tests (requires test fixtures in tests_resources/)
-pytest tests/test_flakedetect.py tests/test_gdsalign.py -v
+# Phase-by-phase regression bundle (every phase E2E, sequential)
+bash tests/test_e2e_regression.sh
+
+# Functional MCP tests (requires KLayout + plugin running)
+pytest -m mcp tests/ -v
 ```
 
 ## Community
 
-Built for the device physics community. Interested in contributing? See [DEVELOPMENT.md](DEVELOPMENT.md) or contact **caidish1234@gmail.com**.
+Built for the device physics community. Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) or contact **caidish1234@gmail.com**.
 
 ## Acknowledgments
 
