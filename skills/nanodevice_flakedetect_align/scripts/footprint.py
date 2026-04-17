@@ -8,7 +8,7 @@ similarity to the source flake. GrabCut refines edges on the original
 color target image.
 
 Usage:
-    conda run -n base python footprint.py \
+    conda run -n instrMCPdev python footprint.py \
         --source <source_image> --target <target_image> \
         --bottom <bottom_part_image> \
         [--mirror] --pixel-size <um/px> --output-dir <path>

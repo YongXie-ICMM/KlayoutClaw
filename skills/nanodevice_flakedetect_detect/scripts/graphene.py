@@ -12,14 +12,14 @@ Two-pass workflow (same pattern as align sweep → refine):
 
 Usage:
     # First pass: auto-detect + save candidates for review
-    conda run -n base python graphene.py \
+    conda run -n instrMCPdev python graphene.py \
         --image <top_part.jpg> \
         --pixel-size <um/px> \
         [--mirror] \
         --output-dir <path>
 
     # Second pass: agent picks correct cluster after vision review
-    conda run -n base python graphene.py \
+    conda run -n instrMCPdev python graphene.py \
         --image <top_part.jpg> \
         --pixel-size <um/px> \
         [--mirror] \

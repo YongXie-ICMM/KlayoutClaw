@@ -6,7 +6,7 @@ auto-thresholding on both grayscale and saturation channels.
 Produces a contour and binary mask for use by sweep.py and refine.py.
 
 Usage:
-    conda run -n base python source_contour.py \
+    conda run -n instrMCPdev python source_contour.py \
         --image <source_image> [--mirror] --output-dir <path>
 """
 

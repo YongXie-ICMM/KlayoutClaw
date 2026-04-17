@@ -13,7 +13,7 @@ Transform rules:
   - top_hBN (full_stack):    pass through (= footprint)
 
 Usage:
-    conda run -n base python transform.py \
+    conda run -n instrMCPdev python transform.py \
         --detections detect/detections.json \
         --align-dir align/ \
         --image full_stack_raw.jpg \

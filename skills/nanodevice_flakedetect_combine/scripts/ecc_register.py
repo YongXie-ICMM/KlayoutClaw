@@ -8,7 +8,7 @@ with a translation-only motion model.
 Creates or initialises combine_report.json with the raw2lut section.
 
 Usage:
-    conda run -n base python ecc_register.py \
+    conda run -n instrMCPdev python ecc_register.py \
         --raw full_stack_raw.jpg \
         --lut full_stack_w_LUT.jpg \
         --output-dir /tmp/combine

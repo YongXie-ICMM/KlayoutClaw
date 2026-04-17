@@ -6,7 +6,7 @@ coloured contours on desaturated background images. For LUT overlays, reads
 the raw→LUT spatial shift from combine_report.json.
 
 Usage:
-    conda run -n base python overlay.py \
+    conda run -n instrMCPdev python overlay.py \
         --traces combine/traces.json \
         --raw full_stack_raw.jpg \
         --lut full_stack_w_LUT.jpg \

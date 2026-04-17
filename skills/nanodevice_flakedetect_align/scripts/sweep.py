@@ -8,7 +8,7 @@ Chamfer+containment cost function. Masks/contours are downsampled to
 agent to select the correct rotation.
 
 Usage:
-    conda run -n base python sweep.py \
+    conda run -n instrMCPdev python sweep.py \
         --source-contour <.npy> --source-mask <.png> \
         --footprint-contour <.npy> --footprint-mask <.png> \
         --target-image <image> --pixel-size <um/px> --output-dir <path>

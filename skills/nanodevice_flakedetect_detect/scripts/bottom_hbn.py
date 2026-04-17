@@ -6,7 +6,7 @@ is the only hBN visible on SiO2 substrate), then warps the detection into
 full_stack coordinates using the SIFT warp matrix from the align step.
 
 Usage:
-    conda run -n base python bottom_hbn.py \
+    conda run -n instrMCPdev python bottom_hbn.py \
         --image <bottom_part.jpg> \
         --warp-matrix <align/warp_sift_bottom.npy> \
         --target-image <full_stack_raw.jpg> \

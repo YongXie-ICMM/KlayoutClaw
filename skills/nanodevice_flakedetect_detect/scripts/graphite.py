@@ -13,13 +13,13 @@ Two-pass workflow (same pattern as graphene and align sweep):
 
 Usage:
     # First pass: auto-detect + save candidates for review
-    conda run -n base python graphite.py \
+    conda run -n instrMCPdev python graphite.py \
         --image <bottom_part.jpg> \
         --pixel-size <um/px> \
         --output-dir <path>
 
     # Second pass: agent picks correct cluster after vision review
-    conda run -n base python graphite.py \
+    conda run -n instrMCPdev python graphite.py \
         --image <bottom_part.jpg> \
         --pixel-size <um/px> \
         --cluster-id 0 \

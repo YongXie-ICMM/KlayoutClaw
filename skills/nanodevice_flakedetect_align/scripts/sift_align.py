@@ -11,7 +11,7 @@ Exit codes:
     2 — Too few matches (<20 inliers) — use Chamfer pipeline instead
 
 Usage:
-    conda run -n base python sift_align.py \
+    conda run -n instrMCPdev python sift_align.py \
         --source <image> --target <image> \
         --pixel-size <um/px> --output-dir <path>
 """

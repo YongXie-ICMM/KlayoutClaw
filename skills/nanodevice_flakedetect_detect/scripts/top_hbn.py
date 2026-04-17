@@ -6,7 +6,7 @@ footprint mask and contour, draws a diagnostic overlay, and produces
 the result sidecar JSON.
 
 Usage:
-    conda run -n base python top_hbn.py \
+    conda run -n instrMCPdev python top_hbn.py \
         --footprint-mask <align/footprint_mask.png> \
         [--footprint-contour <align/footprint_contour.npy>] \
         --image <full_stack_raw.jpg> \
