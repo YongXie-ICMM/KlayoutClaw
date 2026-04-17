@@ -259,6 +259,16 @@ TOOLS = [
                 "auto_map_resolution": {"type": "boolean", "description": "Override map_resolution by deriving from the smallest pin bbox edge across both pin layers (target: min_edge_um / 3, clamped to [0.2, 5.0]). Use on layouts with small contacts (~3x2 um) where the default 2.0 under-resolves. Default false.", "default": False},
                 "dry_run": {"type": "boolean", "description": "Preview Hungarian matching without committing routes. Returns status='dry_run' and a pairs[] array of assignments + distances so you can veto an obviously bad match before paying the pathfinding cost. Default false.", "default": False},
                 "per_pair_obstacle_layers": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Optional per-pair extra obstacle layers, unioned with obstacle_layers for that pair only. Length MUST equal len(pairs) after Hungarian matching — call with dry_run=true first to see the pair order. Example: [['13/0'], [], []] avoids graphite for pair 0, nothing extra for pairs 1-2."},
+                "pin_pairs_override": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 2,
+                        "maxItems": 2
+                    },
+                    "description": "Explicit [a_idx, b_idx] pairs overriding Hungarian matching. Length MUST equal min(n_pin_a, n_pin_b). Call with dry_run=true first to see the shape-iteration order. Use when Hungarian matches the wrong endpoints (e.g. dense layouts where two pairs would collide). If omitted, Hungarian matching + optional sort_pairs is used."
+                },
                 "conda_env": {"type": "string", "description": "Conda env with numpy+scipy+scikit-image. Default 'instrMCPdev'.", "default": "instrMCPdev"},
                 "python_path": {"type": "string", "description": "Explicit python binary path (overrides conda_env)."},
                 "obs_hardness": {"type": "number", "description": "Max cost at obstacle boundary (higher = paths stay further away). Default 20.", "default": 20.0},
@@ -679,6 +689,9 @@ def _tool_auto_route(args):
     per_pair_obstacle_layers = args.get("per_pair_obstacle_layers", None)
     if per_pair_obstacle_layers is not None and not isinstance(per_pair_obstacle_layers, list):
         raise ValueError("per_pair_obstacle_layers must be a list of lists of layer spec strings (or null/omitted).")
+    pin_pairs_override = args.get("pin_pairs_override", None)
+    if pin_pairs_override is not None and not isinstance(pin_pairs_override, list):
+        raise ValueError("pin_pairs_override must be a list of [a_idx, b_idx] pairs (or omitted).")
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_route_")
@@ -716,6 +729,8 @@ def _tool_auto_route(args):
     }
     if per_pair_obstacle_layers is not None:
         config["per_pair_obstacle_layers"] = per_pair_obstacle_layers
+    if pin_pairs_override is not None:
+        config["pin_pairs_override"] = pin_pairs_override
     with open(config_json, "w") as f:
         json.dump(config, f)
 

@@ -233,6 +233,20 @@ class TestDocsTools:
             "klayoutclaw_server.lym; evaluate_design schema must list it "
             "alongside bulk_containment / arm_material_class.")
 
+    def test_pin_pairs_override_in_auto_route_schema(self):
+        """auto_route's inputSchema must list pin_pairs_override as a valid
+        property so agents know it exists."""
+        lym_path = os.path.join(PROJECT_ROOT, "plugin", "klayoutclaw_server.lym")
+        with open(lym_path) as f:
+            src = f.read()
+        # Isolate the auto_route tool block (~2000 char window is enough)
+        import re
+        m = re.search(r'"name":\s*"auto_route"', src)
+        assert m, "auto_route tool block not found"
+        block = src[m.start():m.start() + 4000]
+        assert '"pin_pairs_override"' in block, (
+            "pin_pairs_override not declared in auto_route inputSchema")
+
     def test_tools_md_no_hallbar_default_layer_numbers_in_route_inspect(self):
         """The route_inspect parameter table in docs/tools.md must not show
         ['21/0'] / '2/0' as defaults. Those are the Hall-bar benchmark
