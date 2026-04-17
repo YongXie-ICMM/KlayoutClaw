@@ -409,7 +409,7 @@ Split into 5 sub-skills, each executed by a subagent:
 |-----------|---------|---------|
 | `align` | Register source images to full_stack coords | sift_align, source_contour, footprint, sweep, refine |
 | `detect` | Per-material segmentation | graphite, graphene, bottom_hbn, top_hbn |
-| `combine` | Coordinate transforms + overlays | ecc_register, transform, overlay |
+| `combine` | Coordinate transforms + overlays | ecc_register, transform, overlay, rank_candidate_pairs |
 | `commit` | Insert polygons into KLayout | (pure agent workflow, uses geometry skill) |
 | `review` | Visual validation protocol | (pure agent workflow, uses display skill) |
 

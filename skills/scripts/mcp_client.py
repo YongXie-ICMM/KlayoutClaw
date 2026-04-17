@@ -26,6 +26,15 @@ _DEFAULT_URL = "http://127.0.0.1:8765/mcp"
 # if the caller never explicitly calls load_mcp_config(). If the env var is
 # unset the default host.loopback URL is used, matching legacy behavior.
 MCP_URL = os.environ.get("KLAYOUT_MCP_URL") or _DEFAULT_URL
+
+# Default HTTP timeout for tool-invoking calls (execute_script, auto_route,
+# evaluate_design). 300s matches the evaluate_design subprocess cap in the
+# plugin. The OC ml14 benchmark showed the previous 30s default was too
+# short for geometry queries over layouts with 200+ shapes — the server
+# kept working but the client gave up early.
+# Initialize/list calls pass a shorter override; see _SHORT_TIMEOUT below.
+DEFAULT_TIMEOUT_SECONDS = 300
+_SHORT_TIMEOUT = 30  # for initialize / tools_list / healthcheck-style calls
 _req_id = 0
 _session_id = None
 
@@ -204,8 +213,13 @@ def load_mcp_config(config_path=None):
     return _DEFAULT_URL
 
 
-def mcp_call(method, params=None, timeout=30):
-    """Send a JSON-RPC 2.0 request to the MCP server."""
+def mcp_call(method, params=None, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Send a JSON-RPC 2.0 request to the MCP server.
+
+    Default timeout is :data:`DEFAULT_TIMEOUT_SECONDS` (300s). Short-running
+    calls (initialize, tools/list) should pass ``timeout=_SHORT_TIMEOUT`` so
+    connection failures surface quickly instead of hanging for 5 minutes.
+    """
     global _req_id, _session_id
     _req_id += 1
     payload = {"jsonrpc": "2.0", "id": _req_id, "method": method}
@@ -235,22 +249,31 @@ def mcp_call(method, params=None, timeout=30):
     return data
 
 
-def tool_call(tool_name, timeout=300, **kwargs):
+def tool_call(tool_name, timeout=DEFAULT_TIMEOUT_SECONDS, **kwargs):
     """Call an MCP tool and return parsed JSON result."""
     result = mcp_call("tools/call", {"name": tool_name, "arguments": kwargs}, timeout=timeout)
     text = result["result"]["content"][0]["text"]
     return json.loads(text)
 
 
-def execute_script(code):
-    """Execute Python/pya code in KLayout via execute_script tool."""
-    return tool_call("execute_script", code=code)
+def execute_script(code, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Execute Python/pya code in KLayout via execute_script tool.
+
+    ``timeout`` is the HTTP read deadline in seconds; defaults to
+    :data:`DEFAULT_TIMEOUT_SECONDS` (300). Raise for long-running geometry
+    scripts (e.g. iterating across hundreds of shapes).
+    """
+    return tool_call("execute_script", timeout=timeout, code=code)
 
 
 def init_session():
-    """Initialize MCP session (call once at start)."""
+    """Initialize MCP session (call once at start).
+
+    Uses the short timeout — if the server isn't reachable, we want to fail
+    fast rather than wait 5 minutes for the connection error to surface.
+    """
     mcp_call("initialize", {
         "protocolVersion": "2025-03-26",
         "capabilities": {},
         "clientInfo": {"name": "klayoutclaw-skill", "version": "0.3"},
-    })
+    }, timeout=_SHORT_TIMEOUT)

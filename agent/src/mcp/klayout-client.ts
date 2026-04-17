@@ -21,6 +21,15 @@ import { registerAllDomainTools } from "../tools/klayout/index.js";
 
 const KLAYOUT_PREFIX = "klayout";
 
+/**
+ * Default HTTP timeout for tool-invoking calls (execute_script, auto_route,
+ * evaluate_design). Matches the evaluate_design subprocess cap on the server
+ * side (300s) and the shared Python mcp_client's DEFAULT_TIMEOUT_SECONDS.
+ * Short RPC calls (initialize, listTools, healthCheck) use their own
+ * explicit shorter timeouts so connection failures still surface quickly.
+ */
+export const DEFAULT_TOOL_TIMEOUT_MS = 300_000;
+
 export interface KLayoutClientOptions {
   url: string;
   timeout?: number;
@@ -36,7 +45,7 @@ export class KLayoutMCPClient {
 
   constructor(opts: KLayoutClientOptions) {
     this.url = opts.url;
-    this.timeout = opts.timeout ?? 30000;
+    this.timeout = opts.timeout ?? DEFAULT_TOOL_TIMEOUT_MS;
   }
 
   get connected(): boolean {
@@ -95,11 +104,17 @@ export class KLayoutMCPClient {
    * Call a tool by its namespaced name.
    * Native tools are forwarded directly to MCP server.
    * Domain tools generate pya code and call execute_script.
+   *
+   * Optional ``timeoutMs`` overrides the client default for this single
+   * call only. Use for tool invocations that you know are slow (large
+   * geometry queries) without extending the timeout globally.
    */
   async callTool(
     namespacedName: string,
     args: Record<string, unknown>,
+    timeoutMs?: number,
   ): Promise<MCPToolResult> {
+    const effectiveTimeout = timeoutMs ?? this.timeout;
     // Routing: prefer exact lookup against the registered tool, fall back to
     // native-prefix detection. The old code split on the first `_` after the
     // `klayout_` prefix to derive the group, which breaks on multi-level
@@ -121,7 +136,7 @@ export class KLayoutMCPClient {
           domainTool.originalName,
           args,
           this.sessionId,
-          this.timeout,
+          effectiveTimeout,
         );
         this.sessionId = sessionId;
         return result;
@@ -137,7 +152,7 @@ export class KLayoutMCPClient {
         "execute_script",
         { code: pyaCode },
         this.sessionId,
-        this.timeout,
+        effectiveTimeout,
       );
       this.sessionId = sessionId;
       return result;
@@ -159,7 +174,7 @@ export class KLayoutMCPClient {
       toolName,
       args,
       this.sessionId,
-      this.timeout,
+      effectiveTimeout,
     );
     this.sessionId = sessionId;
     return result;

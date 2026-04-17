@@ -477,6 +477,113 @@ def _prim_spacing(out_lib, ref_lib, layer_map, args):
     return ok / total if total > 0 else 1.0
 
 
+def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
+    """Fraction of component area contained within a *bulk* region.
+
+    Distinct from component_containment: this check is meant to score the
+    Hall-bar-style "channel bulk" against the material overlap region,
+    without penalising arms that intentionally extend into single-material
+    zones.  Two ways to restrict the measurement to bulk-only geometry:
+
+    - Pass ``core_bbox: [x1, y1, x2, y2]`` (um) to clip the component to a
+      rectangular core before containment scoring — only the clipped portion
+      is evaluated.
+    - Pass ``bulk_region`` directly as a region expression (layer_map key or
+      list of keys), same semantics as ``component_containment``'s region
+      arg.  Default bulk region is the intersection of ``material_a`` and
+      ``material_b`` (default keys: "graphene" and "graphite"), matching
+      the overlap region used by Hall bar geometry.
+
+    Args:
+        component: component name (required)
+        bulk_region: region spec (optional; default: intersection of
+            material_a and material_b)
+        region_op: "union"/"intersection"/"difference" for multi-key
+            bulk_region (default: "union")
+        material_a: layer_map key (default "graphene") — only used when
+            bulk_region is not provided
+        material_b: layer_map key (default "graphite") — only used when
+            bulk_region is not provided
+        core_bbox: [x1, y1, x2, y2] in um (optional)
+    """
+    comp = _component_union(out_lib, layer_map, args["component"])
+    if comp.is_empty:
+        return 0.0
+
+    core_bbox = args.get("core_bbox")
+    if core_bbox is not None and len(core_bbox) == 4:
+        x1, y1, x2, y2 = core_bbox
+        core = sg.box(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        comp = comp.intersection(core)
+        if comp.is_empty:
+            return 0.0
+
+    if "bulk_region" in args:
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 args["bulk_region"],
+                                 args.get("region_op", "union"))
+    else:
+        mat_a = args.get("material_a", "graphene")
+        mat_b = args.get("material_b", "graphite")
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 [mat_a, mat_b], "intersection")
+
+    if region.is_empty:
+        return 0.0
+    return comp.intersection(region).area / comp.area
+
+
+def _prim_arm_material_class(out_lib, ref_lib, layer_map, args):
+    """Score arms/contacts by how cleanly they land in *exactly one* material class.
+
+    Each shape on the component layer (typically contact_patch or mesa arms)
+    is checked against a list of mutually-exclusive class regions (e.g.
+    graphene_only, graphite_only, overlap).  A shape "belongs to" a class
+    if >= ``containment_threshold`` of its area is inside that class region.
+    A shape scores 1.0 if it belongs to exactly one class, 0.0 if it
+    belongs to none or straddles multiple.
+
+    Args:
+        component: component name (required) — shapes are evaluated individually
+        classes: list of class dicts (required), each:
+            {"name": str,
+             "region": layer_map key or list of keys,
+             "region_op": "union" (default) / "intersection" / "difference"}
+        containment_threshold: float, default 0.9
+    """
+    shapes = _component_list(out_lib, layer_map, args["component"])
+    if not shapes:
+        return 0.0
+
+    classes_spec = args.get("classes")
+    if not isinstance(classes_spec, list) or not classes_spec:
+        return 0.0
+
+    threshold = float(args.get("containment_threshold", 0.9))
+
+    resolved_classes = []
+    for cls in classes_spec:
+        region = _resolve_region(out_lib, ref_lib, layer_map,
+                                 cls["region"],
+                                 cls.get("region_op", "union"))
+        resolved_classes.append(region)
+
+    ok = 0
+    for s in shapes:
+        if s.area <= 0:
+            continue
+        memberships = 0
+        for region in resolved_classes:
+            if region.is_empty:
+                continue
+            frac = s.intersection(region).area / s.area
+            if frac >= threshold:
+                memberships += 1
+        if memberships == 1:
+            ok += 1
+    return ok / len(shapes)
+
+
 # ---------------------------------------------------------------------------
 # Primitive registry
 # ---------------------------------------------------------------------------
@@ -484,6 +591,8 @@ def _prim_spacing(out_lib, ref_lib, layer_map, args):
 PRIMITIVES = {
     "component_overlap": _prim_component_overlap,
     "component_containment": _prim_component_containment,
+    "bulk_containment": _prim_bulk_containment,
+    "arm_material_class": _prim_arm_material_class,
     "contact_isolation": _prim_contact_isolation,
     "connectivity": _prim_connectivity,
     "route_endpoints": _prim_route_endpoints,
@@ -502,6 +611,55 @@ def _write_error(output_path, message):
     with open(output_path, "w") as f:
         json.dump(result, f)
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# next_step_suggestion builder
+# ---------------------------------------------------------------------------
+
+def _build_next_step(overall, results, empty_components):
+    """Emit a concise, static suggestion string for the agent.
+
+    The intent (per benchmark review) is NOT to parse result.json or validate
+    a schema — it is to nudge the agent back to the task instruction +
+    checklist whenever any check underperforms, and to name the specific
+    inspection tools relevant to the failing check.  The agent picks up the
+    hint and decides what to do.
+    """
+    if not results:
+        return ("No checks ran. Re-read the task instruction and the saved "
+                "checklist.md, then call evaluate_design with the "
+                "benchmark-specified layer_map and checks list.")
+
+    parts = []
+    low = [c for c in results if c.get("score", 0.0) < 0.8]
+
+    if overall >= 0.9 and not low:
+        parts.append("Overall score passes. Re-read the task instruction and "
+                     "checklist.md to confirm every benchmark requirement is "
+                     "met (mcp_feedback_* fields, result.json schema, etc.) "
+                     "before save.")
+    else:
+        parts.append("Re-read the task instruction and checklist.md. Verify "
+                     "the design addresses every requirement before the next "
+                     "iteration.")
+
+    names = {c["name"] for c in low}
+    if "contact_isolation" in names:
+        parts.append("For contact_isolation < 0.8: call route_inspect (route_layer + contact_layers + pad_layer) to see crossings with route IDs.")
+    if "component_containment" in names or "bulk_containment" in names:
+        parts.append("For containment < 0.8: call screenshot(zoom_box=...) on the mesa region to visually verify bulk placement, and consider bulk_containment (with core_bbox) instead of component_containment for Hall-bar-style arms.")
+    if "arm_material_class" in names:
+        parts.append("For arm_material_class < 0.8: the arms/contacts straddle material boundaries. Run screenshot over each ambiguous arm and re-check the contact classes against graphene_only / graphite_only / overlap.")
+    if "connectivity" in names or "route_endpoints" in names:
+        parts.append("For connectivity/route_endpoints < 0.8: call route_inspect then screenshot(zoom_box=...) over each unreached contact to spot broken routes or missing endpoints.")
+    if "adjacency" in names or "spacing" in names:
+        parts.append("For adjacency/spacing < 0.8: call screenshot(zoom_box=...) near the flagged components to inspect geometry.")
+
+    if empty_components:
+        parts.append("Warnings list empty components — either add geometry to those layers or drop the corresponding checks before re-running.")
+
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +772,7 @@ def main():
         "status": "ok",
         "overall": overall,
         "checks": results,
+        "next_step_suggestion": _build_next_step(overall, results, empty_components),
     }
     if empty_components:
         output["warnings"] = [

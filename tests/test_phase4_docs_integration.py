@@ -197,11 +197,17 @@ class TestDocsTools:
             "docs/tools.md must mention validate_pixel_size tool"
         )
 
-    def test_tool_count_9(self):
+    def test_tool_count_10(self):
         content = _read(DOCS_TOOLS)
-        # The tool summary line should say 9 tools
-        assert re.search(r'9\s*tools', content, re.IGNORECASE), (
-            "docs/tools.md must indicate 9 tools total"
+        # The tool summary line should say 10 tools (route_inspect added in P2)
+        assert re.search(r'10\s*tools', content, re.IGNORECASE), (
+            "docs/tools.md must indicate 10 tools total"
+        )
+
+    def test_mentions_route_inspect(self):
+        content = _read(DOCS_TOOLS)
+        assert "route_inspect" in content, (
+            "docs/tools.md must mention route_inspect tool"
         )
 
 
@@ -224,11 +230,18 @@ class TestDocsSkills:
 class TestClaudeMd:
     """CLAUDE.md must have updated tool count, new skills, and evaluate_worker."""
 
-    def test_tool_count_9(self):
+    def test_tool_count_10(self):
         content = _read(CLAUDE_MD)
-        # Must say "9 total" somewhere in the MCP Tools section
-        assert re.search(r'MCP\s+Tools\s*\(\s*9\s+total\s*\)', content, re.IGNORECASE), (
-            "CLAUDE.md must have 'MCP Tools (9 total)' header"
+        # Must say "10 total" somewhere in the MCP Tools section
+        # (route_inspect added in P2 of the 2026-04-14/15 benchmark review)
+        assert re.search(r'MCP\s+Tools\s*\(\s*10\s+total\s*\)', content, re.IGNORECASE), (
+            "CLAUDE.md must have 'MCP Tools (10 total)' header"
+        )
+
+    def test_claudemd_mentions_route_inspect(self):
+        content = _read(CLAUDE_MD)
+        assert "route_inspect" in content, (
+            "CLAUDE.md must mention route_inspect in the MCP Tools table"
         )
 
     def test_mentions_evaluate_worker(self):

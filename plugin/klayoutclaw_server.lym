@@ -244,27 +244,30 @@ TOOLS = [
     },
     {
         "name": "auto_route",
-        "description": "Automatically route connections between pin pairs. Uses Hungarian matching + cost-based pathfinding. Requires numpy/scipy/scikit-image in conda env.",
+        "description": "Route pin pairs between pin_layer_a and pin_layer_b using Hungarian matching + Dijkstra pathfinding. Inserts routed paths on output_layer. Returns status, routed_pairs, errors, map_resolution_um_used, and next_step_suggestion. Requires numpy/scipy/scikit-image in the conda env (default 'instrMCPdev').",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pin_layer_a": {"type": "string", "description": "Layer with start pins (e.g. '102/0')"},
-                "pin_layer_b": {"type": "string", "description": "Layer with end pins (e.g. '111/0')"},
-                "obstacle_layers": {"type": "array", "items": {"type": "string"}, "description": "Layers to avoid", "default": []},
-                "output_layer": {"type": "string", "description": "Layer for routed paths", "default": "10/0"},
-                "path_width": {"type": "number", "description": "Path width in microns", "default": 10.0},
-                "obs_safe_distance": {"type": "number", "description": "Min distance from obstacles in microns", "default": 5.0},
-                "path_safe_distance": {"type": "number", "description": "Min distance between paths in microns", "default": 5.0},
-                "map_resolution": {"type": "number", "description": "Grid resolution in microns", "default": 2.0},
-                "conda_env": {"type": "string", "description": "Conda env with routing deps", "default": "instrMCPdev"},
-                "python_path": {"type": "string", "description": "Path to python with routing deps (overrides conda_env)"},
-                "obs_hardness": {"type": "number", "description": "Max cost at obstacle boundary (higher = paths stay further away)", "default": 20.0},
-                "pin_safe_distance_a": {"type": "number", "description": "Avoidance halo around Pin A shapes in microns", "default": 5.0},
-                "pin_safe_distance_b": {"type": "number", "description": "Avoidance halo around Pin B shapes in microns", "default": 5.0},
-                "path_hardness": {"type": "number", "description": "Max cost near previously routed paths (higher = more spacing)", "default": 10.0},
-                "sort_pairs": {"type": "boolean", "description": "Route shortest pairs first (improves success rate)", "default": True},
-                "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds (default 120, max 600)"},
-                "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping step for graduated damping pathfinder (default 4, lower = stronger avoidance)"}
+                "pin_layer_a": {"type": "string", "description": "REQUIRED. Layer spec of start pins (e.g. '102/0' or '21/0')."},
+                "pin_layer_b": {"type": "string", "description": "REQUIRED. Layer spec of end pins (e.g. '111/0' or '2/0')."},
+                "obstacle_layers": {"type": "array", "items": {"type": "string"}, "description": "Global obstacle layers routes must avoid (applies to every pair). Example: ['20/0', '21/0', '22/0']. Default [].", "default": []},
+                "output_layer": {"type": "string", "description": "Layer spec for the routed path shapes. Default '10/0'.", "default": "10/0"},
+                "path_width": {"type": "number", "description": "Path width in um. Default 10.", "default": 10.0},
+                "obs_safe_distance": {"type": "number", "description": "Minimum distance from obstacles in um. Default 5.", "default": 5.0},
+                "path_safe_distance": {"type": "number", "description": "Minimum distance between routed paths in um. Default 5.", "default": 5.0},
+                "map_resolution": {"type": "number", "description": "Routing grid resolution in um. Smaller = finer but slower. Ignored if auto_map_resolution=true. Default 2.", "default": 2.0},
+                "auto_map_resolution": {"type": "boolean", "description": "Override map_resolution by deriving from the smallest pin bbox edge across both pin layers (target: min_edge_um / 3, clamped to [0.2, 5.0]). Use on layouts with small contacts (~3x2 um) where the default 2.0 under-resolves. Default false.", "default": False},
+                "dry_run": {"type": "boolean", "description": "Preview Hungarian matching without committing routes. Returns status='dry_run' and a pairs[] array of assignments + distances so you can veto an obviously bad match before paying the pathfinding cost. Default false.", "default": False},
+                "per_pair_obstacle_layers": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Optional per-pair extra obstacle layers, unioned with obstacle_layers for that pair only. Length MUST equal len(pairs) after Hungarian matching — call with dry_run=true first to see the pair order. Example: [['13/0'], [], []] avoids graphite for pair 0, nothing extra for pairs 1-2."},
+                "conda_env": {"type": "string", "description": "Conda env with numpy+scipy+scikit-image. Default 'instrMCPdev'.", "default": "instrMCPdev"},
+                "python_path": {"type": "string", "description": "Explicit python binary path (overrides conda_env)."},
+                "obs_hardness": {"type": "number", "description": "Max cost at obstacle boundary (higher = paths stay further away). Default 20.", "default": 20.0},
+                "pin_safe_distance_a": {"type": "number", "description": "Avoidance halo around Pin A shapes in um. Default 5.", "default": 5.0},
+                "pin_safe_distance_b": {"type": "number", "description": "Avoidance halo around Pin B shapes in um. Default 5.", "default": 5.0},
+                "path_hardness": {"type": "number", "description": "Max cost near previously routed paths (higher = more spacing). Default 10.", "default": 10.0},
+                "sort_pairs": {"type": "boolean", "description": "Route shortest pairs first. Improves success rate on dense layouts. Default true.", "default": True},
+                "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds. Clamped to [10, 600]. Default 120."},
+                "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping steps. Lower = stronger avoidance. Default 4."}
             },
             "required": ["pin_layer_a", "pin_layer_b"]
         }
@@ -284,33 +287,54 @@ TOOLS = [
     },
     {
         "name": "evaluate_design",
-        "description": "Evaluate a device design against configurable geometric quality checks. Returns per-check scores and weighted overall score (0-1).",
+        "description": "Score a device design against a list of geometric quality checks. Returns weighted overall score (0-1), per-check scores, diagnostic fields (e.g. crossing_pairs for contact_isolation), and a next_step_suggestion string pointing the agent at the inspection tools relevant to any failing check.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "checks": {
                     "type": "array",
-                    "description": "List of check objects. Each: {name, args, weight}. weight is 0-1 (all weights should sum to 1). Available primitives and their args:\n- component_overlap: {component, region, region_op?} — fraction of component area overlapping region\n- component_containment: {component, region, region_op?} — fraction of component area inside region\n- contact_isolation: {component?} — route crossing check with junction-aware detection and steep penalty (default component: contact_route)\n- connectivity: {contact_component?, pad_component?, route_component?, tolerance?} — fraction of contacts reaching a pad via routes (defaults: contact_patch, bonding_pad, contact_route, 15.0)\n- route_endpoints: {route_component?, target_components?, tolerance?} — fraction of route endpoints on valid targets (defaults: contact_route, [contact_patch, mesa, bonding_pad], 15.0)\n- adjacency: {component_a, component_b, tolerance?} — fraction of component_a shapes near component_b (default tolerance: 2.0)\n- solidity: {component, threshold?, direction?} — shape solidity score (default threshold: 0.5, direction: below)\n- spacing: {component_a, component_b?, min_distance?} — fraction of shape pairs meeting min distance (default: same component, 1.0)\nAll component/region values are keys in layer_map. region can be a string or list of strings; region_op: union (default) or intersection.",
+                    "description": "List of check objects; each has {name, args, weight}. weight \u2208 [0, 1] and all weights should sum to ~1.0 (re-normalised internally).",
                     "items": {
                         "type": "object",
+                        "description": "Available primitives (`name` field):\n\n- component_overlap {component, region, region_op?} \u2014 fraction of component area overlapping region. region is a layer_map key or list of keys; region_op \u2208 {union (default), intersection, difference}.\n- component_containment {component, region, region_op?} \u2014 fraction of component area inside region. Same region semantics as overlap.\n- bulk_containment {component, bulk_region?, region_op?, material_a?, material_b?, core_bbox?} \u2014 fraction of component area inside a bulk region. Use instead of component_containment for Hall-bar-style shapes where arms intentionally sit outside the overlap. If bulk_region omitted, defaults to intersection of material_a (default \"graphene\") and material_b (default \"graphite\"). Optional core_bbox=[x1,y1,x2,y2] in um clips the component to the channel core first.\n- arm_material_class {component, classes, containment_threshold?} \u2014 fraction of component shapes that fall entirely inside EXACTLY ONE class. classes is a list of {name, region, region_op?}; a shape belongs to a class if \u2265 containment_threshold (default 0.9) of its area lies inside that class's region. Scores 0 for shapes that are ambiguous or land in zero classes.\n- contact_isolation {component?} \u2014 junction-aware route-crossing check with steep penalty. Default component \"contact_route\". Response promotes crossing_pairs=[[i,j,area_um2], ...] to the check result.\n- connectivity {contact_component?, pad_component?, route_component?, tolerance?} \u2014 fraction of contacts reaching a pad via routes. Defaults: contact_patch, bonding_pad, contact_route, 15.0.\n- route_endpoints {route_component?, target_components?, tolerance?} \u2014 fraction of route endpoints on valid targets. Defaults: contact_route, [contact_patch, mesa, bonding_pad], 15.0.\n- adjacency {component_a, component_b, tolerance?} \u2014 fraction of component_a shapes near component_b (default tolerance 2.0).\n- solidity {component, threshold?, direction?} \u2014 shape solidity score vs threshold (default 0.5, below).\n- spacing {component_a, component_b?, min_distance?} \u2014 fraction of shape pairs meeting min distance (default: same component, 1.0).\n\nAll component / region / target_components values are keys in layer_map.",
                         "properties": {
-                            "name": {"type": "string"},
-                            "args": {"type": "object"},
-                            "weight": {"type": "number"}
+                            "name": {"type": "string", "description": "Primitive name \u2014 see the description above for the full registry."},
+                            "args": {"type": "object", "description": "Primitive-specific arguments. Required keys vary by primitive (see description)."},
+                            "weight": {"type": "number", "description": "Relative weight in [0, 1]."}
                         },
                         "required": ["name", "args", "weight"]
                     }
                 },
                 "layer_map": {
                     "type": "object",
-                    "description": "Map of component names to layer specs. Values can be [layer, datatype] (e.g. [20, 0]), {\"layer\": 20, \"datatype\": 0}, or a list of either for multi-layer components. Keys are referenced by check args (component, region, etc.).",
+                    "description": "Map of component name \u2192 layer spec. Accepted value shapes:\n  [20, 0]                         \u2014 single (layer, datatype) pair\n  {\"layer\": 20, \"datatype\": 0}    \u2014 dict form\n  [[20, 0], [3, 0]]                \u2014 list of pairs for multi-layer components\n  [{\"layer\": 3, \"datatype\": 0}, {\"layer\": 4, \"datatype\": 0}] \u2014 list of dicts\n\nKeys here are the ONLY names check args can reference. Unknown keys inside primitive args are silently ignored; missing layers score the check 0.0 (no crash).\n\nExample for a Hall bar benchmark:\n  {\"mesa\": [20, 0], \"contact_patch\": [21, 0], \"topgate\": [22, 0], \"contact_route\": [3, 0], \"bonding_pad\": [2, 0], \"graphene\": [11, 0], \"graphite\": [13, 0]}",
                     "additionalProperties": {}
                 },
-                "reference_gds": {"type": "string", "description": "Path to reference GDS (optional, for checks needing reference layers)"},
-                "python_path": {"type": "string", "description": "Path to python binary with gdstk/shapely/numpy (overrides conda_env)"},
-                "conda_env": {"type": "string", "default": "instrMCPdev", "description": "Conda environment with gdstk/shapely/numpy"}
+                "reference_gds": {"type": "string", "description": "Optional path to a reference GDS \u2014 only needed when a region references a layer that lives in the reference file rather than the current layout."},
+                "timeout": {"type": "number", "default": 300, "minimum": 60, "maximum": 900, "description": "Subprocess timeout in seconds (default 300, max 900). Raise this for layouts with hundreds of shapes."},
+                "python_path": {"type": "string", "description": "Path to python binary with gdstk/shapely/numpy (overrides conda_env)."},
+                "conda_env": {"type": "string", "default": "instrMCPdev", "description": "Conda environment name that has gdstk+shapely+numpy installed."}
             },
             "required": ["checks", "layer_map"]
+        }
+    },
+    {
+        "name": "route_inspect",
+        "description": "Inspect every route on a given layer and report (route_id, from_contact, to_pad, length_um, layer, endpoints_um) plus any pair crossings. route_id matches the indexing used by evaluate_design's contact_isolation.crossing_pairs so the two tools can be cross-referenced. Read-only \u2014 never modifies the layout.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "route_layer": {"type": "string", "description": "Layer spec of the routes to inspect (e.g. '3/0')."},
+                "contact_layers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Layer specs for contact patches that route endpoints may land on (default ['21/0']). Accepts a list or single string.",
+                    "default": ["21/0"]
+                },
+                "pad_layer": {"type": "string", "description": "Layer spec for bonding pads (default '2/0').", "default": "2/0"},
+                "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 5.0).", "default": 5.0}
+            },
+            "required": ["route_layer"]
         }
     },
     {
@@ -650,6 +674,13 @@ def _tool_auto_route(args):
     except (TypeError, ValueError):
         obs_damping_step = 4
 
+    # P4 additions
+    dry_run = bool(args.get("dry_run", False))
+    auto_map_resolution = bool(args.get("auto_map_resolution", False))
+    per_pair_obstacle_layers = args.get("per_pair_obstacle_layers", None)
+    if per_pair_obstacle_layers is not None and not isinstance(per_pair_obstacle_layers, list):
+        raise ValueError("per_pair_obstacle_layers must be a list of lists of layer spec strings (or null/omitted).")
+
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_route_")
     input_gds = os.path.join(tmp_dir, "input.gds")
@@ -681,7 +712,11 @@ def _tool_auto_route(args):
         "path_hardness": path_hardness,
         "sort_pairs": sort_pairs,
         "obs_damping_step": obs_damping_step,
+        "dry_run": dry_run,
+        "auto_map_resolution": auto_map_resolution,
     }
+    if per_pair_obstacle_layers is not None:
+        config["per_pair_obstacle_layers"] = per_pair_obstacle_layers
     with open(config_json, "w") as f:
         json.dump(config, f)
 
@@ -749,6 +784,33 @@ def _tool_auto_route(args):
         raise ValueError("route_worker.py ran but produced no output file. This usually means it crashed before writing results.\nstdout: {}\nstderr: {}".format(
             proc.stdout[:300], proc.stderr[:300]))
 
+    # Dry-run: route_worker returns status="dry_run" with pairs[] preview and
+    # no paths[]. Skip the insert loop and return the preview directly so the
+    # layout is untouched.
+    if result.get("status") == "dry_run":
+        try:
+            os.remove(input_gds)
+            os.remove(config_json)
+            os.remove(output_json)
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+        preview_pairs = result.get("pairs", [])
+        return json.dumps({
+            "status": "dry_run",
+            "routed_pairs": 0,
+            "total_pins_a": result.get("total_pins_a", 0),
+            "total_pins_b": result.get("total_pins_b", 0),
+            "pairs": preview_pairs,
+            "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
+            "errors": result.get("errors", []),
+            "next_step_suggestion": (
+                "dry_run preview: {} Hungarian assignments computed, no routes inserted. "
+                "Review the pairs[] array — if the matching looks good, call auto_route again with dry_run=false. "
+                "If a pair looks wrong, flag obstacles via per_pair_obstacle_layers[pair_idx] before the real run."
+            ).format(len(preview_pairs)),
+        })
+
     # Insert routed paths into layout
     ol_parts = output_layer.split("/")
     ol_num = int(ol_parts[0])
@@ -782,14 +844,297 @@ def _tool_auto_route(args):
     except Exception:
         pass
 
+    # Compose a next_step_suggestion pointing the agent at the inspection
+    # tools most relevant to the outcome. Static string — the intent is to
+    # nudge the agent, not to prescribe.
+    n_errors = len(result.get("errors", []))
+    status = result.get("status", "unknown")
+    total_pairs = min(result.get("total_pins_a", 0), result.get("total_pins_b", 0))
+    if status == "success" and n_errors == 0 and inserted == total_pairs:
+        next_step = ("Routes committed. Call screenshot (optionally with zoom_box over the device region) to visually verify, "
+                     "then route_inspect to map each route_id back to its contact/pad, "
+                     "and evaluate_design with contact_isolation to detect crossings.")
+    elif inserted &gt; 0:
+        next_step = ("Partial routing ({}/{} pairs). Call route_inspect to see which pairs succeeded, "
+                     "screenshot(zoom_box=...) over the unrouted region, and consider per_pair_obstacle_layers or a higher timeout for the retry.".format(inserted, total_pairs))
+    else:
+        next_step = ("No routes inserted. Re-check pin_layer_a / pin_layer_b have geometry via get_layout_info, "
+                     "try dry_run=True first to preview Hungarian matching, and consult the errors list.")
+
     return json.dumps({
-        "status": result.get("status", "unknown"),
+        "status": status,
         "routed_pairs": inserted,
         "total_pins_a": result.get("total_pins_a", 0),
         "total_pins_b": result.get("total_pins_b", 0),
         "output_layer": output_layer,
         "path_width_um": path_width,
+        "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
         "errors": result.get("errors", []),
+        "next_step_suggestion": next_step,
+    })
+
+
+def _iter_routes_on_layer(layer_num, datatype):
+    """Yield (route_id, endpoints_dbu, length_dbu, polygon) for every route-shaped
+    object on the given (layer, datatype). Handles both pya.Path shapes and
+    polygons (paths get converted to polygons via Region for crossing detection,
+    but spine endpoints are preserved from the Path for accuracy).
+
+    Returns a list of dicts, ordered stably: paths first (in shape-iteration
+    order), then polygons. route_id is the index into the returned list and
+    matches the indexing used by evaluate_design's contact_isolation
+    crossing_pairs — agents can cross-reference the two tools safely.
+    """
+    global _layout, _top_cell
+    layer_idx = _layout.layer(layer_num, datatype)
+    routes = []
+    # Single pass over recursive shapes so the indexing is stable for
+    # cross-tool reference (matches evaluate_worker order-of-iteration).
+    rsi = _top_cell.begin_shapes_rec(layer_idx)
+    while not rsi.at_end():
+        shape = rsi.shape()
+        try:
+            if shape.is_path():
+                path = shape.path
+                pts = list(path.each_point())
+                if len(pts) &gt;= 2:
+                    length_dbu = 0
+                    for i in range(len(pts) - 1):
+                        length_dbu += pts[i].distance(pts[i + 1])
+                    routes.append({
+                        "kind": "path",
+                        "endpoints_dbu": [(pts[0].x, pts[0].y), (pts[-1].x, pts[-1].y)],
+                        "length_dbu": length_dbu,
+                        "polygon": shape.polygon,  # pya.Polygon of the path outline
+                    })
+            elif shape.is_polygon() or shape.is_simple_polygon() or shape.is_box():
+                poly = shape.polygon
+                # For polygons, approximate endpoints as the two most distant
+                # vertices — matches evaluate_worker's fallback logic.
+                hull_pts = list(poly.each_point_hull())
+                if len(hull_pts) &gt;= 2:
+                    max_d = 0
+                    ep_a = hull_pts[0]
+                    ep_b = hull_pts[1]
+                    for i in range(len(hull_pts)):
+                        for j in range(i + 1, len(hull_pts)):
+                            d = hull_pts[i].distance(hull_pts[j])
+                            if d &gt; max_d:
+                                max_d = d
+                                ep_a = hull_pts[i]
+                                ep_b = hull_pts[j]
+                    routes.append({
+                        "kind": "polygon",
+                        "endpoints_dbu": [(ep_a.x, ep_a.y), (ep_b.x, ep_b.y)],
+                        "length_dbu": max_d,
+                        "polygon": poly,
+                    })
+        except Exception:
+            # Defensive: skip shapes we can't inspect rather than crash
+            pass
+        rsi.next()
+    return routes
+
+
+def _parse_layer_spec(spec):
+    """Parse 'L/DT' strings into (layer, datatype) ints. Returns None on failure."""
+    try:
+        parts = str(spec).split("/")
+        return (int(parts[0]), int(parts[1]) if len(parts) &gt; 1 else 0)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _tool_route_inspect(args):
+    """Report per-route metadata (contact, pad, length, crossings) for every
+    route on the given layer. Read-only — never modifies the layout.
+
+    route_id in the output matches the indexing used by evaluate_design's
+    contact_isolation.crossing_pairs, so agents can cross-reference the two
+    tools without re-deriving the order.
+    """
+    global _layout, _top_cell
+    _ensure_valid_handles()
+
+    route_spec = args.get("route_layer")
+    if not route_spec:
+        raise ValueError("route_layer is required (e.g. '3/0')")
+    rl = _parse_layer_spec(route_spec)
+    if rl is None:
+        raise ValueError("Invalid route_layer spec '{}'. Expected 'L/DT' (e.g. '3/0').".format(route_spec))
+
+    contact_specs = args.get("contact_layers", ["21/0"])
+    if isinstance(contact_specs, str):
+        contact_specs = [contact_specs]
+    pad_spec = args.get("pad_layer", "2/0")
+    tolerance_um = float(args.get("tolerance_um", 5.0))
+
+    dbu = _layout.dbu
+    tolerance_dbu = int(round(tolerance_um / dbu))
+
+    # Walk route shapes on route_layer
+    routes = _iter_routes_on_layer(rl[0], rl[1])
+
+    # Collect contact shapes per layer (with centroids) and build a flat list
+    contact_entries = []  # [{layer, shape_idx, centroid_um, region, bbox_dbu}, ...]
+    for cspec in contact_specs:
+        cl = _parse_layer_spec(cspec)
+        if cl is None:
+            continue
+        li = _layout.layer(cl[0], cl[1])
+        rsi = _top_cell.begin_shapes_rec(li)
+        idx = 0
+        while not rsi.at_end():
+            s = rsi.shape()
+            if not s.is_text():
+                try:
+                    poly = s.polygon
+                    bb = poly.bbox()
+                    cx_dbu = (bb.left + bb.right) / 2.0
+                    cy_dbu = (bb.bottom + bb.top) / 2.0
+                    contact_entries.append({
+                        "layer": cspec,
+                        "shape_idx": idx,
+                        "centroid_um": [round(cx_dbu * dbu, 4), round(cy_dbu * dbu, 4)],
+                        "centroid_dbu": (cx_dbu, cy_dbu),
+                        "region": pya.Region(poly),
+                    })
+                    idx += 1
+                except Exception:
+                    pass
+            rsi.next()
+
+    # Collect pad shapes
+    pad_entries = []
+    pl = _parse_layer_spec(pad_spec)
+    if pl is not None:
+        pli = _layout.layer(pl[0], pl[1])
+        rsi = _top_cell.begin_shapes_rec(pli)
+        idx = 0
+        while not rsi.at_end():
+            s = rsi.shape()
+            if not s.is_text():
+                try:
+                    poly = s.polygon
+                    bb = poly.bbox()
+                    cx_dbu = (bb.left + bb.right) / 2.0
+                    cy_dbu = (bb.bottom + bb.top) / 2.0
+                    pad_entries.append({
+                        "layer": pad_spec,
+                        "shape_idx": idx,
+                        "centroid_um": [round(cx_dbu * dbu, 4), round(cy_dbu * dbu, 4)],
+                        "centroid_dbu": (cx_dbu, cy_dbu),
+                        "region": pya.Region(poly),
+                    })
+                    idx += 1
+                except Exception:
+                    pass
+            rsi.next()
+
+    # Helper: find the closest shape to a given (x, y) in dbu, within tolerance
+    def _closest_shape(entries, ep_dbu, tolerance_dbu):
+        best = None
+        best_d = float("inf")
+        ex, ey = ep_dbu
+        for entry in entries:
+            cx, cy = entry["centroid_dbu"]
+            # Prefer point-in-region (endpoint actually lands on the shape)
+            pt_region = pya.Region(pya.Box(
+                int(ex) - tolerance_dbu, int(ey) - tolerance_dbu,
+                int(ex) + tolerance_dbu, int(ey) + tolerance_dbu,
+            ))
+            if not (entry["region"] &amp; pt_region).is_empty():
+                # Endpoint touches shape; use centroid distance as ranker
+                d = ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5
+                if d &lt; best_d:
+                    best_d = d
+                    best = entry
+        if best is not None:
+            return best
+        # Fallback: nearest centroid within tolerance
+        for entry in entries:
+            cx, cy = entry["centroid_dbu"]
+            d = ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5
+            if d &lt;= tolerance_dbu and d &lt; best_d:
+                best_d = d
+                best = entry
+        return best
+
+    # Per-route classification
+    out_routes = []
+    for ridx, r in enumerate(routes):
+        ep_a_dbu, ep_b_dbu = r["endpoints_dbu"]
+        contact_match = _closest_shape(contact_entries, ep_a_dbu, tolerance_dbu) or \
+                        _closest_shape(contact_entries, ep_b_dbu, tolerance_dbu)
+        pad_match = _closest_shape(pad_entries, ep_b_dbu, tolerance_dbu) or \
+                    _closest_shape(pad_entries, ep_a_dbu, tolerance_dbu)
+
+        from_contact = None
+        if contact_match is not None:
+            from_contact = {
+                "layer": contact_match["layer"],
+                "shape_idx": contact_match["shape_idx"],
+                "centroid_um": contact_match["centroid_um"],
+            }
+        to_pad = None
+        if pad_match is not None:
+            to_pad = {
+                "layer": pad_match["layer"],
+                "shape_idx": pad_match["shape_idx"],
+                "centroid_um": pad_match["centroid_um"],
+            }
+
+        out_routes.append({
+            "route_id": ridx,
+            "kind": r["kind"],
+            "layer": route_spec,
+            "length_um": round(r["length_dbu"] * dbu, 4),
+            "endpoints_um": [
+                [round(ep_a_dbu[0] * dbu, 4), round(ep_a_dbu[1] * dbu, 4)],
+                [round(ep_b_dbu[0] * dbu, 4), round(ep_b_dbu[1] * dbu, 4)],
+            ],
+            "from_contact": from_contact,
+            "to_pad": to_pad,
+        })
+
+    # Crossings among routes on this same layer (uses raw polygon areas — no
+    # junction filtering, so adjacent-at-endpoint shapes that touch mid-body
+    # will show up here; agents typically read this alongside
+    # evaluate_design's contact_isolation.crossing_pairs which applies the
+    # junction filter).
+    crossings = []
+    for i in range(len(routes)):
+        for j in range(i + 1, len(routes)):
+            inter = routes[i]["polygon"] &amp; routes[j]["polygon"] if hasattr(routes[i]["polygon"], "__and__") else None
+            if inter is None:
+                ri_reg = pya.Region(routes[i]["polygon"])
+                rj_reg = pya.Region(routes[j]["polygon"])
+                ov = ri_reg &amp; rj_reg
+            else:
+                ov = pya.Region(inter)
+            if ov.is_empty():
+                continue
+            area_um2 = round(ov.area() * dbu * dbu, 4)
+            if area_um2 &gt; 0.01:
+                crossings.append([i, j, area_um2])
+
+    # next_step_suggestion
+    n_unmapped = sum(1 for r in out_routes if r["from_contact"] is None or r["to_pad"] is None)
+    if crossings:
+        next_step = ("{} crossing(s) detected. Inspect crossing_pairs (route_idx_A, route_idx_B, overlap_um2) and call screenshot(zoom_box=...) over each pair. Consider re-running auto_route with narrower path_width, per_pair_obstacle_layers, or dry_run first.".format(len(crossings)))
+    elif n_unmapped:
+        next_step = ("{} route(s) are missing a contact or pad assignment (endpoints outside tolerance_um={}). Raise tolerance_um or check that pin_layer_a/b in the original auto_route call match the contact/pad layers you expected.".format(n_unmapped, tolerance_um))
+    else:
+        next_step = ("All {} routes mapped to contact + pad with no crossings. Run evaluate_design with contact_isolation + connectivity + route_endpoints to confirm full scoring.".format(len(out_routes)))
+
+    return json.dumps({
+        "status": "ok",
+        "route_layer": route_spec,
+        "num_routes": len(out_routes),
+        "routes": out_routes,
+        "crossings": crossings,
+        "crossing_pairs_format": "[route_idx_A, route_idx_B, overlap_um2]",
+        "next_step_suggestion": next_step,
     })
 
 
@@ -807,15 +1152,29 @@ def _tool_evaluate_design(args):
     python_path = args.get("python_path", None)
     conda_env = args.get("conda_env", "instrMCPdev")
 
+    # Clamp timeout to [60, 900] seconds (default 300)
+    try:
+        timeout_sec = float(args.get("timeout", 300))
+    except (TypeError, ValueError):
+        timeout_sec = 300.0
+    if timeout_sec &lt; 60:
+        timeout_sec = 60.0
+    elif timeout_sec &gt; 900:
+        timeout_sec = 900.0
+
     if checks is None or not isinstance(checks, list) or len(checks) == 0:
         raise ValueError("'checks' must be a non-empty list of check objects.")
 
     # Validate check structure before spawning subprocess
-    _known_primitives = ["component_overlap", "component_containment", "contact_isolation",
-                         "connectivity", "route_endpoints", "adjacency", "solidity", "spacing"]
+    _known_primitives = ["component_overlap", "component_containment",
+                         "bulk_containment", "arm_material_class",
+                         "contact_isolation", "connectivity", "route_endpoints",
+                         "adjacency", "solidity", "spacing"]
     _required_args = {
         "component_overlap": ["component", "region"],
         "component_containment": ["component", "region"],
+        "bulk_containment": ["component"],
+        "arm_material_class": ["component", "classes"],
         "contact_isolation": [],
         "connectivity": [],
         "route_endpoints": [],
@@ -931,10 +1290,10 @@ def _tool_evaluate_design(args):
         try:
             proc = subprocess.run(
                 ["bash", "-c", cmd],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=timeout_sec
             )
         except subprocess.TimeoutExpired:
-            raise ValueError("Evaluation timed out after 60 seconds.")
+            raise ValueError("Evaluation timed out after {} seconds. Layout may be too complex — raise the 'timeout' parameter (max 900) or reduce the number of checks.".format(int(timeout_sec)))
         except Exception as e:
             raise ValueError("Failed to run evaluate_worker.py: {}".format(e))
 
@@ -1211,6 +1570,7 @@ _TOOL_DISPATCH = {
     "get_layout_info": _tool_get_layout_info,
     "screenshot": _tool_screenshot,
     "auto_route": _tool_auto_route,
+    "route_inspect": _tool_route_inspect,
     "evaluate_design": _tool_evaluate_design,
     "validate_pixel_size": _tool_validate_pixel_size,
     "close_layout_view": _tool_close_layout_view,
