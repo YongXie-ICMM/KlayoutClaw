@@ -91,12 +91,21 @@ class TestBulkContainmentDefaults:
               "weight": 1.0}],
             {"channel_body": [30, 0]},
         )
-        if result["status"] == "ok":
-            check = result["checks"][0]
-            detail = check.get("detail", "") + " ".join(result.get("warnings", []))
-            assert ("bulk_region" in detail or "material" in detail), (
-                "bulk_containment silently scored without a bulk region — "
-                "overfit default likely still present. detail={!r}".format(detail))
+        assert result["status"] == "ok"
+        check = result["checks"][0]
+        # Error path: score MUST be 0.0 and detail MUST contain an ERROR marker.
+        assert check["score"] == 0.0, (
+            "bulk_containment returned non-zero score ({!r}) with neither "
+            "bulk_region nor materials passed. Did a default sneak back in?".format(
+                check["score"]))
+        detail = check.get("detail", "") + " ".join(result.get("warnings", []))
+        assert "ERROR" in detail, (
+            "Error path must surface 'ERROR' in detail so agents can distinguish "
+            "from genuine 0 overlap. Got: {!r}".format(detail))
+        # And the message must name both allowed arg names.
+        assert "bulk_region" in detail and ("material" in detail), (
+            "Error message must name both 'bulk_region' and 'materials'. "
+            "Got: {!r}".format(detail))
 
     def test_accepts_explicit_bulk_region(self, alt_layer_gds):
         """Passing bulk_region explicitly must work on a non-Hall-bar layout."""
