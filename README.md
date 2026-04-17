@@ -26,26 +26,32 @@ https://github.com/user-attachments/assets/8d615606-082a-4204-b7ef-fff0b4a1a830
 
 ## What's Inside
 
-KlayoutClaw has three layers:
+KlayoutClaw has four layers:
 
 | Layer | What it does |
 |-------|-------------|
 | **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 10 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs, inspect route metadata, evaluate designs, validate pixel size, close layout tabs. Zero external dependencies. |
 | **Skills** | Claude Code plugin with 9 skills — geometry, display, visual, image, klayout_gds_import, and 4 nanodevice skills (flakedetect, gdsalign, routing, e2e_design). Claude loads them automatically when relevant. |
+| **Qlaybot Agent** | Standalone TypeScript AI agent (`agent/`, v0.4.2) wrapping Pi-Agent SDK with its own KLayout MCP client (auto-launches KLayout on macOS/Linux/Windows). Interactive Ink/React TUI, 10 slash commands + interactive Config Panel, planning sandbox, role-based subagent delegation, categorized memory with FTS5 + optional vector search & reranker (4 search modes), 3-phase context compaction, background task support, and a JSON-RPC mode for integration / E2E testing. |
 | **Tools** | Standalone utilities — GDS-to-PNG converter, subprocess routing engine. Used by the MCP server and skills internally. |
 
 ```
-┌─────────────┐       HTTP/JSON-RPC        ┌─────────────────┐
-│  Claude /    │  ◄──────────────────────►  │  KLayout GUI    │
-│  Codex /     │    127.0.0.1:8765/mcp      │  + KlayoutClaw  │
-│  Any MCP     │                            │    plugin        │
-│  client      │                            │                  │
-└─────────────┘                            └─────────────────┘
-       │
-       │  Skills (Claude Code plugin)
-       │  geometry, display, visual, image,
-       │  nanodevice:{flakedetect, gdsalign, routing}
-       ▼
+  Any MCP client                              KLayout GUI
+  (Claude / Codex / …)                        + KlayoutClaw plugin
+┌──────────────────┐   HTTP/JSON-RPC 2.0   ┌──────────────────┐
+│                  │ ◄───────────────────► │                  │
+│  Claude Code     │   127.0.0.1:8765/mcp  │  pya.QTcpServer  │
+│  + Skills plugin │                       │  (Qt main thread) │
+│                  │                       │                  │
+└──────────────────┘                       └──────────────────┘
+
+  Qlaybot (agent/)                            KLayout GUI
+┌──────────────────┐   HTTP/JSON-RPC 2.0   ┌──────────────────┐
+│  Ink/React TUI   │ ◄───────────────────► │                  │
+│  Pi-Agent SDK    │   127.0.0.1:8765/mcp  │  pya.QTcpServer  │
+│  SQLite memory   │                       │  (Qt main thread) │
+│  Plan / Compact  │                       │                  │
+└──────────────────┘                       └──────────────────┘
 ```
 
 ## Quick Start
@@ -162,6 +168,125 @@ Then just ask Claude to create layouts:
 
 > "Create a Hall bar device with a 100x25um graphene channel, 6 side probes, metal contacts, and bonding pads. Save it as hallbar.gds."
 
+## Qlaybot Agent
+
+Qlaybot (`agent/`, v0.4.2) is a self-contained TypeScript AI agent that wraps the Pi-Agent SDK and ships its own KLayout MCP client (HTTP JSON-RPC on `127.0.0.1:8765`). It's the "batteries-included" way to drive KLayout — no external MCP client setup required.
+
+```bash
+cd agent
+npm install
+npm run build
+export ANTHROPIC_API_KEY=your_key_here
+npm start          # Interactive TUI
+```
+
+First run creates `~/.qlaybot/` (config + workspace + memory + sessions). Use `qlaybot onboard` to (re)initialize or `qlaybot uninstall` to remove it. Qlaybot auto-launches KLayout if the MCP port isn't answering (`open /Applications/klayout.app` on macOS, `start klayout` on Windows, `klayout &` on Linux), then polls with exponential backoff (1s → 2s → 4s → 8s).
+
+### CLI & modes
+
+```bash
+qlaybot                               # Interactive TUI (default)
+qlaybot -m "add a 100x25um rectangle" # Single-shot JSON mode
+qlaybot --mode rpc                    # JSON-RPC on stdin/stdout (integration / E2E)
+qlaybot --plain                       # Plain readline (no Ink)
+
+# Top-level flags
+--model <provider/modelId>            # Override default model
+--thinking <off|minimal|low|medium|high|xhigh>
+--cwd <path>                          # Working directory
+
+# Shell-mode subcommands (same names/args as TUI slash commands)
+qlaybot model [show|set|list]
+qlaybot mcp [status|tools|reconnect]
+qlaybot config [show|set|reset]
+qlaybot memory [show|search|clear]
+qlaybot compact [instructions]
+qlaybot tasks
+qlaybot onboard | uninstall | help
+```
+
+After `npm link`, `qlaybot` becomes a global CLI from any directory.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/model [show\|set\|list]` | Switch active model; persists to `config/model.json`. Bare `/model` opens the Config Panel on the Models tab. |
+| `/mcp [status\|tools\|reconnect]` | MCP server management. Bare `/mcp` opens the MCP tab of the Config Panel. |
+| `/config [show\|set <k> <v>\|reset\|setup]` | Persisted config management. Bare `/config` opens the Config Panel (Settings tab); `/config setup` re-runs the interactive setup wizard with a config backup. |
+| `/memory [show\|search <query>\|clear <category>]` | Memory inspection. Categories: `knowledge`, `procedures`, `preferences`, `log`. |
+| `/plan [enter\|exit\|status]` | Planning sandbox — restricts tools to a read-only allowlist while reasoning. |
+| `/compact [instructions]` | Trigger context compaction with KLayout-state preservation. |
+| `/tasks` | Background task status + cancel support. |
+| `/context` | Workspace file listing with live context-window usage. |
+| `/help [command]` | Help. |
+| `/exit` | Graceful shutdown (TUI only). |
+
+### Planning Mode
+
+`/plan` (or `/plan enter`) activates a sandbox that wraps every tool and rejects any call not on the allowlist. Currently allowed:
+
+- `read` (filesystem read)
+- `klayout_native_get_layout_info`
+- `klayout_native_screenshot`
+- `memory_save`, `memory_search`
+- `delegate` (subagent handoff)
+
+Everything else — `bash`, `write`, `edit`, `execute_script`, all geometry/display/image/nanodevice tools, `auto_route`, `save_layout`, … — returns a "blocked in plan mode" error until you run `/plan exit`.
+
+### Subagents & search
+
+- **Role-based subagents** (`src/subagent/`) with a `delegate` tool, per-role budgets (tokens + turns), concurrent execution, and a TUI inspector panel. Roles are defined in `config/settings.json` under `subagent.roles` and auto-inherit their parent's search mode.
+- **Hybrid search** (`src/memory/`) with 4 modes set via `/config set search.mode <mode>`:
+  - `fts5` (default, SQLite porter unicode61)
+  - `fts5+rerank` (Haiku cross-encoder rerank)
+  - `fts5+vector+rerank` (BM25 ∪ cosine, deduplicated, reranked)
+  - `vector+rerank` (pure embedding search)
+  - Embedding provider is any OpenAI-compatible endpoint, configured under `embedding.*`.
+
+### TUI Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+T` | Toggle tool detail + thinking expansion |
+| `Ctrl+W` | Toggle workspace panel |
+| `Ctrl+G` | Toggle background task panel |
+| `Ctrl+A` / `Ctrl+E` | Cursor to start / end of line |
+| `Ctrl+D` | Delete forward |
+| `↑/↓` | Command history / panel navigation |
+| `Tab` | Cycle command completion |
+| `Escape` | Abort agent / close panel |
+
+### RPC mode
+
+With `--mode rpc`, qlaybot speaks JSON-RPC 2.0 over stdin/stdout. Methods: `initialize`, `prompt`, `get_session_info` (returns `planMode`, `backgroundTasks`, `contextUsage`), `dispose`, `shutdown`. Events pushed to the client: `ready`, `prompt_start`, `content_delta`, `thinking`, `tool_use`, `tool_result`, `usage_update`, `error`. Slash commands work in RPC mode — `prompt` calls starting with `/` route to the CommandRegistry.
+
+### Config
+
+Runtime state lives at `~/.qlaybot/`:
+
+| Path | Purpose |
+|------|---------|
+| `config/model.json` | Default model + thinking level + provider definitions |
+| `config/mcp.json` | MCP server URLs, required flag, disabled tools |
+| `config/settings.json` | Memory budget, compaction thresholds, TUI prefs, search + embedding, subagent roles |
+| `auth.json`, `models.json` | Auth storage + model registry (written next to `config/`) |
+| `workspace/` | Domain knowledge (SOUL.md, TOOLS.md, RULES.md) + compaction prompt template + subagent templates |
+| `memory/` | Persistent categorized memory (knowledge / procedures / preferences / log) + SQLite FTS5 index |
+| `sessions/` | JSONL session + interaction history |
+
+### Testing
+
+```bash
+cd agent
+npm test                  # All tests (auto-skips E2E if env unavailable)
+npm run test:unit         # 588 unit tests across 12 files
+npm run test:integration  # 95 integration tests across 3 files
+npm run test:e2e          # 14 E2E tests (needs ANTHROPIC_API_KEY + KLayout)
+```
+
+**697 tests total / 16 files.** See [agent/README.md](agent/README.md) and [agent/CLAUDE.md](agent/CLAUDE.md) for the full reference.
+
 ## Skills (Claude Code Plugin)
 
 KlayoutClaw is also a Claude Code plugin. Install it to get skills that Claude invokes automatically:
@@ -189,10 +314,10 @@ claude --plugin-dir ./path/to/KlayoutClaw
 | `visual` | `/klayoutclaw:visual` | Capture layout as PNG for visual inspection |
 | `image` | `/klayoutclaw:image` | Load reference images (microscope, SEM) as background overlay |
 | `klayout_gds_import` | -- | Safe GDS import (flattens + merges top cells, avoids `Layout.read()` pitfalls) |
-| `nanodevice:flakedetect` | -- | Detect vdW heterostructure material boundaries (hBN, graphene, graphite) from optical images |
-| `nanodevice:gdsalign` | -- | Align GDS templates to microscope images using lithographic marker detection |
-| `nanodevice:routing` | -- | Place bonding pads and autoroute connections between device features |
-| `nanodevice:e2e_design` | -- | Device-agnostic end-to-end orchestrator (QUERY → PREPARE → ANALYZE → DESIGN → ROUTE → EVALUATE → SAVE) |
+| `nanodevice_flakedetect` | -- | Detect vdW heterostructure material boundaries (hBN, graphene, graphite) from optical images |
+| `nanodevice_gdsalign` | -- | Align GDS templates to microscope images using lithographic marker detection |
+| `nanodevice_routing` | -- | Place bonding pads and autoroute connections between device features |
+| `nanodevice_e2e_design` | -- | Device-agnostic end-to-end orchestrator (QUERY → PREPARE → ANALYZE → DESIGN → ROUTE → EVALUATE → SAVE) |
 
 Claude loads these skills automatically when relevant (e.g., "draw a rectangle" triggers the geometry skill).
 
@@ -227,6 +352,33 @@ KlayoutClaw/
 ├── plugin/
 │   ├── klayoutclaw_server.lym    # MCP server (v0.6)
 │   └── klayoutclaw_ui.lym        # UI panel + status bar
+├── agent/                        # qlaybot v0.4.2 — standalone TypeScript agent
+│   ├── src/
+│   │   ├── cli.ts                # Entry point (interactive / json / rpc / slash)
+│   │   ├── agent.ts              # createDesignSession(), 3-phase transformContext pipeline
+│   │   ├── config.ts             # QlayBotConfig + ~/.qlaybot layout + resolveModel
+│   │   ├── setup.ts              # Interactive setup wizard + config backup
+│   │   ├── rpc.ts                # JSON-RPC server (initialize / prompt / get_session_info / dispose / shutdown)
+│   │   ├── events.ts             # Session event subscribers
+│   │   ├── history.ts            # InteractionHistory (session JSONL)
+│   │   ├── context.ts            # Workspace context loader
+│   │   ├── commands/             # CommandRegistry + 10 command handlers
+│   │   ├── planning/             # PlanManager + sandbox tool wrapper (allowlist)
+│   │   ├── background/           # BackgroundTaskManager with cancel()
+│   │   ├── compaction/           # tool-result-pruner, state-extractor, state-loader, prompt-loader
+│   │   ├── subagent/             # Role resolver, runner, tool factory, transcript
+│   │   ├── mcp/                  # MCPManager + custom HTTP JSON-RPC client + transport
+│   │   ├── memory/               # MemoryManager (FTS5 + vector search + reranker + auto-recall)
+│   │   ├── prompts/              # System prompt builder (PromptMode.Full/…)
+│   │   ├── tools/                # Base tools + KLayout native + domain (geometry/display/image/visual/nanodevice)
+│   │   ├── tui/                  # Ink/React TUI (14 components + hooks + config panel + subagent panel)
+│   │   └── types/                # v0.4 contracts (search modes, config schemas, embedder types)
+│   ├── tests/                    # 697 tests: unit (588) / integration (95) / e2e (14)
+│   ├── workspace/                # Domain knowledge (SOUL, TOOLS, RULES) + compaction + subagent templates
+│   ├── package.json              # name: qlaybot, version: 0.4.2, bin: qlaybot
+│   ├── README.md                 # Qlaybot user reference
+│   ├── CLAUDE.md                 # Agent dev instructions
+│   └── TODO.md                   # v0.1 → v0.4 roadmap
 ├── skills/                       # Claude Code skills (auto-loaded)
 │   ├── scripts/mcp_client.py     # Shared MCP client
 │   ├── geometry/                 # Shape creation skills
@@ -239,8 +391,6 @@ KlayoutClaw/
 │   └── nanodevice_routing/      # Pad placement + autorouting
 ├── tools/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
-│   ├── capture_demo.py           # Simple Hall bar demo capture script
-│   ├── capture_ml08_demo.py      # ML08 nanodevice demo
 │   ├── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
 │   └── evaluate_worker.py        # Subprocess design evaluator (gdstk/shapely/numpy)
 ├── tests/
