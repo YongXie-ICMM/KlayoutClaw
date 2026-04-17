@@ -262,8 +262,8 @@ Report per-route metadata (contact, pad, length, crossings) for every route on a
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `route_layer` | string | yes | | Layer spec of the routes to inspect (e.g. "3/0"). |
-| `contact_layers` | string[] \| string | no | `["21/0"]` | Layer specs for contact patches that route endpoints may land on. Accepts a list or single string. |
-| `pad_layer` | string | no | `"2/0"` | Layer spec for bonding pads. |
+| `contact_layers` | string[] | **yes** | — | Layer specs for contact shapes route endpoints may land on. Must be a non-empty list; no default is assumed. |
+| `pad_layer` | string | **yes** | — | Layer spec for bonding pads. No default is assumed. |
 | `tolerance_um` | number | no | 5.0 | Endpoint-to-shape matching tolerance in microns. |
 
 **Returns:**
@@ -333,7 +333,7 @@ Evaluate a device design against configurable geometric quality checks. Runs `to
 **Available check primitives (10):**
 - `component_overlap` — fraction of component area overlapping with region
 - `component_containment` — fraction of component area contained within region
-- `bulk_containment` — fraction of component area inside a *bulk* region (use instead of `component_containment` for Hall-bar-style shapes where arms intentionally sit outside the overlap). Args: `{component, bulk_region?, region_op?, material_a?, material_b?, core_bbox?}`. If `bulk_region` is omitted, defaults to the intersection of `material_a` (default `"graphene"`) and `material_b` (default `"graphite"`). Optional `core_bbox=[x1,y1,x2,y2]` in um clips the component to the channel core first.
+- `bulk_containment` — fraction of component area inside a caller-declared bulk region. Use when the component has a core body plus peripherals that intentionally extend beyond the target region; `component_containment` would penalise that, `bulk_containment` does not. Args: `{component, bulk_region?, materials?, region_op?, core_bbox?}`. Pass **either** `bulk_region` (single layer_map key or list, combined via `region_op`) **or** `materials` (list of layer_map keys whose intersection defines the bulk). No default material names are assumed. Optional `core_bbox=[x1,y1,x2,y2]` in um clips the component to a rectangular core first.
 - `arm_material_class` — fraction of component shapes that fall entirely inside EXACTLY ONE class. Args: `{component, classes=[{name, region, region_op?}, ...], containment_threshold?}`. A shape belongs to a class if ≥ `containment_threshold` (default 0.9) of its area is inside that class's region. Shapes that straddle multiple classes or land in zero classes score 0.
 - `contact_isolation` — route crossing check with junction-aware detection and steep penalty curve
 - `connectivity` — fraction of contacts that reach a bonding pad
