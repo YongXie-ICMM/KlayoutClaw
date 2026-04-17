@@ -20,13 +20,9 @@ Built for device physicists working on 2D material devices, superconducting qubi
 
 A full autonomous run of the nanodevice fabrication pipeline on a real van der Waals heterostructure sample: load a GDS template, overlay flake detection results from the `flakedetect` and `gdsalign` pipelines, generate a Hall bar, and route every pin to bonding pads using multi-window routing — all driven by one agent prompt.
 
-<p align="center">
-  <video src="https://github.com/caidish/KlayoutClaw/releases/download/demo-assets/Demo.mp4" controls width="720">
-    Your browser does not support inline video playback.
-  </video>
-</p>
+https://github.com/user-attachments/assets/8d615606-082a-4204-b7ef-fff0b4a1a830
 
-> Video not rendering inline? Stream or download it from the [demo-assets release](https://github.com/caidish/KlayoutClaw/releases/tag/demo-assets), or grab the copy in [`docs/Demo.mp4`](docs/Demo.mp4) (~13 MB).
+> Video not rendering on your client? The uncompressed copy lives at [`docs/Demo.mp4`](docs/Demo.mp4).
 
 ## What's Inside
 
