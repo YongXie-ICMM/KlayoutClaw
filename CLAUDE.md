@@ -127,7 +127,7 @@ KlayoutClaw/
 | `screenshot` | Capture viewport as PNG (what the user sees) |
 | `auto_route` | Autoroute pin pairs (subprocess, needs conda env); supports dry_run preview, per_pair_obstacle_layers, auto_map_resolution |
 | `route_inspect` | Per-route metadata (contact/pad assignment, length, crossings) on a given layer; requires `route_layer`, `contact_layers`, `pad_layer` (no defaults). `route_id` aligns with `evaluate_design.contact_isolation.crossing_pairs`. |
-| `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess); includes `bulk_containment` + `arm_material_class` + `next_step_suggestion` |
+| `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess); includes `bulk_containment` + `arm_material_class` + `material_overlap_report` + `next_step_suggestion` |
 | `validate_pixel_size` | Validate pixel_size against known objectives |
 | `close_layout_view` | Close one or more layout tabs to keep the server healthy (modes: current/others/all, or by index) |
 

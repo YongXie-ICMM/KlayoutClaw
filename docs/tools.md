@@ -330,11 +330,12 @@ Evaluate a device design against configurable geometric quality checks. Runs `to
 
 **Per-check extras:** `contact_isolation` adds a `crossing_pairs` list with every detected mid-body short and a `crossing_pairs_format` legend line explaining the tuple layout. Other primitives return a plain score; `contact_isolation` uses a dict-return pattern that `main()` promotes to top-level fields.
 
-**Available check primitives (10):**
+**Available check primitives (11):**
 - `component_overlap` — fraction of component area overlapping with region
 - `component_containment` — fraction of component area contained within region
 - `bulk_containment` — fraction of component area inside a caller-declared bulk region. Use when the component has a core body plus peripherals that intentionally extend beyond the target region; `component_containment` would penalise that, `bulk_containment` does not. Args: `{component, bulk_region?, materials?, region_op?, core_bbox?}`. Pass **either** `bulk_region` (single layer_map key or list, combined via `region_op`) **or** `materials` (list of layer_map keys whose intersection defines the bulk). No default material names are assumed. Optional `core_bbox=[x1,y1,x2,y2]` in um clips the component to a rectangular core first.
 - `arm_material_class` — fraction of component shapes that fall entirely inside EXACTLY ONE class. Args: `{component, classes=[{name, region, region_op?}, ...], containment_threshold?}`. A shape belongs to a class if ≥ `containment_threshold` (default 0.9) of its area is inside that class's region. Shapes that straddle multiple classes or land in zero classes score 0.
+- `material_overlap_report` — compute pairwise and multi-way intersections of a set of material layers. Args: `{materials}`. `materials` is a list of ≥2 layer_map keys. Always scores 1.0; the report lives in the check's `report` side-data field: `{"<A>_only": {area_um2, bbox_um, centroid_um, num_polygons}, "<A>_and_<B>": {...}, ...}`. Use to replace the standard hand-rolled Region intersection code that every session ends up writing.
 - `contact_isolation` — route crossing check with junction-aware detection and steep penalty curve
 - `connectivity` — fraction of contacts that reach a bonding pad
 - `route_endpoints` — fraction of route endpoints on valid targets
