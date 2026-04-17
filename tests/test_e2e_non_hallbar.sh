@@ -8,7 +8,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MCP_URL="http://127.0.0.1:8765/mcp"
 GDS_FILE="/tmp/e2e_non_hallbar.gds"
 RESULT_JSON="/tmp/e2e_non_hallbar_result.json"
-TMUX_SESSION="e2e_non_hb"
+CLAUDE_LOG="/tmp/e2e_non_hb.log"
 MAX_WAIT_SEC=720  # 12 min cap
 
 echo "=== E2E: non-Hall-bar evaluate_design ==="
@@ -74,29 +74,54 @@ If any tool raises a schema error complaining about missing defaults,
 treat that as a test failure and print "E2E_FAIL: <msg>" instead.
 EOF
 
-tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-tmux new-session -d -s "$TMUX_SESSION" \
-    "claude --mcp-config '$PROJECT_DIR/mcp_config.json' --print \"$PROMPT\" 2>&1 | tee /tmp/e2e_non_hb.log"
-
-# 4. Wait for result.
-for ((i=0; i<MAX_WAIT_SEC; i+=5)); do
-    if grep -q "E2E_DONE\|E2E_FAIL" /tmp/e2e_non_hb.log 2>/dev/null; then
+# Run claude directly — no tmux. Redirect all output to the log so we can
+# grep it for the success / failure markers. macOS lacks `timeout`, so we
+# use a background+poll pattern to enforce the wall-clock cap portably.
+: > "$CLAUDE_LOG"   # truncate
+claude \
+    --mcp-config "$PROJECT_DIR/mcp_config.json" \
+    --dangerously-skip-permissions \
+    --print "$PROMPT" > "$CLAUDE_LOG" 2>&1 &
+CLAUDE_PID=$!
+TIMED_OUT=0
+for ((elapsed=0; elapsed<MAX_WAIT_SEC; elapsed+=5)); do
+    if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
         break
     fi
     sleep 5
 done
+if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill -9 "$CLAUDE_PID" 2>/dev/null || true
+    TIMED_OUT=1
+fi
+set +e
+wait "$CLAUDE_PID"
+CLAUDE_RC=$?
+set -e
 
-grep -q "E2E_FAIL" /tmp/e2e_non_hb.log && {
-    echo "FAIL: agent reported failure"
-    tail -40 /tmp/e2e_non_hb.log
+if [ "$TIMED_OUT" -eq 1 ]; then
+    echo "FAIL: claude timed out after ${MAX_WAIT_SEC}s"
+    tail -40 "$CLAUDE_LOG"
+    exit 3
+elif [ "$CLAUDE_RC" -ne 0 ]; then
+    echo "FAIL: claude exited rc=$CLAUDE_RC"
+    tail -40 "$CLAUDE_LOG"
+    exit 2
+fi
+
+grep -q "E2E_FAIL" "$CLAUDE_LOG" && {
+    echo "FAIL: agent reported E2E_FAIL"
+    tail -40 "$CLAUDE_LOG"
     exit 2
 }
-grep -q "E2E_DONE" /tmp/e2e_non_hb.log || {
-    echo "FAIL: timed out after ${MAX_WAIT_SEC}s"
+grep -q "E2E_DONE" "$CLAUDE_LOG" || {
+    echo "FAIL: agent did not emit E2E_DONE marker"
+    tail -40 "$CLAUDE_LOG"
     exit 3
 }
 test -f "$RESULT_JSON" || {
     echo "FAIL: result.json missing at $RESULT_JSON"
+    tail -40 "$CLAUDE_LOG"
     exit 4
 }
 
@@ -115,5 +140,4 @@ assert checks["bulk_containment"]["score"] > 0.0, (
 print("PASS: non-Hall-bar evaluate_design works; overall =", r["overall"])
 PY
 
-tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 echo "=== E2E: non-Hall-bar evaluate_design PASSED ==="
