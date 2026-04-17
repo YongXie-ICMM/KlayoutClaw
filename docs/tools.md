@@ -187,6 +187,7 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 | `auto_map_resolution` | bool | no | false | Override `map_resolution` by deriving from smallest pin bbox edge (target: edge_um / 3, clamped [0.2, 5.0]). Use on layouts with small contacts (~3×2 um). |
 | `dry_run` | bool | no | false | Preview Hungarian matching without committing routes. Returns `status="dry_run"` and a `pairs[]` array of assignments + straight-line distances. |
 | `per_pair_obstacle_layers` | string[][] | no | | Per-pair extra obstacle layers, unioned with `obstacle_layers` for that pair only. Length MUST equal `len(pairs)` after Hungarian matching — call with `dry_run=true` first to see pair order. |
+| `pin_pairs_override` | int[][] | no | | Explicit `[a_idx, b_idx]` pairs overriding Hungarian matching. Length MUST equal `min(n_pin_a, n_pin_b)`. Run with `dry_run=true` first to inspect the shape-iteration order. |
 | `conda_env` | string | no | "instrMCPdev" | Conda env with routing deps |
 | `python_path` | string | no | | Path to python binary (overrides conda_env) |
 | `timeout` | number | no | 120 | Subprocess timeout in seconds. Clamped to `[10, 600]` by the handler. |
@@ -239,6 +240,12 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 The `next_step_suggestion` field adapts to the outcome (success / partial / dry_run / no routes) and names the specific follow-up tools to run. It is advisory — not a programmatic schema validator.
 
 The `pairs[]` order from a dry_run matches the order `per_pair_obstacle_layers[pair_idx]` is interpreted against on the subsequent real run.
+
+**Manual pairing workflow:** When Hungarian matching assigns pins the wrong way (e.g. two pairs would need to cross through a narrow corridor):
+
+1. Call `auto_route(dry_run=true)` to see the Hungarian assignment as a `pairs[]` array.
+2. Read `pin_a_idx` / `pin_b_idx` per entry to identify the mismatch.
+3. Re-call `auto_route(pin_pairs_override=[[a_idx, b_idx], ...], dry_run=false)` with the corrected pairing. The override list must have length equal to the Hungarian pair count.
 
 **Algorithm:**
 1. Save current layout to temp GDS
