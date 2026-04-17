@@ -532,6 +532,90 @@ def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
     return comp.intersection(region).area / comp.area
 
 
+def _prim_material_overlap_report(out_lib, ref_lib, layer_map, args):
+    """Compute pairwise and multi-way intersections of a set of material
+    layers. Returns a dict with score=1.0 (always) plus a ``report`` side-
+    data field that main() promotes onto the check.
+
+    Args:
+        materials: list of layer_map keys (required, min 2).
+
+    Report schema, per region key:
+        {
+          "<key>": {
+              "area_um2": float,
+              "bbox_um": [x1, y1, x2, y2],
+              "centroid_um": [cx, cy],
+              "num_polygons": int
+          }
+        }
+
+    Region key naming:
+      - "<name>_only"         — that material minus the union of the others
+      - "<a>_and_<b>"         — pairwise intersection
+      - "<a>_and_<b>_and_<c>" — higher-order intersections
+    """
+    mats = args.get("materials")
+    if not isinstance(mats, list) or len(mats) < 2:
+        raise ValueError(
+            "material_overlap_report: 'materials' must be a list of at "
+            "least two layer_map keys (e.g. ['A', 'B']).")
+
+    # Resolve each material to its shapely region.
+    regions = {}
+    for key in mats:
+        regions[key] = _resolve_region(out_lib, ref_lib, layer_map, key, "union")
+
+    report = {}
+
+    def _summarize(region):
+        if region.is_empty:
+            return {"area_um2": 0.0, "bbox_um": [0.0, 0.0, 0.0, 0.0],
+                    "centroid_um": [0.0, 0.0], "num_polygons": 0}
+        minx, miny, maxx, maxy = region.bounds
+        c = region.centroid
+        try:
+            n = len(region.geoms) if hasattr(region, "geoms") else 1
+        except Exception:
+            n = 1
+        return {
+            "area_um2": round(float(region.area), 4),
+            "bbox_um": [round(float(minx), 4), round(float(miny), 4),
+                        round(float(maxx), 4), round(float(maxy), 4)],
+            "centroid_um": [round(float(c.x), 4), round(float(c.y), 4)],
+            "num_polygons": int(n),
+        }
+
+    # "<name>_only" regions: each material minus the union of the others.
+    for key in mats:
+        others = [regions[k] for k in mats if k != key]
+        if others:
+            others_union = others[0]
+            for r in others[1:]:
+                others_union = others_union.union(r)
+            only_r = regions[key].difference(others_union)
+        else:
+            only_r = regions[key]
+        report["{}_only".format(key)] = _summarize(only_r)
+
+    # Pairwise + higher-order intersections.
+    from itertools import combinations
+    for r_size in range(2, len(mats) + 1):
+        for combo in combinations(mats, r_size):
+            label = "_and_".join(combo)
+            inter = regions[combo[0]]
+            for k in combo[1:]:
+                inter = inter.intersection(regions[k])
+            report[label] = _summarize(inter)
+
+    return {
+        "score": 1.0,
+        "report": report,
+        "detail": "material_overlap_report: {} materials, {} regions".format(
+            len(mats), len(report)),
+    }
+
+
 def _prim_arm_material_class(out_lib, ref_lib, layer_map, args):
     """Score arms/contacts by how cleanly they land in *exactly one* material class.
 
@@ -592,6 +676,7 @@ PRIMITIVES = {
     "component_containment": _prim_component_containment,
     "bulk_containment": _prim_bulk_containment,
     "arm_material_class": _prim_arm_material_class,
+    "material_overlap_report": _prim_material_overlap_report,
     "contact_isolation": _prim_contact_isolation,
     "connectivity": _prim_connectivity,
     "route_endpoints": _prim_route_endpoints,
@@ -742,6 +827,7 @@ def main():
         args = check.get("args", {})
         weight = check.get("weight", 1.0 / len(checks))
         extra = None
+        raw = None
         try:
             raw = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
             # Primitives may return a plain float (score) or a dict
@@ -753,7 +839,10 @@ def main():
             else:
                 score = raw
             score = max(0.0, min(1.0, float(score)))
-            detail = "{}: {:.4f}".format(name, score)
+            if isinstance(raw, dict) and "detail" in raw:
+                detail = raw["detail"]
+            else:
+                detail = "{}: {:.4f}".format(name, score)
         except Exception as e:
             score = 0.0
             detail = "{}: ERROR — {}".format(name, e)
@@ -772,6 +861,9 @@ def main():
                     entry[k] = v
             else:
                 entry["extra"] = extra
+        # Promote top-level side-data fields from dict-returning primitives.
+        if isinstance(raw, dict) and "report" in raw:
+            entry["report"] = raw["report"]
         results.append(entry)
 
     # Compute overall score (weighted sum)
