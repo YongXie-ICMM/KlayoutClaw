@@ -349,6 +349,68 @@ export function ToolPanel({ tool, expanded, verbose = false }: ToolPanelProps) {
   const duration = formatDuration(tool);
   const durationSuffix = duration ? ` (${duration})` : "";
 
+  // Hooks MUST run unconditionally every render. Previously the useState +
+  // useLayoutEffect below lived AFTER the `if (!expanded) return` branch, so
+  // toggling Ctrl+T (expanded ↔ compact) changed the hook count and React
+  // threw "Rendered more hooks than during the previous render." Compute the
+  // image-block detection up front and run the hooks in every branch; the
+  // results are only consumed in the expanded branch's JSX.
+  const resultBlocks =
+    tool.status !== "running" && tool.result != null
+      ? extractContentBlocks(tool.result)
+      : [];
+  const hasImageBlock = resultBlocks.some((b) => b.type === "image");
+
+  const [fallbackPaths, setFallbackPaths] = useState<Map<number, string>>(() => {
+    const m = new Map<number, string>();
+    for (let i = 0; i < resultBlocks.length; i++) {
+      const b = resultBlocks[i];
+      if (b.type !== "image") continue;
+      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
+      const cached = imageRenderCache.get(key);
+      if (cached !== undefined) m.set(i, cached);
+    }
+    return m;
+  });
+
+  useLayoutEffect(() => {
+    if (!hasImageBlock) return;
+    const mode = detectImageRenderMode();
+    let nextMap: Map<number, string> | null = null;
+    for (let i = 0; i < resultBlocks.length; i++) {
+      const b = resultBlocks[i];
+      if (b.type !== "image") continue;
+      const size = base64DecodedSize(b.source.data);
+      if (mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES) continue;
+
+      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
+      const existing = imageRenderCache.get(key);
+      if (existing !== undefined) {
+        imageRenderCache.delete(key);
+        imageRenderCache.set(key, existing);
+        if (!fallbackPaths.has(i) || fallbackPaths.get(i) !== existing) {
+          if (nextMap === null) nextMap = new Map(fallbackPaths);
+          nextMap.set(i, existing);
+        }
+        continue;
+      }
+      const rendered = renderFallback(
+        b.source.data,
+        os.tmpdir(),
+        b.source.media_type,
+      );
+      imageRenderCache.set(key, rendered);
+      if (imageRenderCache.size > IMAGE_RENDER_CACHE_MAX) {
+        const oldest = imageRenderCache.keys().next().value;
+        if (oldest !== undefined) imageRenderCache.delete(oldest);
+      }
+      if (nextMap === null) nextMap = new Map(fallbackPaths);
+      nextMap.set(i, rendered);
+    }
+    if (nextMap !== null) setFallbackPaths(nextMap);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool.id, resultBlocks.length, hasImageBlock]);
+
   // ── Compact view (default) ──
   if (!expanded) {
     const header = compactHeader(tool, cols - 10);
@@ -389,87 +451,6 @@ export function ToolPanel({ tool, expanded, verbose = false }: ToolPanelProps) {
   const header = compactHeader(tool, cols - 10);
   const headerText = `${header}${durationSuffix}`;
   const argsStr = formatArgs(tool.args);
-
-  // Detect image blocks so we can route them to inline render or fallback
-  // instead of JSON.stringify-ing the whole result (which would dump raw
-  // base64 to the screen). Detected at render time so TERM_PROGRAM flips
-  // between test cases take effect.
-  const resultBlocks =
-    tool.status !== "running" && tool.result != null
-      ? extractContentBlocks(tool.result)
-      : [];
-  const hasImageBlock = resultBlocks.some((b) => b.type === "image");
-
-  // Seed state from the module-level cache ONLY. No disk writes in the
-  // initializer — this is still render-phase. The cache is populated only
-  // from inside `useLayoutEffect` below, so on first render of a new tool
-  // result this map is empty for those blocks and we render a placeholder
-  // until the commit-phase effect fills it in.
-  const [fallbackPaths, setFallbackPaths] = useState<Map<number, string>>(() => {
-    const m = new Map<number, string>();
-    for (let i = 0; i < resultBlocks.length; i++) {
-      const b = resultBlocks[i];
-      if (b.type !== "image") continue;
-      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
-      const cached = imageRenderCache.get(key);
-      if (cached !== undefined) m.set(i, cached);
-    }
-    return m;
-  });
-
-  // Commit-phase side effects: run fallback disk writes here, NEVER during
-  // render. `useLayoutEffect` fires synchronously after the DOM/ink commit
-  // (and in ink-testing-library fires before `lastFrame()` returns), so
-  // tests still see the post-effect state. `useEffect` alone is NOT safe
-  // for tests because ink-testing-library does not flush async effects
-  // before returning the first frame (empirically verified).
-  useLayoutEffect(() => {
-    if (!hasImageBlock) return;
-    const mode = detectImageRenderMode();
-    let nextMap: Map<number, string> | null = null;
-    for (let i = 0; i < resultBlocks.length; i++) {
-      const b = resultBlocks[i];
-      if (b.type !== "image") continue;
-      const size = base64DecodedSize(b.source.data);
-      // iTerm2 inline path is pure (no disk write) and is handled directly
-      // in the JSX render path — no need to populate the map for it.
-      if (mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES) continue;
-
-      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
-      const existing = imageRenderCache.get(key);
-      if (existing !== undefined) {
-        // LRU touch so hot entries survive eviction.
-        imageRenderCache.delete(key);
-        imageRenderCache.set(key, existing);
-        if (!fallbackPaths.has(i) || fallbackPaths.get(i) !== existing) {
-          if (nextMap === null) nextMap = new Map(fallbackPaths);
-          nextMap.set(i, existing);
-        }
-        continue;
-      }
-      // Cache miss — THIS is the only place renderFallback (which writes
-      // to disk) is ever invoked. Commit phase, not render phase.
-      const rendered = renderFallback(
-        b.source.data,
-        os.tmpdir(),
-        b.source.media_type,
-      );
-      imageRenderCache.set(key, rendered);
-      // Evict oldest when cap exceeded.
-      if (imageRenderCache.size > IMAGE_RENDER_CACHE_MAX) {
-        const oldest = imageRenderCache.keys().next().value;
-        if (oldest !== undefined) imageRenderCache.delete(oldest);
-      }
-      if (nextMap === null) nextMap = new Map(fallbackPaths);
-      nextMap.set(i, rendered);
-    }
-    if (nextMap !== null) setFallbackPaths(nextMap);
-    // Dependencies: re-run when the tool identity changes or the set of
-    // blocks changes. `resultBlocks` is rebuilt each render so we depend
-    // on its length + a content fingerprint (tool.id is immutable per
-    // tool execution).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool.id, resultBlocks.length, hasImageBlock]);
 
   return (
     <Box flexDirection="column" marginY={0}>

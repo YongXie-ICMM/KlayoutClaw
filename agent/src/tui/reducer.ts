@@ -13,8 +13,52 @@ import type {
   ConfigPanelTab,
 } from "./types.js";
 import type { SubagentTUIEntry, SubagentSegment } from "../types/v04-contracts.js";
+import { DEFAULT_TRANSCRIPT_TRUNCATION, truncate } from "../truncation.js";
 
 let messageCounter = 0;
+
+/**
+ * Truncate a tool result before it lands in reducer state. Mirrors the disk
+ * truncation in InteractionHistory.recordToolCall so the in-memory transcript
+ * cannot grow without bound across a long autonomous session — large
+ * evaluate/screenshot/script results were the primary driver of TUI OOM
+ * crashes (~4GB heap). For MCP-shaped results ({content: [{type,...}], ...})
+ * we truncate each text block in place so image blocks keep rendering; for
+ * strings and other shapes we stringify + truncate. --verbose still bypasses
+ * rendering-side truncation in ToolPanel but the in-memory copy is capped
+ * regardless; the full result remains in ~/.qlaybot/history on disk.
+ */
+export function truncateToolResult(result: unknown): unknown {
+  if (result == null) return result;
+  const opts = DEFAULT_TRANSCRIPT_TRUNCATION;
+  if (typeof result === "string") return truncate(result, opts);
+  if (typeof result === "object" && !Array.isArray(result)) {
+    const obj = result as Record<string, unknown>;
+    if (Array.isArray(obj.content)) {
+      let changed = false;
+      const newContent = obj.content.map((c) => {
+        if (c == null || typeof c !== "object") return c;
+        const item = c as Record<string, unknown>;
+        if (item.type === "text" && typeof item.text === "string") {
+          const t = truncate(item.text, opts);
+          if (t !== item.text) {
+            changed = true;
+            return { ...item, text: t };
+          }
+        }
+        return c;
+      });
+      return changed ? { ...obj, content: newContent } : result;
+    }
+  }
+  try {
+    const s = JSON.stringify(result);
+    if (s.length > opts.threshold) return truncate(s, opts);
+  } catch {
+    /* unserializable — leave untouched */
+  }
+  return result;
+}
 
 function newAssistantMessage(): AssistantMessageData {
   return {
@@ -216,16 +260,17 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
 
     case "TOOL_UPDATE": {
       if (!state.currentAssistant) return state;
+      const partial = truncateToolResult(action.partialResult);
       const updatedTools = state.currentAssistant.tools.map((t) =>
         t.id === action.toolCallId
-          ? { ...t, result: action.partialResult }
+          ? { ...t, result: partial }
           : t,
       );
       const updatedSegments = state.currentAssistant.segments.map((seg) =>
         seg.type === "tool" && seg.tool.id === action.toolCallId
           ? {
               ...seg,
-              tool: { ...seg.tool, result: action.partialResult },
+              tool: { ...seg.tool, result: partial },
             }
           : seg,
       );
@@ -245,9 +290,10 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
       const endedStatus = action.isError
         ? ("error" as const)
         : ("completed" as const);
+      const finalResult = truncateToolResult(action.result);
       const tools = state.currentAssistant.tools.map((t) =>
         t.id === action.toolCallId
-          ? { ...t, status: endedStatus, result: action.result, endTime }
+          ? { ...t, status: endedStatus, result: finalResult, endTime }
           : t,
       );
       const segments = state.currentAssistant.segments.map((seg) =>
@@ -257,7 +303,7 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
               tool: {
                 ...seg.tool,
                 status: endedStatus,
-                result: action.result,
+                result: finalResult,
                 endTime,
               },
             }
@@ -755,7 +801,12 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
         for (let i = newSegments.length - 1; i >= 0; i--) {
           const seg = newSegments[i];
           if (seg.type === "tool_call" && seg.toolName === action.toolName && seg.status === "running") {
-            newSegments[i] = { ...seg, status: "done", result: action.result };
+            const truncated = truncateToolResult(action.result);
+            newSegments[i] = {
+              ...seg,
+              status: "done",
+              result: typeof truncated === "string" ? truncated : String(truncated ?? ""),
+            };
             break;
           }
         }
