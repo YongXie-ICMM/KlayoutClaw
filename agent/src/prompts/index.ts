@@ -34,6 +34,23 @@ export function buildSystemPrompt(ctx: PromptBuildContext): string {
   const tooling = buildToolingSection(ctx.toolNames);
   if (tooling) sections.push(tooling);
 
+  // Plan Mode awareness paragraph (full mode only — subagents don't plan).
+  if (ctx.mode === PromptMode.Full) {
+    sections.push(
+      [
+        "### Plan Mode",
+        "Use `enter_plan_mode` proactively when the task involves:",
+        "- Multi-step device design with dependencies between steps",
+        "- Complex routing, layout, or fabrication decisions",
+        "- Any operation where a mistake could invalidate hours of work",
+        "During plan mode, only the plan file can be written. Read, klayout_get_layout_info,",
+        "screenshot, route_inspect, and memory_search remain available. Bash and file writes",
+        "outside the plan are blocked.",
+        "The user can also type `/plan` to request plan mode.",
+      ].join("\n"),
+    );
+  }
+
   // MCP
   const mcp = buildMCPSection(ctx.connectedServers);
   if (mcp) sections.push(mcp);

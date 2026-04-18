@@ -4,17 +4,109 @@
  * Expanded mode: full args + truncated result (8 head + 8 tail).
  */
 
-import React, { useMemo } from "react";
+import React, { useMemo, useState, useLayoutEffect } from "react";
+import * as os from "node:os";
 import { Text, Box } from "ink";
 import { Spinner } from "@inkjs/ui";
 import figures from "figures";
 import cliTruncate from "cli-truncate";
 import { theme } from "../theme.js";
 import type { ToolExecution } from "../types.js";
+import {
+  detectImageRenderMode,
+  base64DecodedSize,
+  renderInlineImage,
+  renderFallback,
+} from "../image-render.js";
+
+/**
+ * Threshold above which the iTerm2 inline-image escape is skipped in favor
+ * of the save-to-file fallback. Large base64 payloads blow up terminal
+ * buffers and some terminals refuse to render them.
+ */
+const IMAGE_INLINE_MAX_BYTES = 2_000_000;
+
+/**
+ * Module-level LRU cache for the fallback (disk-writing) render path.
+ *
+ * Only the fallback path is cached here — `renderInlineImage` is pure (just
+ * builds a string), no need to memoize. The cache's job is to prevent
+ * re-writing the same image to tmp on re-mount / remount of a component
+ * for the same tool result.
+ *
+ * The cache is populated inside `useLayoutEffect` (commit phase, never
+ * render phase), so React's "no side effects in render" invariant holds.
+ * One entry per `(tool.id, blockIdx, data.length)` for the lifetime of
+ * the process — tool results in qlaybot are immutable once set by the
+ * reducer on `tool_end`, so the key is safely stable.
+ *
+ * LRU-capped to bound memory on long sessions.
+ */
+const IMAGE_RENDER_CACHE_MAX = 200;
+const imageRenderCache = new Map<string, string>();
+
+function makeCacheKey(
+  toolId: string,
+  blockIdx: number,
+  mediaType: string,
+  dataLen: number,
+): string {
+  return `${toolId}:${blockIdx}:${mediaType}:${dataLen}`;
+}
+
+type ContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: string; data: string };
+    };
+
+/**
+ * Pull the `{type, ...}` content blocks out of an MCP tool result. Returns
+ * empty array when the result is not shaped like an MCP tool-result.
+ */
+function extractContentBlocks(result: unknown): ContentBlock[] {
+  if (result == null || typeof result !== "object") return [];
+  const content = (result as { content?: unknown }).content;
+  if (!Array.isArray(content)) return [];
+  const out: ContentBlock[] = [];
+  for (const c of content) {
+    if (c == null || typeof c !== "object") continue;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const item = c as any;
+    if (item.type === "text" && typeof item.text === "string") {
+      out.push({ type: "text", text: item.text });
+    } else if (
+      item.type === "image" &&
+      item.source != null &&
+      typeof item.source === "object" &&
+      typeof item.source.data === "string"
+    ) {
+      out.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type:
+            typeof item.source.media_type === "string"
+              ? item.source.media_type
+              : "image/png",
+          data: item.source.data,
+        },
+      });
+    }
+  }
+  return out;
+}
 
 interface ToolPanelProps {
   tool: ToolExecution;
   expanded?: boolean;
+  /**
+   * When true (from --verbose), the 8-head/8-tail formatResult truncation
+   * is skipped and the full result is rendered verbatim. Default false
+   * preserves Group 5 truncation behavior.
+   */
+  verbose?: boolean;
 }
 
 const MAX_RESULT_LINES = 8;
@@ -45,10 +137,17 @@ function resultAsString(result: unknown): string {
   if (typeof result === "object" && !Array.isArray(result)) {
     const obj = result as Record<string, unknown>;
     if (Array.isArray(obj.content)) {
+      // Once we've identified the pi-agent / MCP tool-result shape
+      // (has a `content` array), compact mode concatenates the TEXT
+      // blocks only. Image blocks are intentionally skipped — they
+      // must never leak as base64 or JSON in the compact summary
+      // (spec §2.5, qlaybot v0.4.3 Group 4). An image-only result
+      // therefore returns the empty string here, which compact-mode
+      // callers treat as "no summary".
       const textParts = (obj.content as Array<Record<string, unknown>>)
         .filter((c) => c.type === "text" && typeof c.text === "string")
         .map((c) => c.text as string);
-      if (textParts.length > 0) return textParts.join("\n");
+      return textParts.join("\n");
     }
   }
   try {
@@ -211,9 +310,10 @@ function formatArgs(args: unknown): string {
   }
 }
 
-function formatResult(result: unknown): string {
+function formatResult(result: unknown, verbose = false): string {
   if (result == null) return "";
   const s = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  if (verbose) return s;
   const lines = s.split("\n");
   if (lines.length <= MAX_RESULT_LINES * 2) return s;
   const head = lines.slice(0, MAX_RESULT_LINES).join("\n");
@@ -230,7 +330,7 @@ function formatDuration(tool: ToolExecution): string {
 
 // ── Component ──
 
-export function ToolPanel({ tool, expanded }: ToolPanelProps) {
+export function ToolPanel({ tool, expanded, verbose = false }: ToolPanelProps) {
   const cols = process.stdout.columns || 80;
 
   const statusIcon = useMemo(() => {
@@ -290,6 +390,87 @@ export function ToolPanel({ tool, expanded }: ToolPanelProps) {
   const headerText = `${header}${durationSuffix}`;
   const argsStr = formatArgs(tool.args);
 
+  // Detect image blocks so we can route them to inline render or fallback
+  // instead of JSON.stringify-ing the whole result (which would dump raw
+  // base64 to the screen). Detected at render time so TERM_PROGRAM flips
+  // between test cases take effect.
+  const resultBlocks =
+    tool.status !== "running" && tool.result != null
+      ? extractContentBlocks(tool.result)
+      : [];
+  const hasImageBlock = resultBlocks.some((b) => b.type === "image");
+
+  // Seed state from the module-level cache ONLY. No disk writes in the
+  // initializer — this is still render-phase. The cache is populated only
+  // from inside `useLayoutEffect` below, so on first render of a new tool
+  // result this map is empty for those blocks and we render a placeholder
+  // until the commit-phase effect fills it in.
+  const [fallbackPaths, setFallbackPaths] = useState<Map<number, string>>(() => {
+    const m = new Map<number, string>();
+    for (let i = 0; i < resultBlocks.length; i++) {
+      const b = resultBlocks[i];
+      if (b.type !== "image") continue;
+      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
+      const cached = imageRenderCache.get(key);
+      if (cached !== undefined) m.set(i, cached);
+    }
+    return m;
+  });
+
+  // Commit-phase side effects: run fallback disk writes here, NEVER during
+  // render. `useLayoutEffect` fires synchronously after the DOM/ink commit
+  // (and in ink-testing-library fires before `lastFrame()` returns), so
+  // tests still see the post-effect state. `useEffect` alone is NOT safe
+  // for tests because ink-testing-library does not flush async effects
+  // before returning the first frame (empirically verified).
+  useLayoutEffect(() => {
+    if (!hasImageBlock) return;
+    const mode = detectImageRenderMode();
+    let nextMap: Map<number, string> | null = null;
+    for (let i = 0; i < resultBlocks.length; i++) {
+      const b = resultBlocks[i];
+      if (b.type !== "image") continue;
+      const size = base64DecodedSize(b.source.data);
+      // iTerm2 inline path is pure (no disk write) and is handled directly
+      // in the JSX render path — no need to populate the map for it.
+      if (mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES) continue;
+
+      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
+      const existing = imageRenderCache.get(key);
+      if (existing !== undefined) {
+        // LRU touch so hot entries survive eviction.
+        imageRenderCache.delete(key);
+        imageRenderCache.set(key, existing);
+        if (!fallbackPaths.has(i) || fallbackPaths.get(i) !== existing) {
+          if (nextMap === null) nextMap = new Map(fallbackPaths);
+          nextMap.set(i, existing);
+        }
+        continue;
+      }
+      // Cache miss — THIS is the only place renderFallback (which writes
+      // to disk) is ever invoked. Commit phase, not render phase.
+      const rendered = renderFallback(
+        b.source.data,
+        os.tmpdir(),
+        b.source.media_type,
+      );
+      imageRenderCache.set(key, rendered);
+      // Evict oldest when cap exceeded.
+      if (imageRenderCache.size > IMAGE_RENDER_CACHE_MAX) {
+        const oldest = imageRenderCache.keys().next().value;
+        if (oldest !== undefined) imageRenderCache.delete(oldest);
+      }
+      if (nextMap === null) nextMap = new Map(fallbackPaths);
+      nextMap.set(i, rendered);
+    }
+    if (nextMap !== null) setFallbackPaths(nextMap);
+    // Dependencies: re-run when the tool identity changes or the set of
+    // blocks changes. `resultBlocks` is rebuilt each render so we depend
+    // on its length + a content fingerprint (tool.id is immutable per
+    // tool execution).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool.id, resultBlocks.length, hasImageBlock]);
+
   return (
     <Box flexDirection="column" marginY={0}>
       <Box>
@@ -302,9 +483,39 @@ export function ToolPanel({ tool, expanded }: ToolPanelProps) {
           <Text>{theme.toolArgs(cliTruncate(argsStr, cols - 6))}</Text>
         </Box>
       )}
-      {tool.status !== "running" && tool.result != null && (
+      {tool.status !== "running" && tool.result != null && !hasImageBlock && (
         <Box marginLeft={3} flexDirection="column">
-          <Text>{theme.muted(formatResult(tool.result))}</Text>
+          <Text>{theme.muted(formatResult(tool.result, verbose))}</Text>
+        </Box>
+      )}
+      {tool.status !== "running" && tool.result != null && hasImageBlock && (
+        <Box marginLeft={3} flexDirection="column">
+          {resultBlocks.map((block, i) => {
+            if (block.type === "image") {
+              // Render-phase decision: PURE string computation only.
+              // iTerm2 inline → pure escape string, safe during render.
+              // Fallback → read pre-populated path from state (populated
+              // by the useLayoutEffect above during commit phase).
+              const mode = detectImageRenderMode();
+              const size = base64DecodedSize(block.source.data);
+              const canInline =
+                mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES;
+              const rendered = canInline
+                ? renderInlineImage(block.source.data)
+                : fallbackPaths.get(i) ?? "[image loading...]";
+              // Pin width generously and disable wrapping so long tmp-dir
+              // paths (common on macOS: ~80 chars for /var/folders/...)
+              // don't get folded across lines. The iTerm2 escape is a
+              // single token without whitespace so this is a no-op for
+              // inline-render; it matters for the fallback marker.
+              return (
+                <Box key={i} width={10_000}>
+                  <Text wrap="truncate-end">{rendered}</Text>
+                </Box>
+              );
+            }
+            return <Text key={i}>{theme.muted(block.text)}</Text>;
+          })}
         </Box>
       )}
     </Box>

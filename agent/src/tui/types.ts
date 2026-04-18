@@ -118,6 +118,8 @@ export interface TUIState {
   subagentInjectMode: boolean;
   subagentInjectTarget: string | null;
   subagentInjectValue: string;
+  // v0.4.3 Group 3: plan mode exit menu (null when closed, holds plan file path when open)
+  planExitMenu: string | null;
 }
 
 export type TUIAction =
@@ -147,6 +149,8 @@ export type TUIAction =
   | { type: "COMPACTION_END" }
   | { type: "PLAN_MODE_ENTERED" }
   | { type: "PLAN_MODE_EXITED" }
+  | { type: "PLAN_EXIT_MENU_OPEN"; planFilePath: string }
+  | { type: "PLAN_EXIT_MENU_CLOSE" }
   | { type: "TOGGLE_DETAIL_VIEW" }
   // v0.4 actions
   | { type: "FOCUS_UP"; hasCompletions: boolean }

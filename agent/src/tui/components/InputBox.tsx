@@ -2,7 +2,7 @@
  * InputBox — cursor-aware text editing with hooks, history, and tab completion.
  */
 
-import React, { useState, useCallback, useRef } from "react";
+import React, { useState, useCallback, useRef, useEffect } from "react";
 import { Box, Text, useInput } from "ink";
 import { Chalk } from "chalk";
 import type { SessionPhase } from "../types.js";
@@ -22,20 +22,57 @@ interface InputBoxProps {
   phase?: SessionPhase;
   onSubmit: (text: string) => void;
   disabled?: boolean;
+  /**
+   * v0.4.3 Group 3: when true, the input is frozen (does not accept keystrokes
+   * nor submit via Enter) but still renders the normal qlaybot> prompt. Used
+   * when the plan-mode exit menu is open.
+   */
+  frozen?: boolean;
   onToggleThinking?: () => void;
   focusState?: FocusState;
   recency?: Record<string, number>;
 }
 
+/**
+ * Cursor-aware synchronous shadow of the committed buffer.
+ *
+ * Why: `useInputBuffer` is a `useReducer`, so a single sync tick like
+ * `stdin.write("ab"); stdin.write("\r")` fires two useInput callbacks before
+ * React commits either reducer update. Enter then reads a stale `buf.value`
+ * and submits "". We track the would-be-committed state (value + cursor) in
+ * a ref that every keystroke path updates identically to `useInputBuffer`'s
+ * reducer, so the Enter handler can submit using the effective state and
+ * non-insert paths (arrow keys, backspace) also reflect intermediate edits
+ * without resurrecting deleted text.
+ *
+ * A useEffect clears the ref once the React-committed state catches up.
+ */
+type PendingBuf = { value: string; cursor: number };
+
 export function InputBox({
   phase = "ready",
   onSubmit,
   disabled = false,
+  frozen = false,
   onToggleThinking,
   focusState = "input",
   recency = {},
 }: InputBoxProps) {
   const buf = useInputBuffer();
+  const pendingBufRef = useRef<PendingBuf | null>(null);
+  // Read the effective buffer state: pending ref if ahead of React, else committed.
+  const getEffective = useCallback((): PendingBuf => {
+    return pendingBufRef.current ?? { value: buf.value, cursor: buf.cursor };
+  }, [buf.value, buf.cursor]);
+
+  useEffect(() => {
+    // Drop the shadow once committed state matches what we tracked.
+    const p = pendingBufRef.current;
+    if (p && p.value === buf.value && p.cursor === buf.cursor) {
+      pendingBufRef.current = null;
+    }
+  }, [buf.value, buf.cursor]);
+
   const history = useCommandHistory();
   const [completions, setCompletions] = useState<CommandMatch[]>([]);
   const [completionIdx, setCompletionIdx] = useState(0);
@@ -55,19 +92,23 @@ export function InputBox({
 
       // Tab completion
       if (key.tab) {
-        const val = buf.value;
-        if (val.startsWith("/")) {
+        const { value: effVal } = getEffective();
+        if (effVal.startsWith("/")) {
           if (tabCycleRef.current && completions.length > 1) {
             // Cycle through completions
             const next = (completionIdx + 1) % completions.length;
             setCompletionIdx(next);
-            buf.setValue(completions[next].name + " ");
+            const newVal = completions[next].name + " ";
+            pendingBufRef.current = { value: newVal, cursor: newVal.length };
+            buf.setValue(newVal);
             return;
           }
 
-          const matches = matchCommandsWithInfo(val.trimEnd());
+          const matches = matchCommandsWithInfo(effVal.trimEnd());
           if (matches.length === 1) {
-            buf.setValue(matches[0].name + " ");
+            const newVal = matches[0].name + " ";
+            pendingBufRef.current = { value: newVal, cursor: newVal.length };
+            buf.setValue(newVal);
             clearCompletions();
           } else if (matches.length > 1) {
             setCompletions(matches);
@@ -83,9 +124,11 @@ export function InputBox({
         clearCompletions();
       }
 
-      // Enter = submit
+      // Enter = submit using the effective (cursor-aware) buffer value.
       if (key.return) {
-        const trimmed = buf.value.trim();
+        const { value } = getEffective();
+        const trimmed = value.trim();
+        pendingBufRef.current = null;
         if (trimmed) {
           history.push(trimmed);
           onSubmit(trimmed);
@@ -97,18 +140,27 @@ export function InputBox({
 
       // Ctrl+A = home
       if (key.ctrl && input === "a") {
+        const { value } = getEffective();
+        pendingBufRef.current = { value, cursor: 0 };
         buf.moveHome();
         return;
       }
 
       // Ctrl+E = end
       if (key.ctrl && input === "e") {
+        const { value } = getEffective();
+        pendingBufRef.current = { value, cursor: value.length };
         buf.moveEnd();
         return;
       }
 
       // Ctrl+D = delete forward
       if (key.ctrl && input === "d") {
+        const { value, cursor } = getEffective();
+        if (cursor < value.length) {
+          const newValue = value.slice(0, cursor) + value.slice(cursor + 1);
+          pendingBufRef.current = { value: newValue, cursor };
+        }
         buf.deleteForward();
         return;
       }
@@ -125,26 +177,40 @@ export function InputBox({
         return;
       }
 
-      // Backspace / Delete
+      // Backspace / Delete — delete-before-cursor
       if (key.backspace || key.delete) {
+        const { value, cursor } = getEffective();
+        if (cursor > 0) {
+          const newValue = value.slice(0, cursor - 1) + value.slice(cursor);
+          pendingBufRef.current = { value: newValue, cursor: cursor - 1 };
+        }
         buf.deleteBack();
         return;
       }
 
       // Arrow keys
       if (key.leftArrow) {
+        const { value, cursor } = getEffective();
+        pendingBufRef.current = { value, cursor: Math.max(0, cursor - 1) };
         buf.moveCursorLeft();
         return;
       }
       if (key.rightArrow) {
+        const { value, cursor } = getEffective();
+        pendingBufRef.current = {
+          value,
+          cursor: Math.min(value.length, cursor + 1),
+        };
         buf.moveCursorRight();
         return;
       }
 
       // Up arrow = history
       if (key.upArrow) {
-        const entry = history.navigateUp(buf.value);
+        const { value: effVal } = getEffective();
+        const entry = history.navigateUp(effVal);
         if (entry != null) {
+          pendingBufRef.current = { value: entry, cursor: entry.length };
           buf.setValue(entry);
         }
         return;
@@ -154,17 +220,26 @@ export function InputBox({
       if (key.downArrow) {
         const entry = history.navigateDown();
         if (entry != null) {
+          pendingBufRef.current = { value: entry, cursor: entry.length };
           buf.setValue(entry);
         }
         return;
       }
 
-      // Regular character input
+      // Regular character input — cursor-aware insert into the pending shadow
+      // so a same-tick Enter submits the right value, and so mid-buffer
+      // inserts do not resurrect as an appended suffix.
       if (!key.ctrl && !key.meta && input) {
+        const { value, cursor } = getEffective();
+        const newValue = value.slice(0, cursor) + input + value.slice(cursor);
+        pendingBufRef.current = {
+          value: newValue,
+          cursor: cursor + input.length,
+        };
         buf.insert(input);
       }
     },
-    { isActive: isInputActive(focusState) && !isDisabled },
+    { isActive: isInputActive(focusState) && !isDisabled && !frozen },
   );
 
   // Disabled state

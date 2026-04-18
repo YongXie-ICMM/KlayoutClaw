@@ -44,7 +44,8 @@ import type {
   SubagentSegment,
 } from "../src/types/v04-contracts.js";
 import { TOOL_ANNOTATIONS } from "../src/tools/annotations.js";
-import { ALLOWED_TOOLS } from "../src/planning/sandbox.js";
+// Legacy plan-mode allowlist import removed in qlaybot v0.4.3 Group 3
+// step 11 — src/planning/sandbox.ts no longer exports the pre-0.4.3 Set.
 
 // ---------------------------------------------------------------------------
 // Mock Agent SDK at module level
@@ -778,23 +779,14 @@ describe("Group 4: Cross-layer integration", () => {
     expect(tool.parameters).toBeDefined();
   });
 
-  it("SCC-H5f: sandbox ALLOWED_TOOLS includes 'delegate' for plan-mode delegation", () => {
-    // Verify that the sandbox allows the delegate tool so delegation works in plan mode.
-    // ALLOWED_TOOLS is the Set in src/planning/sandbox.ts that gates tool execution.
-    expect(ALLOWED_TOOLS.has("delegate")).toBe(true);
-
-    // Also verify other expected tools are present
-    expect(ALLOWED_TOOLS.has("read")).toBe(true);
-    expect(ALLOWED_TOOLS.has("klayout_native_get_layout_info")).toBe(true);
-    expect(ALLOWED_TOOLS.has("klayout_native_screenshot")).toBe(true);
-    expect(ALLOWED_TOOLS.has("memory_save")).toBe(true);
-    expect(ALLOWED_TOOLS.has("memory_search")).toBe(true);
-
-    // Readwrite tools must NOT be allowed in sandbox
-    expect(ALLOWED_TOOLS.has("execute_script")).toBe(false);
-    expect(ALLOWED_TOOLS.has("save_layout")).toBe(false);
-    expect(ALLOWED_TOOLS.has("create_layout")).toBe(false);
-  });
+  // DELETED (qlaybot v0.4.3 Group 3 step 11): the SCC-H5f "sandbox
+  // allowlist includes 'delegate'" test was removed because the legacy
+  // allowlist Set was deleted from src/planning/sandbox.ts per spec §9
+  // step 11. Plan-mode tool gating now flows through
+  // `getReadOnlyForPlanMode` + `wrapMCPToolForPlanMode`. The delegate
+  // tool's plan-mode behavior is gated separately (§1.11 — delegate is
+  // unconditionally blocked while the parent is in plan mode); that
+  // new contract is covered by test-plan-mode-v043-group2.ts.
 
   it("SCC-H5f: delegate tool validates unknown role", async () => {
     const logDir = makeTmpDir();

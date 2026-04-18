@@ -15,6 +15,7 @@ interface AssistantMessageProps {
   message: AssistantMessageData;
   toolDetailExpanded?: boolean;
   thinkingExpanded?: boolean;
+  verbose?: boolean;
 }
 
 /**
@@ -29,6 +30,7 @@ export function AssistantMessage({
   message,
   toolDetailExpanded = false,
   thinkingExpanded = false,
+  verbose = false,
 }: AssistantMessageProps) {
   const { segments, isStreaming, startedAt, completedAt } = message;
 
@@ -51,6 +53,7 @@ export function AssistantMessage({
         toolDetailExpanded,
         isLastSegment: idx === segments.length - 1,
         isStreaming,
+        verbose,
       }))}
       {showFooter && (
         <Box marginLeft={2}>
@@ -69,6 +72,7 @@ function renderSegment(
     toolDetailExpanded: boolean;
     isLastSegment: boolean;
     isStreaming: boolean;
+    verbose?: boolean;
   },
 ) {
   switch (segment.type) {
@@ -106,7 +110,7 @@ function renderSegment(
     case "tool":
       return (
         <Box key={`tool-${idx}`}>
-          <ToolPanel tool={segment.tool} expanded={opts.toolDetailExpanded} />
+          <ToolPanel tool={segment.tool} expanded={opts.toolDetailExpanded} verbose={opts.verbose ?? false} />
         </Box>
       );
   }

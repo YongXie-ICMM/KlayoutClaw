@@ -173,9 +173,16 @@ describe("CommandRegistry", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("has all 10 commands registered (v0.3: includes compact)", () => {
+  it("has all 9 commands registered (v0.4.3: /plan removed, handled by App.tsx slash intercept)", () => {
+    // v0.4.3 Group 3 step 10 deleted `src/commands/plan.ts` and its
+    // registration — the `/plan` slash is now intercepted by App.tsx
+    // before the CommandRegistry (spec §1.8.1). COMMAND_NAMES therefore
+    // does NOT contain "plan", and the registry does not register a
+    // plan command.
     const registry = createCommandRegistry();
-    expect(COMMAND_NAMES.length).toBe(10);
+    expect(COMMAND_NAMES.length).toBe(9);
+    expect(COMMAND_NAMES).not.toContain("plan");
+    expect(registry.has("plan")).toBe(false);
     for (const name of COMMAND_NAMES) {
       expect(registry.has(name)).toBe(true);
     }
@@ -451,88 +458,17 @@ describe("MemoryManager", () => {
 });
 
 // ============================================================
-// 7. Planning + Sandbox
+// 7. Planning + Sandbox (legacy block — DELETED in v0.4.3 Group 3 step 11)
 // ============================================================
-
-import { PlanManager } from "../src/planning/index.js";
-import { wrapToolWithSandbox, ALLOWED_TOOLS } from "../src/planning/sandbox.js";
-
-function makeTool(name: string): AgentTool<any> {
-  return {
-    name,
-    label: name,
-    description: `${name} tool`,
-    parameters: Type.Object({}),
-    async execute() {
-      return { content: [{ type: "text" as const, text: `${name} executed` }], details: {} };
-    },
-  } as AgentTool<any>;
-}
-
-describe("PlanManager", () => {
-  it("starts inactive, transitions enter/exit", () => {
-    const pm = new PlanManager();
-    expect(pm.isActive()).toBe(false);
-    pm.enter();
-    expect(pm.isActive()).toBe(true);
-    pm.exit();
-    expect(pm.isActive()).toBe(false);
-  });
-
-  it("has system prompt injection text", () => {
-    const pm = new PlanManager();
-    const prompt = pm.getSystemPromptInjection();
-    expect(prompt).toContain("PLAN MODE");
-    expect(prompt).toContain("cannot modify");
-  });
-
-  it("onStateChange fires on enter/exit", () => {
-    const pm = new PlanManager();
-    const states: Array<{ active: boolean }> = [];
-    pm.onStateChange((state) => states.push(state));
-    pm.enter();
-    pm.exit();
-    expect(states.length).toBe(2);
-    expect(states[0].active).toBe(true);
-    expect(states[1].active).toBe(false);
-  });
-
-  it("onStateChange returns unsubscribe function", () => {
-    const pm = new PlanManager();
-    const unsub = pm.onStateChange(() => {});
-    expect(typeof unsub).toBe("function");
-    unsub();
-  });
-});
-
-describe("sandbox wrapTool", () => {
-  it("allows read-only tools when plan mode active", async () => {
-    const pm = new PlanManager();
-    pm.enter();
-    for (const toolName of ALLOWED_TOOLS) {
-      const wrapped = wrapToolWithSandbox(makeTool(toolName), pm);
-      const result = await wrapped.execute("call-1", {});
-      expect(result.content[0].text).toContain("executed");
-    }
-  });
-
-  it("blocks mutating tools when plan mode active", async () => {
-    const pm = new PlanManager();
-    pm.enter();
-    for (const toolName of ["bash", "write", "edit", "klayout_native_execute_script"]) {
-      const wrapped = wrapToolWithSandbox(makeTool(toolName), pm);
-      const result = await wrapped.execute("call-1", {});
-      expect(result.content[0].text).toContain("blocked in plan mode");
-    }
-  });
-
-  it("allows all tools when plan mode inactive", async () => {
-    const pm = new PlanManager();
-    const wrapped = wrapToolWithSandbox(makeTool("bash"), pm);
-    const result = await wrapped.execute("call-1", {});
-    expect(result.content[0].text).toContain("executed");
-  });
-});
+//
+// The 0.4.2 PlanManager shim API and the legacy sandbox allowlist
+// helpers were removed from src/planning/ per spec §9 step 11; the
+// tests that validated those shims were deleted alongside them. The
+// qdevbot-parity replacement surface is now covered by:
+//   • tests/test-plan-mode-v043.ts (PlanManager new API + symlink-safe
+//     sandbox + annotation plan-mode gate + tool factories)
+//   • tests/test-plan-mode-v043-group3.ts (TUI reducer + App.tsx slash
+//     handler + exit menu + shim-removal regressions)
 
 // ============================================================
 // 8. Background tasks
@@ -1168,8 +1104,8 @@ describe("/compact command", () => {
 // ============================================================
 
 describe("package.json version", () => {
-  it("version is 0.4.2", () => {
+  it("version is 0.4.3", () => {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
-    expect(pkg.version).toBe("0.4.2");
+    expect(pkg.version).toBe("0.4.3");
   });
 });

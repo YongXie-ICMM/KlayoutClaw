@@ -34,6 +34,14 @@ import { Type } from "@sinclair/typebox";
 import { SubagentRunner } from "../subagent/runner.js";
 import { createDelegateTool } from "./delegate.js";
 import { TOOL_ANNOTATIONS as DEFAULT_ANNOTATIONS } from "./annotations.js";
+import type { PlanManager } from "../planning/index.js";
+import {
+  wrapWriteForPlanMode,
+  wrapEditForPlanMode,
+  wrapBashForPlanMode,
+  wrapMCPToolForPlanMode,
+} from "../planning/sandbox.js";
+import { createEnterPlanModeTool, createExitPlanModeTool } from "./plan.js";
 
 /**
  * Create base tools override (read, bash, edit, write).
@@ -111,14 +119,32 @@ export function createMCPTools(
         params: Record<string, unknown>,
       ): Promise<AgentToolResult<unknown>> {
         const result = await mcpManager.callTool(nt.name, params);
-        const text = result.content
-          .filter((c) => c.type === "text" && c.text)
-          .map((c) => c.text!)
-          .join("\n");
+        // Preserve both text and image blocks through the pi-agent tool
+        // wrapper (spec §2.3). Previously this wrapper collapsed every
+        // block into a single JSON.stringify(result) text payload, which
+        // silently dropped image blocks. The new passthrough keeps the
+        // Anthropic-shaped content array intact so downstream consumers
+        // (TUI ToolPanel, the model itself) can render images inline.
+        //
+        // Note: pi-agent-core's AgentToolResult.content type is
+        // `(TextContent | ImageContent)[]` where ImageContent uses the
+        // legacy flat `{data, mimeType}` shape. We intentionally preserve
+        // the nested Anthropic `{source:{type:"base64",media_type,data}}`
+        // shape here — it's what downstream consumers (TUI ToolPanel) and
+        // Claude's API expect — so the return is cast to satisfy the
+        // looser runtime contract.
+        const passthrough = result.content.filter(
+          (c) =>
+            (c.type === "text" && typeof c.text === "string") ||
+            c.type === "image",
+        );
+        const content =
+          passthrough.length > 0
+            ? passthrough
+            : [{ type: "text" as const, text: JSON.stringify(result) }];
         return {
-          content: [
-            { type: "text" as const, text: text || JSON.stringify(result) },
-          ],
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          content: content as any,
           details: result,
         };
       },
@@ -154,6 +180,8 @@ export function assembleTools(opts: {
   defaultModel: string;
   defaultThinkingLevel: string;
   modelRegistry: import("@mariozechner/pi-coding-agent").ModelRegistry;
+  planManager?: PlanManager;
+  isSubagent?: boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 }): { toolMap: Record<string, AgentTool<any>>; runner: SubagentRunner | null };
 
@@ -220,6 +248,7 @@ export function assembleTools(opts: any): any {
 
     // Add delegate tool if subagent is enabled with roles
     const subagentConfig: SubagentConfig = opts.config.subagent;
+    const planManager: PlanManager | undefined = opts.planManager;
     if (subagentConfig?.enabled && Object.keys(subagentConfig.roles).length > 0) {
       runner = new SubagentRunner({
         config: subagentConfig,
@@ -232,8 +261,72 @@ export function assembleTools(opts: any): any {
         defaultThinkingLevel: opts.defaultThinkingLevel,
         modelRegistry: opts.modelRegistry,
       });
-      const delegateTool = createDelegateTool(runner, subagentConfig);
+      const delegateTool = createDelegateTool(runner, subagentConfig, planManager);
       toolMap[delegateTool.name] = delegateTool;
+    }
+
+    // Plan-mode wiring (spec §9 step 5). When a PlanManager is provided and
+    // we are NOT running as a subagent, wrap base tools + MCP tools, register
+    // plan tools, and run the deny-by-default allowlist assertion.
+    const isSubagent: boolean = opts.isSubagent === true;
+    if (planManager && !isSubagent) {
+      // Wrap base tools (sandbox: write/edit only write inside plansDir,
+      // bash fully blocked in plan mode).
+      if (toolMap.write) toolMap.write = wrapWriteForPlanMode(toolMap.write, planManager, opts.cwd);
+      if (toolMap.edit) toolMap.edit = wrapEditForPlanMode(toolMap.edit, planManager, opts.cwd);
+      if (toolMap.bash) toolMap.bash = wrapBashForPlanMode(toolMap.bash, planManager);
+
+      // Register plan tools.
+      const enterTool = createEnterPlanModeTool(planManager);
+      const exitTool = createExitPlanModeTool(planManager);
+      toolMap[enterTool.name] = enterTool;
+      toolMap[exitTool.name] = exitTool;
+
+      // Wrap every MCP-backed tool (exclude base/memory/plan/delegate).
+      const NON_MCP = new Set([
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "memory_save",
+        "memory_search",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "delegate",
+      ]);
+      const wrappedMCPTools = new Set<string>();
+      for (const [name, tool] of Object.entries(toolMap)) {
+        if (!NON_MCP.has(name)) {
+          toolMap[name] = wrapMCPToolForPlanMode(tool, planManager);
+          wrappedMCPTools.add(name);
+        }
+      }
+
+      // Deny-by-default allowlist (spec §1.5 step 4 + §9 step 5e): every tool
+      // in toolMap must be either an allowlisted base/memory/plan/delegate
+      // name OR wrapped via wrapMCPToolForPlanMode above. Unknown tools
+      // surface as a loud startup failure.
+      const ALLOWED_BASE = new Set([
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "memory_save",
+        "memory_search",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "delegate",
+      ]);
+      for (const name of Object.keys(toolMap)) {
+        if (!ALLOWED_BASE.has(name) && !wrappedMCPTools.has(name)) {
+          throw new Error(
+            `assembleTools: tool "${name}" escaped the plan-mode sandbox — ` +
+              `it is neither an allowlist base/memory/plan/delegate tool nor ` +
+              `wrapped via wrapMCPToolForPlanMode. This is a deny-by-default ` +
+              `allowlist violation.`,
+          );
+        }
+      }
     }
 
     return { toolMap, runner };

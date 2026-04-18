@@ -15,6 +15,7 @@ interface MessageListProps {
   currentStreaming: AssistantMessageData | null;
   toolDetailExpanded?: boolean;
   thinkingExpanded?: boolean;
+  verbose?: boolean;
 }
 
 export function MessageList({
@@ -22,6 +23,7 @@ export function MessageList({
   currentStreaming,
   toolDetailExpanded = false,
   thinkingExpanded = false,
+  verbose = false,
 }: MessageListProps) {
   return (
     <Box flexDirection="column" flexGrow={1}>
@@ -46,6 +48,7 @@ export function MessageList({
                   message={msg}
                   toolDetailExpanded={toolDetailExpanded}
                   thinkingExpanded={thinkingExpanded}
+                  verbose={verbose}
                 />
               </Box>
             );
@@ -57,6 +60,7 @@ export function MessageList({
             message={currentStreaming}
             toolDetailExpanded={toolDetailExpanded}
             thinkingExpanded={thinkingExpanded}
+            verbose={verbose}
           />
         </Box>
       )}

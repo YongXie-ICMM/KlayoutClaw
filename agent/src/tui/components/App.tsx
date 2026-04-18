@@ -15,6 +15,7 @@ import { WorkspaceBar } from "./WorkspaceBar.js";
 import { BackgroundBar } from "./BackgroundBar.js";
 import { ConfigPanel } from "./ConfigPanel.js";
 import { SubagentPanel } from "./SubagentPanel.js";
+import { PlanExitMenu } from "./PlanExitMenu.js";
 import { subscribeToSession } from "../../events.js";
 import { shouldAutoCompact } from "../auto-compact.js";
 import type { QlayBotSession } from "../../agent.js";
@@ -23,6 +24,7 @@ import type { CommandContext } from "../../commands/index.js";
 import { listWorkspaceFiles, checkWorkspaceIntegrity } from "../workspace.js";
 import { loadCommandRecency, saveCommandRecency } from "../hooks/useCommandHistory.js";
 import { getConfigDir, getAllMCPServers } from "../../config.js";
+import { formatTurnMessage } from "../../verbose-helpers.js";
 import { TOOL_ANNOTATIONS } from "../../tools/annotations.js";
 import type { MCPServerData } from "./ConfigPanel.js";
 
@@ -41,6 +43,11 @@ export function App({ botSession }: AppProps) {
   // Keep phase accessible in stale closures (useInput, handleSubmit)
   const phaseRef = useRef(state.phase);
   phaseRef.current = state.phase;
+
+  // v0.4.3 Group 3: local mirror of plan-mode exit menu path (null when closed).
+  // Kept in lockstep with reducer dispatches so the menu useInput gate is
+  // synchronous while the UI re-renders on the open/close reducer actions.
+  const [planExitMenu, setPlanExitMenu] = useState<string | null>(null);
 
   // Track compacting state in a ref for the onAgentEnd callback
   const isCompactingRef = useRef(false);
@@ -104,8 +111,93 @@ export function App({ botSession }: AppProps) {
     }
   });
 
+  // v0.4.3 Group 3: plan-mode exit menu key handler (1/2/3/4/Escape).
+  // Only active while planExitMenu !== null so it never interferes with
+  // normal input otherwise. Keys 1-4 map to §1.8.2 menu choices.
+  useInput(
+    (_input, key) => {
+      if (!planExitMenu) return;
+      const planPath = planExitMenu;
+
+      if (_input === "1") {
+        setPlanExitMenu(null);
+        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
+        dispatch({ type: "COMPACTION_START" });
+        dispatch({
+          type: "SYSTEM_MESSAGE",
+          text: "Compacting context before execution...",
+        });
+        botSession
+          .compact()
+          .then(() => {
+            dispatch({ type: "COMPACTION_END" });
+            dispatch({
+              type: "SYSTEM_MESSAGE",
+              text: "Context compacted. Executing plan...",
+            });
+            dispatch({ type: "USER_PROMPT", text: "Execute the plan" });
+            return botSession.session.prompt(
+              `Execute the design plan at: ${planPath}\n` +
+                `Read the plan file and execute it step by step. Full tool access is restored.`,
+            );
+          })
+          .catch((err: any) => {
+            dispatch({ type: "COMPACTION_END" });
+            dispatch({
+              type: "SESSION_ERROR",
+              error: err?.message ?? String(err),
+            });
+          });
+      } else if (_input === "2") {
+        setPlanExitMenu(null);
+        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
+        dispatch({ type: "USER_PROMPT", text: "Execute the plan" });
+        botSession.session
+          .prompt(
+            `Execute the design plan at: ${planPath}\n` +
+              `Read the plan file and execute it step by step. Full tool access is restored.`,
+          )
+          .catch((err: any) => {
+            dispatch({
+              type: "SESSION_ERROR",
+              error: err?.message ?? String(err),
+            });
+          });
+      } else if (_input === "3") {
+        setPlanExitMenu(null);
+        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
+        const plan = botSession.planManager?.reenterPlanMode();
+        if (plan) {
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text: `Re-entered plan mode for revision.\nPlan file: ${plan.filePath}`,
+          });
+        } else {
+          dispatch({ type: "SYSTEM_MESSAGE", text: "No plan to revise." });
+        }
+      } else if (_input === "4" || key.escape) {
+        setPlanExitMenu(null);
+        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
+        dispatch({
+          type: "SYSTEM_MESSAGE",
+          text: "Plan saved. You can execute it later.",
+        });
+      }
+    },
+    { isActive: !!planExitMenu },
+  );
+
   // Subscribe to session events
   useEffect(() => {
+    // §4 verbose: print the assembled system prompt as the FIRST
+    // SYSTEM_MESSAGE so the user can verify what the model actually sees.
+    if (botSession.config.verbose === true && botSession.assembledSystemPrompt) {
+      dispatch({
+        type: "SYSTEM_MESSAGE",
+        text: botSession.assembledSystemPrompt,
+      });
+    }
+
     dispatch({
       type: "SESSION_READY",
       modelName: botSession.config.agent.defaultModel,
@@ -169,7 +261,30 @@ export function App({ botSession }: AppProps) {
         }),
     });
 
-    return () => unsubscribe();
+    // §4 verbose: per-turn timing + token stats via raw session.subscribe
+    // so synthetic `agent_start` / `agent_end` events fire this handler
+    // regardless of the subscribeToSession bridge. Turn counter starts at 1.
+    let verboseTurnN = 0;
+    let verboseTurnStart = 0;
+    const verboseUnsub =
+      botSession.config.verbose === true
+        ? botSession.session.subscribe((ev: any) => {
+            if (!ev || typeof ev !== "object") return;
+            if (ev.type === "agent_start") {
+              verboseTurnN++;
+              verboseTurnStart = Date.now();
+            } else if (ev.type === "agent_end") {
+              const elapsed = Date.now() - verboseTurnStart;
+              const text = formatTurnMessage(verboseTurnN, elapsed, ev.usage);
+              dispatch({ type: "SYSTEM_MESSAGE", text });
+            }
+          })
+        : () => {};
+
+    return () => {
+      unsubscribe();
+      verboseUnsub();
+    };
   }, [botSession]);
 
   // Subscribe to SubagentRunner events → dispatch SUBAGENT_* actions
@@ -278,21 +393,17 @@ export function App({ botSession }: AppProps) {
     }
   }, [state.subagentInjectTarget, state.subagentInjectValue, (state as any).subagentInjectMode, botSession.subagentRunner]);
 
-  // Subscribe to PlanManager state changes
+  // Subscribe to PlanManager events (v0.4.3 Group 3 step 9)
   useEffect(() => {
-    if (!botSession.planManager?.onStateChange) return;
-
-    const unsubscribe = botSession.planManager.onStateChange(
-      (planState: { active: boolean }) => {
-        if (planState.active) {
-          dispatch({ type: "PLAN_MODE_ENTERED" });
-        } else {
-          dispatch({ type: "PLAN_MODE_EXITED" });
-        }
-      },
-    );
-
-    return () => unsubscribe();
+    if (!botSession.planManager) return;
+    const unsub = botSession.planManager.subscribe((event) => {
+      if (event.type === "plan_mode_entered") {
+        dispatch({ type: "PLAN_MODE_ENTERED" });
+      } else if (event.type === "plan_mode_exited") {
+        dispatch({ type: "PLAN_MODE_EXITED" });
+      }
+    });
+    return () => unsub();
   }, [botSession]);
 
   // Subscribe to BackgroundTaskManager events
@@ -355,6 +466,86 @@ export function App({ botSession }: AppProps) {
 
   const handleSubmit = useCallback(
     async (text: string) => {
+      // v0.4.3 Group 3: intercept /plan BEFORE the CommandRegistry (spec §1.8.1).
+      // This ports qdevbot's App.tsx slash handler; /plan is a modal UI affordance
+      // that cannot live in the registry because it needs access to planExitMenu
+      // local state + session.prompt auto-submit.
+      if (text === "/plan" || text.startsWith("/plan ")) {
+        const pm = botSession.planManager;
+        const taskDesc = text.slice(5).trim();
+
+        if (!pm) {
+          dispatch({ type: "SYSTEM_MESSAGE", text: "Planning mode not available." });
+          return;
+        }
+
+        if (pm.inPlanMode && !taskDesc) {
+          // Branch A: in plan mode, no args → exit + open the 4-option menu.
+          // The menu text itself is rendered by the <PlanExitMenu> component
+          // (conditionally mounted on planExitMenu !== null) so that closing
+          // the menu REMOVES the text from the frame — a persisted
+          // SYSTEM_MESSAGE would leave it behind after dismissal.
+          const planPath = pm.currentPlan?.filePath ?? "";
+          pm.exitPlanMode(true);
+          setPlanExitMenu(planPath);
+          dispatch({ type: "PLAN_EXIT_MENU_OPEN", planFilePath: planPath });
+          return;
+        }
+
+        if (!pm.inPlanMode) {
+          // Branch B: not in plan → enter + optional auto-submit.
+          const plannedTask = taskDesc || "User-initiated plan mode";
+          // Yield once so React can process any pre-existing pending updates
+          // (e.g. InputBox's buf.clear dispatch from the Enter handler) before
+          // we queue our own state changes.
+          await new Promise<void>((r) => setImmediate(r));
+          const plan = pm.enterPlanMode(plannedTask);
+          if (!plan) {
+            // D1 FS-failure surface: enterPlanMode returned null.
+            dispatch({
+              type: "SYSTEM_MESSAGE",
+              text:
+                "Failed to enter plan mode. The plans directory may not be writable.",
+            });
+            return;
+          }
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text:
+              `Plan mode active. Sandbox enforced — only the plan file can be modified.\n` +
+              `Plan file: ${plan.filePath}`,
+          });
+          if (taskDesc) {
+            dispatch({ type: "USER_PROMPT", text: taskDesc });
+            try {
+              await botSession.session.prompt(
+                `[Plan mode activated]\n\n` +
+                  `Task: ${taskDesc}\n` +
+                  `Plan file: ${plan.filePath}\n\n` +
+                  `You are in plan mode. Explore the current state using read and klayout read-only tools, ` +
+                  `then write a detailed design plan to the plan file. ` +
+                  `Only the plan file can be modified — bash, write, and edit are restricted to the plans directory.\n` +
+                  `Include specific cell names, layer numbers, coordinates, and safety checks.\n\n` +
+                  `When the plan is complete, call exit_plan_mode.`,
+              );
+            } catch (err: any) {
+              dispatch({
+                type: "SESSION_ERROR",
+                error: err?.message ?? String(err),
+              });
+            }
+          }
+          return;
+        }
+
+        // Branch C: already in plan mode with args → nudge user.
+        dispatch({
+          type: "SYSTEM_MESSAGE",
+          text: "Already in plan mode. Use /plan (no args) to exit.",
+        });
+        return;
+      }
+
       // Route slash commands
       const parsed = parseCommand(text);
       if (parsed) {
@@ -488,8 +679,10 @@ export function App({ botSession }: AppProps) {
           currentStreaming={state.currentAssistant}
           toolDetailExpanded={state.toolDetailExpanded}
           thinkingExpanded={state.thinkingExpanded}
+          verbose={botSession.config.verbose === true}
         />
       )}
+      {planExitMenu !== null && <PlanExitMenu planFilePath={planExitMenu} />}
       {state.error && <ErrorBanner error={state.error} />}
       <StreamingBar
         phase={state.phase}
@@ -501,6 +694,7 @@ export function App({ botSession }: AppProps) {
       <InputBox
         phase={state.phase}
         onSubmit={handleSubmit}
+        frozen={!!planExitMenu}
         onToggleThinking={() => dispatch({ type: "TOGGLE_THINKING_VIEW" })}
         focusState={state.focusState}
         recency={commandRecency}

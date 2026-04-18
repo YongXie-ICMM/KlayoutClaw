@@ -22,13 +22,24 @@ export interface MCPToolInfo {
   inputSchema: ToolInputSchema;
 }
 
-/** Tool call result content item. */
-export interface MCPContentItem {
-  type: "text" | "image";
-  text?: string;
-  data?: string;
-  mimeType?: string;
-}
+/**
+ * Tool call result content item.
+ *
+ * Discriminated union matching the Anthropic message-content schema:
+ *   - text:  `{ type: "text", text: string }`
+ *   - image: `{ type: "image", source: { type: "base64", media_type: string, data: string } }`
+ *
+ * Legacy flat fields (`data?`, `mimeType?`) were removed in 0.4.3 Group 4 —
+ * image content now lives under the nested `source` object so the whole
+ * pipeline (MCP → tool wrapper → TUI) can round-trip images without
+ * renegotiating the shape at each hop.
+ */
+export type MCPContentItem =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: string; data: string };
+    };
 
 /** MCP tool call result. */
 export interface MCPToolResult {

@@ -1,6 +1,6 @@
 # qlaybot — Device Design Agent
 
-Standalone TypeScript agent (v0.4.2) wrapping Pi-Agent SDK for quantum device design, orchestrating KLayout via MCP.
+Standalone TypeScript agent (v0.4.3) wrapping Pi-Agent SDK for quantum device design, orchestrating KLayout via MCP.
 
 ## Features
 
@@ -97,20 +97,10 @@ qlaybot help [<command>]              # Help
 | `/help` | `[command]` | Command help |
 | `/exit` | — | Graceful shutdown (TUI-only) |
 
-## Planning Mode
-
-`/plan` enters a modal state where the agent can reason and explore but cannot mutate the layout or filesystem.
-
-**Allowed (read-only):** `read`, `get_layout_info`, `screenshot`, `memory_save`, `memory_search`
-
-**Blocked:** `bash`, `write`, `edit`, `execute_script`, `create_layout`, `save_layout`, `auto_route`, all geometry/display/image/nanodevice tools
-
-Exit with `/plan exit` to resume full tool access.
-
 ## Architecture
 
 ```
-qlaybot v0.4.2
+qlaybot v0.4.3
   ├── Agent Layer
   │   ├── SOUL.md (physicist persona)
   │   ├── TOOLS.md / RULES.md (tool guide + design constraints)
@@ -185,6 +175,20 @@ QLAYBOT_E2E=0 npm test                # Skip E2E tests only
 ```
 
 **697 tests across 16 files** — split into unit (588), integration (95), and E2E (14) tiers. See `agent/CLAUDE.md` for the full breakdown.
+
+## v0.4.3 Features
+
+### Plan Mode
+A sandbox-gated planning mode with disk-persisted plan files. Enter via the `enter_plan_mode` tool (the agent invokes it proactively for multi-step device design) or by typing `/plan` at the prompt. While in plan mode, only the active plan file is writable — Bash and file writes outside the plan are blocked. Read, `klayout_get_layout_info`, `screenshot`, `route_inspect`, and `memory_search` remain available so the agent can gather evidence while planning. Exit plan mode from the menu (Ctrl+E → Exit Plan Mode) or via `/plan exit`.
+
+### `--verbose` flag
+Pass `--verbose` to disable tool-result truncation, print the full system prompt banner at startup, emit per-turn usage stats, and write a full-fidelity project transcript to `<workspace>/qlaybot-transcripts/`. Useful for debugging prompt assembly, long tool outputs, and cross-session replay.
+
+### iTerm2 inline image rendering
+When the terminal supports iTerm2's inline-image escape codes, base64 image blocks inside tool results (e.g. `screenshot` output) are rendered directly in the chat stream instead of shown as a base64 blob.
+
+### Transcript truncation (2000-char head+tail)
+By default, long tool-result entries in the in-session transcript are truncated to 2000 characters of head + 2000 characters of tail to keep the scrollback readable. Pass `--verbose` to disable truncation and keep the full output.
 
 ## License
 

@@ -17,6 +17,11 @@ import { startRPCServer } from "./rpc.js";
 import { subscribeToSession } from "./events.js";
 import { COMMAND_NAMES, parseCommand } from "./commands/index.js";
 import type { CommandContext } from "./commands/index.js";
+import {
+  printVerboseStartup,
+  subscribePerTurnStats,
+} from "./verbose-helpers.js";
+import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -31,6 +36,7 @@ interface CLIArgs {
   plain?: boolean;
   slashCommand?: string;
   slashArgs?: string[];
+  verbose: boolean;
 }
 
 export function parseArgs(argv: string[]): CLIArgs {
@@ -38,6 +44,7 @@ export function parseArgs(argv: string[]): CLIArgs {
     mode: "interactive",
     cwd: process.cwd(),
     command: "run",
+    verbose: false,
   };
 
   let i = 2;
@@ -63,6 +70,9 @@ export function parseArgs(argv: string[]): CLIArgs {
         break;
       case "--plain":
         args.plain = true;
+        break;
+      case "--verbose":
+        args.verbose = true;
         break;
       case "setup":
       case "onboard":
@@ -94,6 +104,31 @@ export function parseArgs(argv: string[]): CLIArgs {
   return args;
 }
 
+// Re-export verbose helpers so tests and RPC can load them from cli.ts.
+export {
+  printVerboseStartup,
+  formatTurnMessage,
+  subscribePerTurnStats,
+} from "./verbose-helpers.js";
+
+/**
+ * Wire verbose-mode output for the non-TUI plain / JSON / RPC CLI paths.
+ * Immediately prints the assembled system prompt to `startupStream` and
+ * subscribes per-turn stats to `perTurnStream`. Both streams default to
+ * stderr in the normal call site so stdout (JSON protocol output) stays
+ * clean. Returns a single unsubscribe function that detaches the per-turn
+ * listener — callers should invoke it during session dispose.
+ */
+export function wireVerbosePlain(
+  session: AgentSession,
+  startupStream: NodeJS.WritableStream,
+  perTurnStream: NodeJS.WritableStream,
+  assembledSystemPrompt: string,
+): () => void {
+  printVerboseStartup(startupStream, { assembledSystemPrompt });
+  return subscribePerTurnStats(session, perTurnStream);
+}
+
 function printHelp(): void {
   console.log(`
 qlaybot - Device Design Agent for KLayout (v0.3)
@@ -122,6 +157,7 @@ Options:
   --thinking <level>  Thinking level: off, minimal, low, medium, high, xhigh
   --cwd <path>        Working directory
   --plain             Use plain readline mode (no TUI)
+  --verbose           Print assembled system prompt + per-turn stats (runtime-only, not persisted)
   -h, --help          Show this help
 
 TUI Shortcuts:
@@ -204,20 +240,33 @@ async function runInteractive(args: CLIArgs): Promise<void> {
     cwd: args.cwd,
     model: args.model,
     thinkingLevel: args.thinkingLevel,
+    verbose: args.verbose,
   });
 
   if (useTUI) {
     const { renderTUI } = await import("./tui/render.js");
     await renderTUI(botSession);
   } else {
-    await runInteractivePlain(botSession);
+    await runInteractivePlain(botSession, args.verbose === true);
   }
 }
 
 async function runInteractivePlain(
   botSession: Awaited<ReturnType<typeof createDesignSession>>,
+  verbose = false,
 ): Promise<void> {
   console.log("qlaybot - Device Design Agent\n");
+
+  // §4.5: verbose non-TUI plain mode — dump system prompt + per-turn
+  // stats to stderr. stdout stays clean for the text-delta stream.
+  const verboseUnsub = verbose
+    ? wireVerbosePlain(
+        botSession.session,
+        process.stderr,
+        process.stderr,
+        botSession.assembledSystemPrompt,
+      )
+    : () => {};
 
   const unsubscribe = subscribeToSession(botSession.session, {
     onTextDelta: (text) => process.stdout.write(text),
@@ -239,6 +288,7 @@ async function runInteractivePlain(
     }
     if (input === "/quit" || input === "/exit") {
       unsubscribe();
+      verboseUnsub();
       await botSession.dispose();
       rl.close();
       process.exit(0);
@@ -256,6 +306,7 @@ async function runInteractivePlain(
 
   rl.on("close", async () => {
     unsubscribe();
+    verboseUnsub();
     await botSession.dispose();
     process.exit(0);
   });
@@ -294,7 +345,21 @@ async function runJSON(args: CLIArgs): Promise<void> {
     cwd: args.cwd,
     model: args.model,
     thinkingLevel: args.thinkingLevel,
+    verbose: args.verbose,
   });
+
+  // §4.5 non-TUI verbose: route system prompt + per-turn stats to stderr
+  // so stdout (JSON protocol output) stays clean. Delegates to the shared
+  // wireVerbosePlain helper so the same contract applies across plain,
+  // JSON, and RPC entry points.
+  const turnUnsub = args.verbose
+    ? wireVerbosePlain(
+        botSession.session,
+        process.stderr,
+        process.stderr,
+        botSession.assembledSystemPrompt,
+      )
+    : () => {};
 
   const chunks: string[] = [];
   const unsubscribe = subscribeToSession(botSession.session, {
@@ -334,6 +399,7 @@ async function runJSON(args: CLIArgs): Promise<void> {
     process.exit(1);
   } finally {
     unsubscribe();
+    turnUnsub();
     await botSession.dispose();
   }
 }
@@ -387,6 +453,7 @@ async function main(): Promise<void> {
             cwd: args.cwd,
             model: args.model,
             thinkingLevel: args.thinkingLevel,
+            verbose: args.verbose,
           });
           break;
         case "json":

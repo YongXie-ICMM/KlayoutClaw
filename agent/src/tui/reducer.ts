@@ -83,6 +83,8 @@ export const initialState: TUIState = {
   subagentInjectMode: false,
   subagentInjectTarget: null,
   subagentInjectValue: "",
+  // v0.4.3 Group 3: plan-mode exit menu
+  planExitMenu: null,
 };
 
 export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
@@ -453,6 +455,12 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
 
     case "PLAN_MODE_EXITED":
       return { ...state, inPlanMode: false };
+
+    case "PLAN_EXIT_MENU_OPEN":
+      return { ...state, planExitMenu: action.planFilePath };
+
+    case "PLAN_EXIT_MENU_CLOSE":
+      return { ...state, planExitMenu: null };
 
     case "TOGGLE_DETAIL_VIEW":
       return {

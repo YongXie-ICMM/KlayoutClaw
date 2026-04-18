@@ -5,13 +5,22 @@
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { SubagentConfig } from "../types/v04-contracts.js";
 import type { SubagentRunner } from "../subagent/runner.js";
+import type { PlanManager } from "../planning/index.js";
 import { Type } from "@sinclair/typebox";
 
 /**
  * Create the delegate tool that dispatches tasks to subagent roles.
+ *
+ * When `parentPlanManager` is provided and the parent is in plan mode, the
+ * delegate tool short-circuits with a `plan_mode_restricted` envelope BEFORE
+ * role validation — subagents would otherwise bypass the plan-mode sandbox.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createDelegateTool(runner: SubagentRunner, config: SubagentConfig): AgentTool<any> {
+export function createDelegateTool(
+  runner: SubagentRunner,
+  config: SubagentConfig,
+  parentPlanManager?: PlanManager,
+): AgentTool<any> {
   return {
     name: "delegate",
     label: "delegate",
@@ -25,6 +34,22 @@ export function createDelegateTool(runner: SubagentRunner, config: SubagentConfi
       toolCallId: string,
       params: { role: string; task: string; context?: string },
     ): Promise<AgentToolResult<any>> {
+      // Plan-mode gate (spec §9 step 8): block subagent dispatch when the
+      // parent is in plan mode so subagents cannot escape the sandbox.
+      if (parentPlanManager?.inPlanMode === true) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "plan_mode_restricted",
+              tool: "delegate",
+              message: "Cannot spawn a subagent during plan mode — subagents would bypass the sandbox. Exit plan mode first.",
+            }),
+          }],
+          details: { error: true, planModeRestricted: true },
+        };
+      }
+
       // Validate role exists
       const availableRoles = Object.keys(config.roles);
       if (!config.roles[params.role]) {

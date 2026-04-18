@@ -1237,11 +1237,12 @@ describe("agent-wiring", () => {
     expect(toolNames).not.toContain("delegate");
   });
 
-  // SCC-F4: delegate in plan mode ALLOWED_TOOLS
-  it("delegate is in plan mode ALLOWED_TOOLS list", async () => {
-    const { ALLOWED_TOOLS } = await import("../src/planning/sandbox.js");
-    expect(ALLOWED_TOOLS.has("delegate")).toBe(true);
-  });
+  // DELETED (qlaybot v0.4.3 Group 3 step 11): the SCC-F4 "delegate in
+  // plan-mode allowlist" test was removed because the legacy allowlist
+  // Set was deleted from src/planning/sandbox.ts per spec §9 step 11.
+  // Delegate is now unconditionally BLOCKED in plan mode (§1.11) — the
+  // opposite of the old allowlist behavior — and that new contract is
+  // covered by tests/test-plan-mode-v043-group2.ts.
 
   // SCC-F5: system prompt includes delegation section
   it("system prompt includes dynamic delegation section with role descriptions", async () => {

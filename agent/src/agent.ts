@@ -38,6 +38,7 @@ import { MemoryManager } from "./memory/index.js";
 import { createEmbedder } from "./memory/embedder.js";
 import { createAutoRecallTransform, defaultAutoRecallConfig } from "./memory/auto-recall.js";
 import { InteractionHistory } from "./history.js";
+import { VerboseTranscriptWriter } from "./verbose-transcript.js";
 import { CommandRegistry, createCommandRegistry } from "./commands/index.js";
 import { PlanManager } from "./planning/index.js";
 import { createToolResultPruner } from "./compaction/tool-result-pruner.js";
@@ -45,7 +46,6 @@ import { createStateLoaderTransform } from "./compaction/state-loader.js";
 import { resolveCompactionConfig, type CompactionConfig } from "./compaction/index.js";
 import { extractStateFiles } from "./compaction/state-extractor.js";
 import { buildCompactInstructions } from "./compaction/prompt-loader.js";
-import { wrapToolWithSandbox } from "./planning/sandbox.js";
 import { BackgroundTaskManager, BACKGROUNDABLE_TOOLS } from "./background/index.js";
 import { createBackgroundStatusTool, createBackgroundResultTool } from "./tools/background.js";
 import { resolve, dirname, join } from "path";
@@ -59,6 +59,8 @@ export interface CreateDesignSessionOptions {
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   ephemeral?: boolean;
   promptMode?: PromptMode;
+  /** §4.4 runtime-ephemeral verbose flag. CLI --verbose → createDesignSession. */
+  verbose?: boolean;
 }
 
 export interface QlayBotSession {
@@ -73,6 +75,7 @@ export interface QlayBotSession {
   planManager: PlanManager | null;
   backgroundTaskManager: BackgroundTaskManager | null;
   compactionConfig: CompactionConfig;
+  assembledSystemPrompt: string;
   compact: (userInstructions?: string) => Promise<void>;
   getContextUsage: () => { tokens: number; contextWindow: number; percent: number } | undefined;
   dispose: () => Promise<void>;
@@ -87,6 +90,12 @@ export async function createDesignSession(
   const cwd = opts.cwd ?? process.cwd();
   const agentDir = getQlayBotDir();
   const config = loadConfig();
+  // Propagate CLI --verbose override into runtime config. CLI wins. The
+  // field is never persisted to settings.json (§4.4 runtime-ephemeral).
+  if (opts.verbose === true) {
+    config.verbose = true;
+  }
+  const verbose = config.verbose === true;
   const compactionConfig = resolveCompactionConfig(config.compaction);
   const mode = opts.promptMode ?? PromptMode.Full;
 
@@ -168,12 +177,21 @@ export async function createDesignSession(
   const memoryManager = new MemoryManager(memoryDir, config.memory.budget, embedder, config);
 
   // --- Interaction History (with config snapshot) ---
-  const history = new InteractionHistory(opts.sessionId, {
-    model: modelRef,
-    thinkingLevel: opts.thinkingLevel ?? config.agent.thinkingLevel,
-    mcpServers: Object.keys(config.mcp),
-    klayoutConnected: mcpManager.isConnected("klayout"),
-  });
+  // When verbose=true, disable truncation (spec §4 — verbose mode preserves
+  // full-fidelity results in the transcript).
+  const historyTruncationOpts = verbose
+    ? { threshold: Infinity, headChars: 0, tailChars: 0 }
+    : undefined;
+  const history = new InteractionHistory(
+    opts.sessionId,
+    {
+      model: modelRef,
+      thinkingLevel: opts.thinkingLevel ?? config.agent.thinkingLevel,
+      mcpServers: Object.keys(config.mcp),
+      klayoutConnected: mcpManager.isConnected("klayout"),
+    },
+    historyTruncationOpts,
+  );
 
   // --- API key resolver ---
   const configApiKeyResolver = async (
@@ -188,7 +206,7 @@ export async function createDesignSession(
   };
 
   // --- Plan Manager + Background Task Manager (created early for tool wrapping) ---
-  const planManager = new PlanManager();
+  const planManager = new PlanManager(workspaceDir);
   const backgroundTaskManager = new BackgroundTaskManager();
 
   // --- Assemble tools ---
@@ -215,6 +233,8 @@ export async function createDesignSession(
       defaultModel: config.agent.defaultModel,
       defaultThinkingLevel: config.agent.thinkingLevel,
       modelRegistry,
+      planManager,
+      isSubagent: false,
     });
     subagentRunner = runner;
     // Extended signature returns tool map + runner — split into base + custom
@@ -228,23 +248,41 @@ export async function createDesignSession(
       }
     }
   } else {
-    const result = assembleTools({
+    // Migrate legacy call site to extended signature so planManager +
+    // isSubagent are threaded through consistently (spec §9 step 5.3).
+    const { toolMap } = assembleTools({
+      config,
       cwd,
       mcpManager,
       memoryManager,
+      workspaceDir,
+      annotations: TOOL_ANNOTATIONS,
       disabledTools: allDisabledTools,
+      getApiKey: configApiKeyResolver,
+      defaultModel: config.agent.defaultModel,
+      defaultThinkingLevel: config.agent.thinkingLevel,
+      modelRegistry,
+      planManager,
+      isSubagent: false,
     });
-    rawBaseTools = result.baseToolsOverride;
-    rawCustomTools = result.customTools;
+    rawBaseTools = {};
+    rawCustomTools = [];
+    for (const [name, tool] of Object.entries(toolMap)) {
+      if (['read', 'bash', 'edit', 'write'].includes(name)) {
+        rawBaseTools[name] = tool;
+      } else {
+        rawCustomTools.push(tool);
+      }
+    }
   }
 
-  // Wrap all tools with plan-mode sandbox
-  const baseToolsOverride: typeof rawBaseTools = {};
-  for (const [name, tool] of Object.entries(rawBaseTools)) {
-    baseToolsOverride[name] = wrapToolWithSandbox(tool, planManager);
-  }
+  // Plan-mode wrapping is already applied inside assembleTools (per-tool via
+  // wrapWriteForPlanMode/wrapEditForPlanMode/wrapBashForPlanMode/wrapMCPToolForPlanMode).
+  // Do NOT re-wrap with the legacy allowlist sandbox — its ALLOWED_TOOLS set would
+  // block exit_plan_mode, enter_plan_mode, write, edit, and most readonly MCP tools.
+  const baseToolsOverride = rawBaseTools;
   const customTools = [
-    ...rawCustomTools.map((t: any) => wrapToolWithSandbox(t, planManager)),
+    ...rawCustomTools,
     createBackgroundStatusTool(backgroundTaskManager),
     createBackgroundResultTool(backgroundTaskManager),
   ];
@@ -311,15 +349,6 @@ export async function createDesignSession(
     transformed = await autoRecall(transformed, signal);
     // Phase 3: inject compaction state
     transformed = stateLoader(transformed);
-    // Inject plan-mode system prompt
-    if (planManager.isActive()) {
-      const injection: AgentMessage = {
-        role: "user",
-        content: [{ type: "text", text: `[SYSTEM] ${planManager.getSystemPromptInjection()}` }],
-        timestamp: Date.now(),
-      };
-      transformed = [injection, ...transformed];
-    }
     return transformed;
   };
 
@@ -351,12 +380,24 @@ export async function createDesignSession(
 
   session.setAutoCompactionEnabled(false);
 
+  // --- Verbose transcript writer (spec §4.3, runtime-ephemeral) ---
+  // When verbose=true, every session event that reaches InteractionHistory
+  // is also mirrored to a JSONL transcript file for full-fidelity replay.
+  const verboseWriter: VerboseTranscriptWriter | null =
+    verbose
+      ? new VerboseTranscriptWriter(
+          workspaceDir,
+          history.getSessionId(),
+        )
+      : null;
+
   // --- Auto-save: subscribe to session events for interaction history ---
   const toolStartTimes = new Map<string, number>();
   const toolStartArgs = new Map<string, unknown>();
   let pendingTextChunks: string[] = [];
   let pendingThinkingChunks: string[] = [];
   const historyUnsub = session.subscribe((event) => {
+    if (verboseWriter) verboseWriter.write(event);
     switch (event.type) {
       case "message_update": {
         const ame = event.assistantMessageEvent;
@@ -419,6 +460,13 @@ export async function createDesignSession(
   // --- Dispose ---
   async function dispose(): Promise<void> {
     historyUnsub();
+    if (verboseWriter) {
+      try {
+        await verboseWriter.close();
+      } catch {
+        /* best-effort */
+      }
+    }
     session.dispose();
     memoryManager.close();
     await mcpManager.disconnectAll();
@@ -472,6 +520,7 @@ export async function createDesignSession(
     planManager,
     backgroundTaskManager,
     compactionConfig,
+    assembledSystemPrompt: systemPrompt,
     compact,
     getContextUsage,
     dispose,

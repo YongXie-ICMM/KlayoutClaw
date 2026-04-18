@@ -70,6 +70,13 @@ export interface QlayBotConfig {
   subagent: SubagentConfig;
   search: SearchConfig;
   embedding: EmbeddingConfig;
+  /**
+   * §4.4 runtime-ephemeral flag. Controls --verbose behavior (disable
+   * transcript truncation, print assembled system prompt, per-turn stats,
+   * VerboseTranscriptWriter). NEVER serialized to settings.json — excluded
+   * at saveSettingsConfig serialization boundary.
+   */
+  verbose: boolean;
 }
 
 /**
@@ -229,6 +236,7 @@ function defaultConfig(): QlayBotConfig {
     subagent: defaultSubagentConfig(),
     search: defaultSearchConfig(),
     embedding: defaultEmbeddingConfig(),
+    verbose: false,
   };
 }
 

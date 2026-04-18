@@ -7,6 +7,21 @@ import { createDesignSession, type QlayBotSession } from "./agent.js";
 import { subscribeToSession } from "./events.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
 import { createInterface } from "readline";
+import { readFileSync } from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+
+const __rpc_filename = fileURLToPath(import.meta.url);
+const __rpc_dirname = dirname(__rpc_filename);
+const PKG_VERSION = (
+  JSON.parse(
+    readFileSync(resolve(__rpc_dirname, "..", "package.json"), "utf8"),
+  ) as { version: string }
+).version;
+
+// Re-export §4.5 per-turn stats helper so callers can import it from
+// rpc.ts (matches the spec-test import surface).
+export { subscribePerTurnStats } from "./verbose-helpers.js";
 
 interface RPCRequest {
   jsonrpc: "2.0";
@@ -35,8 +50,14 @@ export async function startRPCServer(opts: {
   cwd?: string;
   model?: string;
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  verbose?: boolean;
 }): Promise<void> {
   let botSession: QlayBotSession | null = null;
+  let verbosePerTurnUnsub: (() => void) | null = null;
+  // Serialize concurrent `initialize` calls — parallel RPC init requests
+  // previously leaked sessions because both would race past the null-check
+  // on `botSession` before either cleanup ran.
+  let initializing: Promise<void> | null = null;
 
   const rl = createInterface({
     input: process.stdin,
@@ -81,14 +102,62 @@ export async function startRPCServer(opts: {
     try {
       switch (req.method) {
         case "initialize": {
-          botSession = await createDesignSession({
-            cwd: (req.params?.cwd as string) ?? opts.cwd,
-            model: (req.params?.model as string) ?? opts.model,
-            thinkingLevel:
-              (req.params?.thinkingLevel as "high") ?? opts.thinkingLevel,
-            ephemeral: req.params?.ephemeral !== false,
+          // Promise-chain serialization: every initialize call snapshots
+          // the current `initializing` promise BEFORE overwriting it,
+          // then chains `await prev` as the first line of its own task.
+          // This guarantees strict FIFO ordering regardless of how many
+          // initialize requests are in flight simultaneously — the simple
+          // `if (initializing) await initializing` idiom only serializes
+          // two callers because all waiters wake at once on resolve.
+          const prev = initializing ?? Promise.resolve();
+          const myInit = (async () => {
+            await prev;
+            // Clean up any prior session before re-initializing — guards
+            // against listener leaks when initialize is called twice on
+            // the same RPC connection.
+            verbosePerTurnUnsub?.();
+            verbosePerTurnUnsub = null;
+            await botSession?.dispose();
+            botSession = null;
+
+            botSession = await createDesignSession({
+              cwd: (req.params?.cwd as string) ?? opts.cwd,
+              model: (req.params?.model as string) ?? opts.model,
+              thinkingLevel:
+                (req.params?.thinkingLevel as "high") ?? opts.thinkingLevel,
+              ephemeral: req.params?.ephemeral !== false,
+              verbose:
+                (req.params?.verbose as boolean) ?? opts.verbose ?? false,
+            });
+            if (opts.verbose || req.params?.verbose) {
+              const { printVerboseStartup, subscribePerTurnStats } =
+                await import("./verbose-helpers.js");
+              printVerboseStartup(process.stderr, {
+                assembledSystemPrompt: botSession.assembledSystemPrompt,
+              });
+              // §4.5 — wire per-turn timing to stderr so JSON-RPC responses
+              // on stdout remain parseable. Unsubscribe on dispose.
+              verbosePerTurnUnsub = subscribePerTurnStats(
+                botSession.session,
+                process.stderr,
+              );
+            }
+          })();
+          // Store the tail-of-chain promise (swallowed rejection form) so
+          // the next initialize caller can await it without inheriting
+          // our failure — but THIS caller still sees the original error.
+          const tail = myInit.catch(() => {
+            /* swallow — propagates only to this caller below */
           });
-          sendResult(req.id, { status: "initialized" });
+          initializing = tail;
+          try {
+            await myInit;
+            sendResult(req.id, { status: "initialized" });
+          } finally {
+            // Only clear the pointer if no further initialize has chained
+            // onto us (i.e. the tail is still ours).
+            if (initializing === tail) initializing = null;
+          }
           break;
         }
 
@@ -182,7 +251,7 @@ export async function startRPCServer(opts: {
             model: botSession.config.agent.defaultModel,
             thinkingLevel: botSession.config.agent.thinkingLevel,
             contextUsage,
-            planMode: botSession.planManager?.isActive() ?? false,
+            planMode: botSession.planManager?.inPlanMode ?? false,
             backgroundTasks: botSession.backgroundTaskManager?.list() ?? [],
           });
           break;
@@ -190,6 +259,10 @@ export async function startRPCServer(opts: {
 
         case "dispose": {
           if (botSession) {
+            if (verbosePerTurnUnsub) {
+              verbosePerTurnUnsub();
+              verbosePerTurnUnsub = null;
+            }
             await botSession.dispose();
             botSession = null;
           }
@@ -199,6 +272,10 @@ export async function startRPCServer(opts: {
 
         case "shutdown": {
           if (botSession) {
+            if (verbosePerTurnUnsub) {
+              verbosePerTurnUnsub();
+              verbosePerTurnUnsub = null;
+            }
             await botSession.dispose();
             botSession = null;
           }
@@ -218,10 +295,14 @@ export async function startRPCServer(opts: {
 
   rl.on("close", async () => {
     if (botSession) {
+      if (verbosePerTurnUnsub) {
+        verbosePerTurnUnsub();
+        verbosePerTurnUnsub = null;
+      }
       await botSession.dispose();
     }
     process.exit(0);
   });
 
-  sendEvent("ready", { version: "0.3.0" });
+  sendEvent("ready", { version: PKG_VERSION });
 }

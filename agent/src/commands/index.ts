@@ -9,7 +9,6 @@ import { mcpCommand } from "./mcp.js";
 import { configCommand } from "./config.js";
 import { contextCommand } from "./context.js";
 import { memoryCommand } from "./memory.js";
-import { planCommand } from "./plan.js";
 import { tasksCommand } from "./tasks.js";
 import { helpCommand } from "./help.js";
 import { exitCommand } from "./exit.js";
@@ -91,7 +90,6 @@ export function createCommandRegistry(): CommandRegistry {
   registry.register(configCommand);
   registry.register(contextCommand);
   registry.register(memoryCommand);
-  registry.register(planCommand);
   registry.register(tasksCommand);
   registry.register(compactCommand);
   registry.register(helpCommand);
@@ -102,5 +100,5 @@ export function createCommandRegistry(): CommandRegistry {
 /** All command names for CLI detection */
 export const COMMAND_NAMES = [
   "model", "mcp", "config", "context", "memory",
-  "plan", "tasks", "compact", "help", "exit",
+  "tasks", "compact", "help", "exit",
 ];

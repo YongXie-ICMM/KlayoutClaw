@@ -122,12 +122,19 @@ export async function callTool(
 
 /**
  * Parse text content from MCP tool result.
+ *
+ * Image blocks are ignored — only text is returned. After 0.4.3 Group 4
+ * `MCPContentItem` is a discriminated union, so we narrow via `type`
+ * before reading `text`.
  */
 export function parseTextResult(result: MCPToolResult): string {
-  const textItems = result.content.filter(
-    (c: MCPContentItem) => c.type === "text" && c.text,
-  );
-  return textItems.map((c: MCPContentItem) => c.text!).join("\n");
+  const textItems: string[] = [];
+  for (const c of result.content as MCPContentItem[]) {
+    if (c.type === "text" && typeof c.text === "string" && c.text.length > 0) {
+      textItems.push(c.text);
+    }
+  }
+  return textItems.join("\n");
 }
 
 /**

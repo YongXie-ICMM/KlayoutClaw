@@ -6,6 +6,11 @@
 import { existsSync, mkdirSync, appendFileSync, writeFileSync, symlinkSync, unlinkSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import {
+  DEFAULT_TRANSCRIPT_TRUNCATION,
+  truncate,
+  type TruncationOptions,
+} from "./truncation.js";
 
 const HISTORY_DIR = join(homedir(), ".qlaybot", "history");
 
@@ -19,9 +24,16 @@ export class InteractionHistory {
   private sessionDir: string;
   private sessionId: string;
   private toolCallCounter = 0;
+  private truncationOpts: TruncationOptions;
 
-  constructor(sessionId?: string, configSnapshot?: Record<string, unknown>) {
+  constructor(
+    sessionId?: string,
+    configSnapshot?: Record<string, unknown>,
+    truncationOpts?: TruncationOptions | null,
+  ) {
     this.sessionId = sessionId ?? `session_${Date.now()}`;
+    this.truncationOpts =
+      truncationOpts == null ? DEFAULT_TRANSCRIPT_TRUNCATION : truncationOpts;
     const dateDir = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     this.sessionDir = join(HISTORY_DIR, dateDir, this.sessionId);
     this.ensureDirs();
@@ -102,17 +114,36 @@ export class InteractionHistory {
 
   /**
    * Record a tool call.
+   *
+   * The `result` field is serialized (string passthrough; otherwise
+   * JSON.stringify with 2-space indent) and run through the configured
+   * truncation. When truncation actually fires, `truncated: true` and
+   * `original_length: number` metadata fields are appended so consumers can
+   * detect truncation. Args are NEVER truncated. The same toolLog is written
+   * to BOTH transcript.jsonl AND the per-tool JSON file (single source of
+   * truth — the full result is not preserved on disk unless verbose-bypass
+   * opts {threshold: Infinity, ...} were passed to the constructor).
    */
   recordToolCall(toolName: string, args: unknown, result: unknown, durationMs: number): void {
     this.toolCallCounter++;
     const padded = String(this.toolCallCounter).padStart(3, "0");
-    const toolLog = {
+
+    const serialized =
+      typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    const original_length = serialized.length;
+    const truncated = truncate(serialized, this.truncationOpts);
+
+    const toolLog: Record<string, unknown> = {
       toolName,
       args,
-      result,
+      result: truncated,
       durationMs,
       timestamp: new Date().toISOString(),
     };
+    if (serialized.length > this.truncationOpts.threshold) {
+      toolLog.truncated = true;
+      toolLog.original_length = original_length;
+    }
 
     // Write individual tool call log
     writeFileSync(

@@ -1,6 +1,6 @@
 {
   "name": "qlaybot",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Device design agent wrapping Pi-Agent SDK for KLayout MCP orchestration",
   "type": "module",
   "main": "dist/index.js",
@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:perf": "QLAYBOT_BENCH=1 vitest run tests/test-perf-v043.ts --testTimeout=300000",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:watch": "vitest",
     "clean": "rm -rf dist"
