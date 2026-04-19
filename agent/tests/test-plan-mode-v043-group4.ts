@@ -764,7 +764,12 @@ describe("Group 4 · Step 13 · renderFallback", () => {
 // Step 13 — ToolPanel E2E integration (T28 / T29 / T30)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Group 4 · Step 13 · ToolPanel expanded view · image rendering", () => {
+// Image rendering in ToolPanel was removed to stop long-session OOM —
+// base64 screenshots stayed pinned in reducer state forever and drove the
+// heap to 4GB. Images are now replaced with a `[image omitted: …]` text
+// placeholder by truncateToolResult in the reducer, and ToolPanel renders
+// text only. The image-render module itself is still tested above.
+describe.skip("Group 4 · Step 13 · ToolPanel expanded view · image rendering", () => {
   /** Collect tmp files written by fallback renders so we can clean up. */
   const savedFallbackPaths: string[] = [];
   afterEach(() => {

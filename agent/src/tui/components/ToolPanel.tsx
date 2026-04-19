@@ -4,99 +4,20 @@
  * Expanded mode: full args + truncated result (8 head + 8 tail).
  */
 
-import React, { useMemo, useState, useLayoutEffect } from "react";
-import * as os from "node:os";
+import React, { useMemo } from "react";
 import { Text, Box } from "ink";
 import { Spinner } from "@inkjs/ui";
 import figures from "figures";
 import cliTruncate from "cli-truncate";
 import { theme } from "../theme.js";
 import type { ToolExecution } from "../types.js";
-import {
-  detectImageRenderMode,
-  base64DecodedSize,
-  renderInlineImage,
-  renderFallback,
-} from "../image-render.js";
 
 /**
- * Threshold above which the iTerm2 inline-image escape is skipped in favor
- * of the save-to-file fallback. Large base64 payloads blow up terminal
- * buffers and some terminals refuse to render them.
+ * Inline-image rendering in the TUI was removed to eliminate long-session
+ * OOM. Screenshots and other image blocks are now converted to a `[image
+ * omitted: …]` text placeholder by `truncateToolResult` in the reducer, so
+ * this component only ever sees text content.
  */
-const IMAGE_INLINE_MAX_BYTES = 2_000_000;
-
-/**
- * Module-level LRU cache for the fallback (disk-writing) render path.
- *
- * Only the fallback path is cached here — `renderInlineImage` is pure (just
- * builds a string), no need to memoize. The cache's job is to prevent
- * re-writing the same image to tmp on re-mount / remount of a component
- * for the same tool result.
- *
- * The cache is populated inside `useLayoutEffect` (commit phase, never
- * render phase), so React's "no side effects in render" invariant holds.
- * One entry per `(tool.id, blockIdx, data.length)` for the lifetime of
- * the process — tool results in qlaybot are immutable once set by the
- * reducer on `tool_end`, so the key is safely stable.
- *
- * LRU-capped to bound memory on long sessions.
- */
-const IMAGE_RENDER_CACHE_MAX = 200;
-const imageRenderCache = new Map<string, string>();
-
-function makeCacheKey(
-  toolId: string,
-  blockIdx: number,
-  mediaType: string,
-  dataLen: number,
-): string {
-  return `${toolId}:${blockIdx}:${mediaType}:${dataLen}`;
-}
-
-type ContentBlock =
-  | { type: "text"; text: string }
-  | {
-      type: "image";
-      source: { type: "base64"; media_type: string; data: string };
-    };
-
-/**
- * Pull the `{type, ...}` content blocks out of an MCP tool result. Returns
- * empty array when the result is not shaped like an MCP tool-result.
- */
-function extractContentBlocks(result: unknown): ContentBlock[] {
-  if (result == null || typeof result !== "object") return [];
-  const content = (result as { content?: unknown }).content;
-  if (!Array.isArray(content)) return [];
-  const out: ContentBlock[] = [];
-  for (const c of content) {
-    if (c == null || typeof c !== "object") continue;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const item = c as any;
-    if (item.type === "text" && typeof item.text === "string") {
-      out.push({ type: "text", text: item.text });
-    } else if (
-      item.type === "image" &&
-      item.source != null &&
-      typeof item.source === "object" &&
-      typeof item.source.data === "string"
-    ) {
-      out.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type:
-            typeof item.source.media_type === "string"
-              ? item.source.media_type
-              : "image/png",
-          data: item.source.data,
-        },
-      });
-    }
-  }
-  return out;
-}
 
 interface ToolPanelProps {
   tool: ToolExecution;
@@ -349,68 +270,6 @@ export function ToolPanel({ tool, expanded, verbose = false }: ToolPanelProps) {
   const duration = formatDuration(tool);
   const durationSuffix = duration ? ` (${duration})` : "";
 
-  // Hooks MUST run unconditionally every render. Previously the useState +
-  // useLayoutEffect below lived AFTER the `if (!expanded) return` branch, so
-  // toggling Ctrl+T (expanded ↔ compact) changed the hook count and React
-  // threw "Rendered more hooks than during the previous render." Compute the
-  // image-block detection up front and run the hooks in every branch; the
-  // results are only consumed in the expanded branch's JSX.
-  const resultBlocks =
-    tool.status !== "running" && tool.result != null
-      ? extractContentBlocks(tool.result)
-      : [];
-  const hasImageBlock = resultBlocks.some((b) => b.type === "image");
-
-  const [fallbackPaths, setFallbackPaths] = useState<Map<number, string>>(() => {
-    const m = new Map<number, string>();
-    for (let i = 0; i < resultBlocks.length; i++) {
-      const b = resultBlocks[i];
-      if (b.type !== "image") continue;
-      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
-      const cached = imageRenderCache.get(key);
-      if (cached !== undefined) m.set(i, cached);
-    }
-    return m;
-  });
-
-  useLayoutEffect(() => {
-    if (!hasImageBlock) return;
-    const mode = detectImageRenderMode();
-    let nextMap: Map<number, string> | null = null;
-    for (let i = 0; i < resultBlocks.length; i++) {
-      const b = resultBlocks[i];
-      if (b.type !== "image") continue;
-      const size = base64DecodedSize(b.source.data);
-      if (mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES) continue;
-
-      const key = makeCacheKey(tool.id, i, b.source.media_type, b.source.data.length);
-      const existing = imageRenderCache.get(key);
-      if (existing !== undefined) {
-        imageRenderCache.delete(key);
-        imageRenderCache.set(key, existing);
-        if (!fallbackPaths.has(i) || fallbackPaths.get(i) !== existing) {
-          if (nextMap === null) nextMap = new Map(fallbackPaths);
-          nextMap.set(i, existing);
-        }
-        continue;
-      }
-      const rendered = renderFallback(
-        b.source.data,
-        os.tmpdir(),
-        b.source.media_type,
-      );
-      imageRenderCache.set(key, rendered);
-      if (imageRenderCache.size > IMAGE_RENDER_CACHE_MAX) {
-        const oldest = imageRenderCache.keys().next().value;
-        if (oldest !== undefined) imageRenderCache.delete(oldest);
-      }
-      if (nextMap === null) nextMap = new Map(fallbackPaths);
-      nextMap.set(i, rendered);
-    }
-    if (nextMap !== null) setFallbackPaths(nextMap);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool.id, resultBlocks.length, hasImageBlock]);
-
   // ── Compact view (default) ──
   if (!expanded) {
     const header = compactHeader(tool, cols - 10);
@@ -464,39 +323,9 @@ export function ToolPanel({ tool, expanded, verbose = false }: ToolPanelProps) {
           <Text>{theme.toolArgs(cliTruncate(argsStr, cols - 6))}</Text>
         </Box>
       )}
-      {tool.status !== "running" && tool.result != null && !hasImageBlock && (
+      {tool.status !== "running" && tool.result != null && (
         <Box marginLeft={3} flexDirection="column">
           <Text>{theme.muted(formatResult(tool.result, verbose))}</Text>
-        </Box>
-      )}
-      {tool.status !== "running" && tool.result != null && hasImageBlock && (
-        <Box marginLeft={3} flexDirection="column">
-          {resultBlocks.map((block, i) => {
-            if (block.type === "image") {
-              // Render-phase decision: PURE string computation only.
-              // iTerm2 inline → pure escape string, safe during render.
-              // Fallback → read pre-populated path from state (populated
-              // by the useLayoutEffect above during commit phase).
-              const mode = detectImageRenderMode();
-              const size = base64DecodedSize(block.source.data);
-              const canInline =
-                mode === "iterm2" && size <= IMAGE_INLINE_MAX_BYTES;
-              const rendered = canInline
-                ? renderInlineImage(block.source.data)
-                : fallbackPaths.get(i) ?? "[image loading...]";
-              // Pin width generously and disable wrapping so long tmp-dir
-              // paths (common on macOS: ~80 chars for /var/folders/...)
-              // don't get folded across lines. The iTerm2 escape is a
-              // single token without whitespace so this is a no-op for
-              // inline-render; it matters for the fallback marker.
-              return (
-                <Box key={i} width={10_000}>
-                  <Text wrap="truncate-end">{rendered}</Text>
-                </Box>
-              );
-            }
-            return <Text key={i}>{theme.muted(block.text)}</Text>;
-          })}
         </Box>
       )}
     </Box>

@@ -1,7 +1,12 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --max-old-space-size=8192
 /**
  * qlaybot CLI entry point.
  * Supports interactive, JSON, and RPC modes.
+ *
+ * The shebang bumps V8's old-generation heap cap from Node's default ~4 GB
+ * to 8 GB. Autonomous design sessions run for hours with large transcript
+ * state + MCP tool results held in the Agent's internal history; the 4 GB
+ * default got hit routinely during idle waits between prompts.
  */
 
 import { resolve, dirname } from "path";

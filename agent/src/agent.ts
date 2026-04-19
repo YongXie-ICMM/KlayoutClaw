@@ -381,15 +381,25 @@ export async function createDesignSession(
   session.setAutoCompactionEnabled(false);
 
   // --- Verbose transcript writer (spec §4.3, runtime-ephemeral) ---
-  // When verbose=true, every session event that reaches InteractionHistory
-  // is also mirrored to a JSONL transcript file for full-fidelity replay.
+  // When verbose=true we mirror every entry that reaches
+  // InteractionHistory.transcript.jsonl into a JSONL file next to where the
+  // user launched qlaybot (process.cwd()), not the internal qlaybot
+  // workspace (~/.qlaybot/workspace). The writer is attached as a mirror on
+  // the history instance so the two transcripts are byte-for-byte identical
+  // — previously we tapped raw session.subscribe events (deltas, partial
+  // results, etc.) which produced a transcript that did not match
+  // ~/.qlaybot/history/.../transcript.jsonl.
+  const verboseTranscriptDir = process.cwd();
   const verboseWriter: VerboseTranscriptWriter | null =
     verbose
       ? new VerboseTranscriptWriter(
-          workspaceDir,
+          verboseTranscriptDir,
           history.getSessionId(),
         )
       : null;
+  if (verboseWriter) {
+    history.setMirror((entry) => verboseWriter.write(entry));
+  }
 
   // --- Auto-save: subscribe to session events for interaction history ---
   const toolStartTimes = new Map<string, number>();
@@ -397,7 +407,6 @@ export async function createDesignSession(
   let pendingTextChunks: string[] = [];
   let pendingThinkingChunks: string[] = [];
   const historyUnsub = session.subscribe((event) => {
-    if (verboseWriter) verboseWriter.write(event);
     switch (event.type) {
       case "message_update": {
         const ame = event.assistantMessageEvent;

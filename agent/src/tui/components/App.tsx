@@ -448,18 +448,35 @@ export function App({ botSession }: AppProps) {
     return () => unsubscribe();
   }, [botSession]);
 
-  // Poll context usage
+  // Poll context usage. Skip the dispatch when values are unchanged so idle
+  // sessions don't re-clone state + re-reconcile Ink every 5 s for hours —
+  // that was the one recurring allocation source during long idle waits and
+  // drove heap growth all the way to the 4 GB cap.
+  const lastUsageRef = useRef<{ tokens: number; contextWindow: number; percent: number } | null>(null);
   useEffect(() => {
     const timer = setInterval(() => {
       const usage = botSession.getContextUsage();
-      if (usage) {
-        dispatch({
-          type: "CONTEXT_USAGE_UPDATE",
-          tokens: usage.tokens,
-          contextWindow: usage.contextWindow,
-          percent: usage.percent,
-        });
+      if (!usage) return;
+      const prev = lastUsageRef.current;
+      if (
+        prev &&
+        prev.tokens === usage.tokens &&
+        prev.contextWindow === usage.contextWindow &&
+        prev.percent === usage.percent
+      ) {
+        return;
       }
+      lastUsageRef.current = {
+        tokens: usage.tokens,
+        contextWindow: usage.contextWindow,
+        percent: usage.percent,
+      };
+      dispatch({
+        type: "CONTEXT_USAGE_UPDATE",
+        tokens: usage.tokens,
+        contextWindow: usage.contextWindow,
+        percent: usage.percent,
+      });
     }, botSession.config.tui.contextPollMs);
     return () => clearInterval(timer);
   }, [botSession]);

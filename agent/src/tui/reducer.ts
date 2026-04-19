@@ -45,6 +45,27 @@ export function truncateToolResult(result: unknown): unknown {
             changed = true;
             return { ...item, text: t };
           }
+          return c;
+        }
+        // Drop base64 image blocks — they are the single largest contributor
+        // to long-session OOM (each screenshot ≈ 1MB of base64 retained in
+        // state for the whole session). Accept both MCP shapes: the nested
+        // `{source:{type:"base64", data, media_type}}` form Anthropic SDK
+        // emits AND the flat `{type:"image", data, mimeType|mediaType}` form
+        // KlayoutClaw's MCP server emits for screenshot/read_image results.
+        if (item.type === "image") {
+          const src =
+            item.source != null && typeof item.source === "object"
+              ? (item.source as Record<string, unknown>)
+              : null;
+          const dataRaw = src?.data ?? item.data;
+          const mediaRaw =
+            src?.media_type ?? item.media_type ?? item.mimeType ?? item.mime_type;
+          const data = typeof dataRaw === "string" ? dataRaw : "";
+          const mediaType = typeof mediaRaw === "string" ? mediaRaw : "image/png";
+          const kb = Math.round((data.length * 3) / 4 / 1024);
+          changed = true;
+          return { type: "text", text: `[image omitted: ${mediaType}, ${kb} KB]` };
         }
         return c;
       });

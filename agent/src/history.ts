@@ -25,6 +25,10 @@ export class InteractionHistory {
   private sessionId: string;
   private toolCallCounter = 0;
   private truncationOpts: TruncationOptions;
+  /** Optional tap that receives every entry appended to transcript.jsonl.
+   *  Used by the --verbose writer to produce a workspace-local transcript
+   *  that is line-for-line identical to ~/.qlaybot/history/…/transcript.jsonl. */
+  private mirror: ((entry: HistoryEntry) => void) | null = null;
 
   constructor(
     sessionId?: string,
@@ -39,6 +43,13 @@ export class InteractionHistory {
     this.ensureDirs();
     this.saveMetadata(configSnapshot);
     this.updateLatestSymlink();
+  }
+
+  /** Attach a tap that receives every appended HistoryEntry. Used by the
+   *  verbose writer so the workspace-local transcript matches the on-disk
+   *  history transcript exactly. */
+  setMirror(mirror: ((entry: HistoryEntry) => void) | null): void {
+    this.mirror = mirror;
   }
 
   private ensureDirs(): void {
@@ -77,6 +88,13 @@ export class InteractionHistory {
   appendTranscript(entry: HistoryEntry): void {
     const line = JSON.stringify(entry) + "\n";
     appendFileSync(join(this.sessionDir, "transcript.jsonl"), line);
+    if (this.mirror) {
+      try {
+        this.mirror(entry);
+      } catch {
+        /* mirror is best-effort — don't let it break history writes */
+      }
+    }
   }
 
   /**
