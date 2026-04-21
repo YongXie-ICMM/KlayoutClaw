@@ -672,7 +672,17 @@ class RepoHandle:
         """DM-5 placeholder — journal writing lands in task 4.6."""
         return  # no-op until task 4.6
 
-    # _migrate_to is added in task 4.5.
+    # Internal: migrate the underlying repo directory to a new location
+    # (sidecar).  Called by ``migrate_to_disk``.
+    def _migrate_to(self, new_repo_path: str) -> None:
+        os.makedirs(os.path.dirname(new_repo_path), exist_ok=True)
+        # shutil.move preserves the internal layout incl. .git.
+        if os.path.exists(new_repo_path):
+            shutil.rmtree(new_repo_path)
+        shutil.move(self._repo_path, new_repo_path)
+        self._repo_path = new_repo_path
+        self._mode = "disk"
+        self._owns_tmpdir = False
 
 
 # ---------------------------------------------------------------------------
@@ -740,5 +750,15 @@ def init(gds_path: str) -> RepoHandle:
     return handle
 
 
-def migrate_to_disk(handle: RepoHandle, gds_path: str) -> None:  # pragma: no cover - implemented in task 4.5
-    raise NotImplementedError("migrate_to_disk is implemented in task 4.5")
+def migrate_to_disk(handle: RepoHandle, gds_path: str) -> None:
+    """DM-4: atomically move the in-memory tmp repo to ``<gds_path>.vc``.
+
+    After migration the handle remains valid and its ``status().mode`` is
+    ``"disk"``.  Idempotent: calling on an already-disk handle is a no-op.
+    """
+    if handle._invalidated:
+        return
+    if handle._mode == "disk":
+        return
+    sidecar = _sidecar_of(gds_path)
+    handle._migrate_to(sidecar)
