@@ -21,6 +21,7 @@ export const unitFiles = [
   "tests/test-plan-mode-v043-group5.ts",
   "tests/test-plan-mode-v043-group6.ts",
   "tests/test-plan-mode-v043-group6b.ts",
+  "tests/test-marker-emitter.ts",
 ];
 
 export const integrationFiles = [
