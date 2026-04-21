@@ -4,6 +4,8 @@
  */
 
 import type { AgentSession, AgentSessionEventListener } from "@mariozechner/pi-coding-agent";
+import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
+import type { TranscriptMarker } from "./events/marker-types.js";
 
 export interface QlayBotEventCallbacks {
   onTextDelta?: (text: string) => void;
@@ -24,6 +26,14 @@ export interface QlayBotEventCallbacks {
     cacheWrite: number;
     totalTokens: number;
   }) => void;
+  /**
+   * v0.4.4 §4.7 — fires once per TranscriptMarkerEmitter marker event on
+   * the current session. The callback receives the raw marker object
+   * (object identity preserved — no envelope wrapping). The TUI and any
+   * other consumer subscribes here instead of reaching into the emitter
+   * directly; subscribeToSession handles unsubscribe on dispose.
+   */
+  onTranscriptMarker?: (marker: TranscriptMarker) => void;
 }
 
 export interface SubscribeOptions {
@@ -97,5 +107,29 @@ export function subscribeToSession(
   };
 
   const unsubscribe = session.subscribe(listener);
-  return unsubscribe;
+
+  // §4.7 — bridge TranscriptMarkerEmitter "marker" events to the
+  // onTranscriptMarker callback if supplied. We resolve the emitter
+  // lazily via the WeakMap registry so this helper doesn't need a
+  // direct reference passed in; createDesignSession registers it on
+  // session construction. If no emitter is bound (e.g. legacy sessions)
+  // we simply skip the marker subscription — markers are forward-compat
+  // per §2 invariant.
+  let markerUnsubscribe: (() => void) | null = null;
+  if (callbacks.onTranscriptMarker) {
+    const emitter = getTranscriptMarkerEmitter(session);
+    if (emitter) {
+      const onMarker = callbacks.onTranscriptMarker;
+      const markerListener = (m: unknown): void => {
+        onMarker(m as TranscriptMarker);
+      };
+      emitter.on("marker", markerListener);
+      markerUnsubscribe = () => emitter.off("marker", markerListener);
+    }
+  }
+
+  return () => {
+    unsubscribe();
+    markerUnsubscribe?.();
+  };
 }
