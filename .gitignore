@@ -38,3 +38,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# paper
+paper/
+
+#opencode
+opencode.json
