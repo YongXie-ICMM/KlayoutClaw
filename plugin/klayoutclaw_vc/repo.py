@@ -650,7 +650,51 @@ class RepoHandle:
             "mode": self._mode,
         }
 
-        # DM-5 recovery surface is added in task 4.6.
+        # DM-5: surface recovery state when a journal exists and the live
+        # working tree has diverged from ``last_good_sha``.
+        if self._mode == "disk":
+            journal_path = os.path.join(
+                self._repo_path, _RECOVERY_DIR, _JOURNAL_FILENAME)
+            if os.path.exists(journal_path):
+                try:
+                    with open(journal_path, "r") as fh:
+                        j = json.load(fh)
+                    lgs = j.get("last_good_sha")
+                    if isinstance(lgs, str) and lgs:
+                        needs_recovery = False
+                        if head_sha and head_sha != lgs:
+                            needs_recovery = True
+                        if dirty:
+                            needs_recovery = True
+                        # Also flag recovery if the sidecar carries
+                        # untracked user files (simulates an uncheckpointed
+                        # edit — tests drop a stray .txt into the sidecar
+                        # before re-init).  The RECOVERY/ directory itself
+                        # is excluded so our own metadata doesn't trigger
+                        # the signal.
+                        if not needs_recovery:
+                            untracked_r = _git(
+                                self._repo_path, "status", "--porcelain",
+                                "--ignored=no")
+                            if untracked_r.returncode == 0:
+                                for ln in untracked_r.stdout.splitlines():
+                                    stripped = ln.strip()
+                                    if not stripped:
+                                        continue
+                                    if (_RECOVERY_DIR + "/" in stripped
+                                            or stripped.endswith(
+                                                _RECOVERY_DIR)):
+                                        continue
+                                    needs_recovery = True
+                                    break
+                        if needs_recovery:
+                            st["recovery_offered"] = True
+                            st["last_good_sha"] = lgs
+                        else:
+                            st["recovery_offered"] = False
+                except Exception:
+                    pass
+
         return st
 
     # ------------------------------------------------------------------
@@ -669,8 +713,25 @@ class RepoHandle:
         return name
 
     def _write_recovery_journal(self, sha: str, ts: str) -> None:
-        """DM-5 placeholder — journal writing lands in task 4.6."""
-        return  # no-op until task 4.6
+        """DM-5: persist the last good sha + ts to ``RECOVERY/journal.json``.
+
+        Written atomically (tmp + rename) on every successful disk-mode
+        checkpoint.  ``init()`` reads this back and exposes
+        ``status().recovery_offered = True`` when the on-disk working tree
+        diverges from ``last_good_sha`` — signalling a crash between the
+        last good checkpoint and the current handle's re-init.
+        """
+        rec_dir = os.path.join(self._repo_path, _RECOVERY_DIR)
+        try:
+            os.makedirs(rec_dir, exist_ok=True)
+            journal_path = os.path.join(rec_dir, _JOURNAL_FILENAME)
+            tmp_path = journal_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump({"last_good_sha": sha, "ts": ts}, fh)
+            os.replace(tmp_path, journal_path)
+        except Exception:
+            # Best-effort — don't fail the checkpoint on journal errors.
+            pass
 
     # Internal: migrate the underlying repo directory to a new location
     # (sidecar).  Called by ``migrate_to_disk``.
