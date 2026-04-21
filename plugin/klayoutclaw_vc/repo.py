@@ -617,7 +617,24 @@ class RepoHandle:
     # status — RB-4 / T34 (re-reads from disk each call)
     # ------------------------------------------------------------------
 
-    def status(self) -> Dict[str, Any]:
+    def status(self, layout: Optional["pya.Layout"] = None) -> Dict[str, Any]:  # noqa: F821
+        """Return the live status dict for the repo.
+
+        RB-4 dirty detection (spec §5.2.2):
+          * If ``layout`` is provided, ``dirty`` reflects whether
+            ``serializer.serialize(layout)`` differs from the HEAD
+            commit's stored ``snapshot.txt`` (DM-1 deterministic
+            comparison).  This is the spec-compliant path.
+          * If ``layout`` is ``None`` (backwards-compatible no-arg form
+            used by the Phase 5 server bridge when the layout isn't
+            readily in scope), ``dirty`` falls back to the internal
+            ``_dirty`` flag — which tracks dirtiness induced by a
+            failed checkpoint — OR a non-empty ``git status
+            --porcelain --untracked-files=no`` on the sidecar.
+
+        Re-evaluated on every call (T34 non-caching rule): the HEAD
+        snapshot is re-read each time, never cached.
+        """
         if self._invalidated:
             return {"ok": False, "reason": "handle invalidated"}
 
@@ -634,13 +651,21 @@ class RepoHandle:
             if r_ts.returncode == 0:
                 last_ts = r_ts.stdout.strip() or None
 
-        # Dirty: our flag OR git reports uncommitted tracked changes.
-        dirty = bool(self._dirty)
-        if not dirty and os.path.isdir(os.path.join(self._repo_path, ".git")):
-            r_st = _git(self._repo_path, "status", "--porcelain",
-                        "--untracked-files=no")
-            if r_st.returncode == 0 and r_st.stdout.strip():
-                dirty = True
+        # Dirty:
+        #   * If a layout was supplied, compare serialize(layout) against
+        #     the HEAD commit's stored snapshot.txt — spec-compliant
+        #     RB-4 path.  No caching (recomputed every call).
+        #   * Otherwise fall back to the internal flag + git status.
+        dirty: bool
+        if layout is not None:
+            dirty = self._dirty_vs_head(layout, head_sha)
+        else:
+            dirty = bool(self._dirty)
+            if not dirty and os.path.isdir(os.path.join(self._repo_path, ".git")):
+                r_st = _git(self._repo_path, "status", "--porcelain",
+                            "--untracked-files=no")
+                if r_st.returncode == 0 and r_st.stdout.strip():
+                    dirty = True
 
         st: Dict[str, Any] = {
             "branch": branch,
@@ -711,6 +736,35 @@ class RepoHandle:
             r2 = _git(self._repo_path, "rev-parse", "HEAD")
             return r2.stdout.strip() if r2.returncode == 0 else None
         return name
+
+    def _dirty_vs_head(self, layout, head_sha: Optional[str]) -> bool:
+        """Spec-compliant RB-4 dirty detection.
+
+        Compares the DM-1 serialised form of ``layout`` against the
+        ``snapshot.txt`` blob at ``head_sha``.  No HEAD → everything is
+        dirty by definition (no baseline to compare against, so any
+        non-empty layout represents uncheckpointed content).  On any
+        error (bad commit, corrupt blob, serialisation failure) we fall
+        back to the internal flag so a transient IO hiccup doesn't
+        falsely report a clean tree.
+        """
+        try:
+            live_text = serializer.serialize(layout)
+        except Exception:
+            return bool(self._dirty)
+        if not head_sha:
+            # No baseline: treat as dirty unless the caller's layout
+            # happens to be the empty-layout serialisation of nothing.
+            return bool(live_text)
+        r = _git(self._repo_path, "show",
+                 f"{head_sha}:{_SNAPSHOT_FILENAME}")
+        if r.returncode != 0:
+            return bool(self._dirty)
+        head_text = r.stdout
+        # Strip trailing newline added by `git show` (if any).
+        if head_text.endswith("\n") and not live_text.endswith("\n"):
+            head_text = head_text[:-1]
+        return live_text != head_text
 
     def _write_recovery_journal(self, sha: str, ts: str) -> None:
         """DM-5: persist the last good sha + ts to ``RECOVERY/journal.json``.
