@@ -1109,3 +1109,246 @@ describe("package.json version", () => {
     expect(pkg.version).toBe("0.4.3");
   });
 });
+
+// ============================================================
+// 21. Task 0.3 — HistoryEntry transcript_marker envelope
+// ============================================================
+
+import { InteractionHistory, type HistoryEntry } from "../src/history.js";
+
+describe("history — transcript_marker envelope", () => {
+  const histTmpDir = join(tmpdir(), `qlaybot-history-marker-${process.pid}`);
+
+  beforeEach(() => {
+    if (existsSync(histTmpDir)) rmSync(histTmpDir, { recursive: true, force: true });
+    mkdirSync(histTmpDir, { recursive: true });
+  });
+  afterEach(() => {
+    if (existsSync(histTmpDir)) rmSync(histTmpDir, { recursive: true, force: true });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Task 0.3 — extend HistoryEntry union with "transcript_marker".
+  //
+  // Reviewer note (v2): we dropped the earlier source-grep test that a
+  // comment containing "transcript_marker" could satisfy. Instead:
+  //
+  //   1. `appendTranscript` accepts a properly-typed HistoryEntry whose
+  //      `type` literal is "transcript_marker" — NO `as any` cast. If the
+  //      Executor hasn't widened the union, `cd agent && npm run build`
+  //      fails at this file (the plan's Step 5 mandates a build gate).
+  //   2. Runtime round-trip: write then re-read the JSONL, assert deep-
+  //      equality — the load() step in Task 0.3 Step 1.
+  //
+  // Why both: esbuild erases type annotations under vitest test-run, so
+  // the runtime test alone cannot distinguish a widened union from a
+  // narrowed one. The `npm run build` gate catches the type gap.
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("appendTranscript accepts a properly-typed transcript_marker entry (no `as any` casts)", () => {
+    const sessionId = `marker-session-${Date.now()}`;
+    const history = new InteractionHistory(sessionId);
+    const ts = "2026-04-21T00:10:00.000Z";
+    // Build the entry with the EXACT HistoryEntry type — this line must
+    // compile under `npm run build`. If the Executor has not widened
+    // HistoryEntry["type"] to include "transcript_marker", the typecheck
+    // fails RED. NO `as any` — that would silently defeat the build gate.
+    const entry: HistoryEntry = {
+      timestamp: ts,
+      type: "transcript_marker",
+      data: {
+        type: "think_recorded",
+        source: "tool",
+        thought: "history-envelope probe",
+        ts,
+      },
+    };
+    history.appendTranscript(entry);
+
+    const transcriptPath = join(history.getSessionDir(), "transcript.jsonl");
+    expect(existsSync(transcriptPath)).toBe(true);
+
+    const raw = readFileSync(transcriptPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+    expect(lines.length).toBe(1);
+
+    const parsed = JSON.parse(lines[0]);
+    expect(parsed.type).toBe("transcript_marker");
+    expect(parsed.timestamp).toBe(ts);
+    expect(parsed.data).toBeDefined();
+  });
+
+  it("canonical timestamp: the outer entry.timestamp equals data.ts (marker.ts wins)", () => {
+    const sessionId = `marker-ts-session-${Date.now()}`;
+    const history = new InteractionHistory(sessionId);
+    const ts = "2026-04-21T00:11:00.000Z";
+    const entry: HistoryEntry = {
+      timestamp: ts,
+      type: "transcript_marker",
+      data: {
+        type: "think_recorded",
+        source: "tool",
+        thought: "canonical-ts probe",
+        ts,
+      },
+    };
+    history.appendTranscript(entry);
+
+    const transcriptPath = join(history.getSessionDir(), "transcript.jsonl");
+    const line = readFileSync(transcriptPath, "utf8").trim();
+    const parsed = JSON.parse(line);
+    // marker.ts is authoritative — outer timestamp must copy it verbatim
+    expect(parsed.timestamp).toBe(parsed.data.ts);
+    expect(parsed.timestamp).toBe(ts);
+  });
+
+  it("round-trips through JSONL: writing then re-reading preserves the marker payload exactly (Task 0.3 Step 1 load)", () => {
+    const sessionId = `marker-roundtrip-${Date.now()}`;
+    const history = new InteractionHistory(sessionId);
+    const ts = "2026-04-21T00:12:00.000Z";
+    const entry: HistoryEntry = {
+      timestamp: ts,
+      type: "transcript_marker",
+      data: {
+        type: "think_recorded",
+        source: "tool",
+        thought: "roundtrip probe",
+        ts,
+      },
+    };
+    history.appendTranscript(entry);
+
+    const transcriptPath = join(history.getSessionDir(), "transcript.jsonl");
+    const line = readFileSync(transcriptPath, "utf8").trim();
+    const parsed = JSON.parse(line);
+    // Deep equality — every field of the entry round-trips byte-for-byte
+    // (modulo JSON normalisation, which is a no-op for our flat shape).
+    expect(parsed).toEqual(entry);
+    // Structural invariants that any downstream loader assumes.
+    expect(parsed.type).toBe("transcript_marker");
+    expect(parsed.timestamp).toBe(ts);
+    expect(parsed.data.type).toBe("think_recorded");
+    expect(parsed.data.source).toBe("tool");
+    expect(parsed.data.thought).toBe("roundtrip probe");
+    expect(parsed.data.ts).toBe(ts);
+  });
+
+  it("existing history variants still round-trip alongside transcript_marker (no regression)", () => {
+    const sessionId = `marker-mixed-${Date.now()}`;
+    const history = new InteractionHistory(sessionId);
+    history.recordPrompt("hello");
+    const ts = "2026-04-21T00:13:00.000Z";
+    const entry: HistoryEntry = {
+      timestamp: ts,
+      type: "transcript_marker",
+      data: { type: "think_recorded", source: "tool", thought: "mixed", ts },
+    };
+    history.appendTranscript(entry);
+    history.recordResponse("world");
+
+    const transcriptPath = join(history.getSessionDir(), "transcript.jsonl");
+    const lines = readFileSync(transcriptPath, "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l));
+    expect(lines.length).toBe(3);
+    expect(lines[0].type).toBe("user_prompt");
+    expect(lines[1].type).toBe("transcript_marker");
+    expect(lines[2].type).toBe("agent_response");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Type-level build gate for Task 0.3.
+  //
+  // Reviewer v2 concern: esbuild erases TS type annotations under
+  // vitest, so at runtime `const e: HistoryEntry = {type: "transcript_marker", ...}`
+  // passes even against a HistoryEntry union that does NOT include
+  // "transcript_marker". The typed-entry tests above are
+  // necessary-but-not-sufficient. This test uses the TypeScript compiler
+  // programmatically to SYNTHESISE the type check on a minimal snippet
+  // that MUST compile only if HistoryEntry["type"] was widened.
+  //
+  // Depends on: the `typescript` package (already a devDependency).
+  // ─────────────────────────────────────────────────────────────────────
+  it("Task 0.3 type gate: HistoryEntry accepts { type: 'transcript_marker' } under strict TS (programmatic tsc probe)", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ts = require("typescript") as typeof import("typescript");
+    const probeFilename = "history-transcript-marker-probe.ts";
+    const historyTsPath = resolve(__dirname, "..", "src", "history.ts");
+    const historySrc = readFileSync(historyTsPath, "utf-8");
+
+    // Minimal probe that imports HistoryEntry and constructs one with
+    // type: "transcript_marker". If the union hasn't been widened, the
+    // TypeScript compiler reports a Type '"transcript_marker"' is not
+    // assignable to type ... error on the `type:` property — which this
+    // test catches as a diagnostic.
+    const probeSource = `
+      import type { HistoryEntry } from "./history.js";
+      const entry: HistoryEntry = {
+        timestamp: "2026-04-21T00:14:00.000Z",
+        type: "transcript_marker",
+        data: { type: "think_recorded", source: "tool", thought: "type-gate", ts: "2026-04-21T00:14:00.000Z" },
+      };
+      // force the type to be seen (avoid "declared but never read")
+      void entry;
+    `;
+
+    // Synthesise an in-memory TS program with two source files: the real
+    // src/history.ts (so HistoryEntry resolves) and the probe.
+    const files = new Map<string, string>([
+      [resolve(__dirname, "..", "src", "history.ts"), historySrc],
+      [resolve(__dirname, "..", "src", probeFilename), probeSource],
+    ]);
+
+    const compilerOptions: import("typescript").CompilerOptions = {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      esModuleInterop: true,
+      skipLibCheck: true,
+      noEmit: true,
+    };
+
+    const host = ts.createCompilerHost(compilerOptions);
+    const originalReadFile = host.readFile.bind(host);
+    host.readFile = (fn: string): string | undefined => {
+      if (files.has(fn)) return files.get(fn);
+      return originalReadFile(fn);
+    };
+    const originalFileExists = host.fileExists.bind(host);
+    host.fileExists = (fn: string): boolean => {
+      if (files.has(fn)) return true;
+      return originalFileExists(fn);
+    };
+
+    const program = ts.createProgram(
+      [resolve(__dirname, "..", "src", probeFilename)],
+      compilerOptions,
+      host,
+    );
+    const diagnostics = ts
+      .getPreEmitDiagnostics(program)
+      .filter((d) => {
+        // Only care about diagnostics that originate in the probe file
+        // itself. skipLibCheck handles lib types; downstream module
+        // import errors from e.g. missing truncation.ts imports are
+        // noise for this specific gate.
+        const fn = d.file?.fileName ?? "";
+        return fn.endsWith(probeFilename);
+      });
+
+    if (diagnostics.length > 0) {
+      const messages = diagnostics
+        .map((d) =>
+          typeof d.messageText === "string"
+            ? d.messageText
+            : d.messageText.messageText,
+        )
+        .join("\n");
+      throw new Error(
+        `Task 0.3 type gate FAILED — HistoryEntry["type"] does not include "transcript_marker" (or the probe is otherwise ill-typed). Diagnostics:\n${messages}`,
+      );
+    }
+  });
+});

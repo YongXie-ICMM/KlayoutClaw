@@ -16,7 +16,18 @@ const HISTORY_DIR = join(homedir(), ".qlaybot", "history");
 
 export interface HistoryEntry {
   timestamp: string;
-  type: "user_prompt" | "agent_response" | "agent_thinking" | "tool_call" | "tool_result" | "error";
+  type:
+    | "user_prompt"
+    | "agent_response"
+    | "agent_thinking"
+    | "tool_call"
+    | "tool_result"
+    | "error"
+    // v0.4.4 §4.7 Persistence bullet 1 — transcript markers emitted through
+    // TranscriptMarkerEmitter land in the same history.jsonl stream wrapped
+    // in the canonical {timestamp, type, data} envelope. Outer `timestamp`
+    // copies the marker's canonical `ts` verbatim (§4.7 canonical timestamp).
+    | "transcript_marker";
   data: unknown;
 }
 
