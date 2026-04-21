@@ -5,6 +5,8 @@
 
 import { createDesignSession, type QlayBotSession } from "./agent.js";
 import { subscribeToSession } from "./events.js";
+import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
+import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
@@ -22,6 +24,51 @@ const PKG_VERSION = (
 // Re-export §4.5 per-turn stats helper so callers can import it from
 // rpc.ts (matches the spec-test import surface).
 export { subscribePerTurnStats } from "./verbose-helpers.js";
+
+/**
+ * Forward TranscriptMarkerEmitter "marker" events on the session to the
+ * JSON-RPC event stream as `transcript_marker` frames (v0.4.4 §4.7
+ * Consumers).
+ *
+ * Contract:
+ *   - The raw marker object is delivered as the JSON-RPC `params`
+ *     payload — NO envelope wrapping. §4.7 canonical-ts rule: the
+ *     marker's `ts` field is authoritative; the RPC wrapper must not
+ *     add a divergent `ts`.
+ *   - Returns an unsubscribe function. `startRPCServer` MUST call it
+ *     on `dispose` / `shutdown` / re-initialize to avoid listener
+ *     leaks across sessions.
+ *   - If the session has no registered emitter (legacy / unregistered
+ *     session), returns a no-op unsubscribe. Markers are forward-compat
+ *     per §2.
+ *
+ * Exported as a named helper so unit tests can drive the real RPC
+ * code-path without spinning up the full readline pump on stdin.
+ */
+export function subscribeMarkersToRPC(
+  session: object,
+  sendEvent: (method: string, params: Record<string, unknown>) => void,
+): () => void {
+  const emitter = getTranscriptMarkerEmitter(session);
+  if (!emitter) {
+    return () => {
+      /* no-op — no emitter bound to the session */
+    };
+  }
+  const listener = (m: unknown): void => {
+    // §4.7 canonical-ts: params IS the marker. No wrapper-level `ts`.
+    // Cast through `Record<string, unknown>` — the JSON-RPC sendEvent
+    // contract accepts any serialisable object; the discriminated
+    // union keys are concrete string literals that TS refuses to
+    // auto-widen to the index signature, so we widen explicitly.
+    sendEvent(
+      "transcript_marker",
+      m as unknown as Record<string, unknown>,
+    );
+  };
+  emitter.on("marker", listener);
+  return () => emitter.off("marker", listener);
+}
 
 interface RPCRequest {
   jsonrpc: "2.0";
@@ -54,6 +101,10 @@ export async function startRPCServer(opts: {
 }): Promise<void> {
   let botSession: QlayBotSession | null = null;
   let verbosePerTurnUnsub: (() => void) | null = null;
+  // §4.7 — unsubscribe handle for the TranscriptMarkerEmitter → RPC
+  // stream bridge. Installed during initialize, called on dispose /
+  // shutdown / re-initialize to avoid listener leaks.
+  let markerForwardUnsub: (() => void) | null = null;
   // Serialize concurrent `initialize` calls — parallel RPC init requests
   // previously leaked sessions because both would race past the null-check
   // on `botSession` before either cleanup ran.
@@ -117,6 +168,8 @@ export async function startRPCServer(opts: {
             // the same RPC connection.
             verbosePerTurnUnsub?.();
             verbosePerTurnUnsub = null;
+            markerForwardUnsub?.();
+            markerForwardUnsub = null;
             await botSession?.dispose();
             botSession = null;
 
@@ -129,6 +182,13 @@ export async function startRPCServer(opts: {
               verbose:
                 (req.params?.verbose as boolean) ?? opts.verbose ?? false,
             });
+            // §4.7 — forward TranscriptMarkerEmitter markers to the RPC
+            // event stream. Helper is exported from this module so tests
+            // can drive the same code-path in isolation.
+            markerForwardUnsub = subscribeMarkersToRPC(
+              botSession.session,
+              sendEvent,
+            );
             if (opts.verbose || req.params?.verbose) {
               const { printVerboseStartup, subscribePerTurnStats } =
                 await import("./verbose-helpers.js");
@@ -263,6 +323,10 @@ export async function startRPCServer(opts: {
               verbosePerTurnUnsub();
               verbosePerTurnUnsub = null;
             }
+            if (markerForwardUnsub) {
+              markerForwardUnsub();
+              markerForwardUnsub = null;
+            }
             await botSession.dispose();
             botSession = null;
           }
@@ -275,6 +339,10 @@ export async function startRPCServer(opts: {
             if (verbosePerTurnUnsub) {
               verbosePerTurnUnsub();
               verbosePerTurnUnsub = null;
+            }
+            if (markerForwardUnsub) {
+              markerForwardUnsub();
+              markerForwardUnsub = null;
             }
             await botSession.dispose();
             botSession = null;
@@ -298,6 +366,10 @@ export async function startRPCServer(opts: {
       if (verbosePerTurnUnsub) {
         verbosePerTurnUnsub();
         verbosePerTurnUnsub = null;
+      }
+      if (markerForwardUnsub) {
+        markerForwardUnsub();
+        markerForwardUnsub = null;
       }
       await botSession.dispose();
     }
