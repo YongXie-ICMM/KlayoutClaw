@@ -219,23 +219,33 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
     }
 
     case "THINKING_DELTA": {
+      // v0.4.4 / TH-6 / TH-9 — carry `source` from marker → segment so
+      // the renderer can distinguish tool-scratchpad thinking from the
+      // native streaming surface. Default "native" preserves v0.4.3 BC
+      // at the native-streaming call site (which does not pass source).
+      const src: "tool" | "native" | "inline" = action.source ?? "native";
       if (!state.currentAssistant) {
         const msg = newAssistantMessage();
         msg.thinkingChunks.push(action.delta);
-        msg.segments.push({ type: "thinking", chunks: [action.delta] });
+        msg.segments.push({ type: "thinking", chunks: [action.delta], source: src });
         return { ...state, phase: "streaming", currentAssistant: msg };
       }
       const last = lastSegment(state.currentAssistant);
       let newSegments: AssistantSegment[];
-      if (last && last.type === "thinking") {
+      // Only merge into the last thinking segment when sources match;
+      // a differing source (e.g. tool marker after native stream) starts
+      // a new segment so the renderer keeps the two visually distinct.
+      const lastSource: "tool" | "native" | "inline" | undefined =
+        last && last.type === "thinking" ? (last.source ?? "native") : undefined;
+      if (last && last.type === "thinking" && lastSource === src) {
         newSegments = [
           ...state.currentAssistant.segments.slice(0, -1),
-          { type: "thinking", chunks: [...last.chunks, action.delta] },
+          { type: "thinking", chunks: [...last.chunks, action.delta], source: lastSource },
         ];
       } else {
         newSegments = [
           ...state.currentAssistant.segments,
-          { type: "thinking", chunks: [action.delta] },
+          { type: "thinking", chunks: [action.delta], source: src },
         ];
       }
       return {

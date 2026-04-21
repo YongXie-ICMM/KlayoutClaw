@@ -43,7 +43,7 @@ export interface ContextSection {
 }
 
 export type AssistantSegment =
-  | { type: "thinking"; chunks: string[] }
+  | { type: "thinking"; chunks: string[]; source?: "tool" | "native" | "inline" }
   | { type: "text"; chunks: string[] }
   | { type: "tool"; tool: ToolExecution };
 
@@ -127,7 +127,7 @@ export type TUIAction =
   | { type: "USER_PROMPT"; text: string }
   | { type: "STREAM_START" }
   | { type: "TEXT_DELTA"; delta: string }
-  | { type: "THINKING_DELTA"; delta: string }
+  | { type: "THINKING_DELTA"; delta: string; source?: "tool" | "native" | "inline" }
   | { type: "TOOL_START"; toolCallId: string; toolName: string; args: unknown }
   | { type: "TOOL_UPDATE"; toolCallId: string; partialResult: unknown }
   | { type: "TOOL_END"; toolCallId: string; result: unknown; isError: boolean }

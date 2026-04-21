@@ -277,11 +277,25 @@ export function App({ botSession }: AppProps) {
           | undefined;
         if (!marker || marker.type !== "think_recorded") return;
         // Feed the tool-scratchpad text into the thinking-chunk stream.
-        // The existing THINKING_DELTA path in the reducer handles
-        // accumulation + display; the ThinkingIndicator's `source` prop
-        // is set by call sites that know the origin.
+        // Propagate `source` end-to-end so the reducer can start a new
+        // segment when the origin flips (tool vs. native) and the
+        // renderer can pick the right theme color (TH-6 / TH-9).
+        // Phase 1 only ships `source:"tool"` from the `thinking` tool
+        // producer; be conservative and fall back to "tool" when the
+        // marker omits/unknowns the field (think_recorded is only
+        // emitted by the tool producer in v0.4.4).
         if (typeof marker.thought === "string" && marker.thought.length > 0) {
-          dispatch({ type: "THINKING_DELTA", delta: marker.thought + "\n" });
+          const src: "tool" | "native" | "inline" =
+            marker.source === "tool" ||
+            marker.source === "native" ||
+            marker.source === "inline"
+              ? marker.source
+              : "tool";
+          dispatch({
+            type: "THINKING_DELTA",
+            delta: marker.thought + "\n",
+            source: src,
+          });
         }
       },
     });

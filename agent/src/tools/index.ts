@@ -246,9 +246,10 @@ export function assembleTools(opts: any): any {
     }
 
     // v0.4.4 §3 / TH-4 — register the `thinking` tool whenever a
-    // TranscriptMarkerEmitter is threaded through. Phase 0 made the
-    // emitter available on every session; the producer wiring lives
-    // here so it shows up in every `tools/list` (TH-4).
+    // TranscriptMarkerEmitter is threaded through. createDesignSession
+    // always passes one so `thinking` shows up in every real session's
+    // `tools/list` (TH-4). Tests that skip the emitter (legacy callers
+    // of the extended signature) simply won't get the tool registered.
     if (opts.transcriptMarkerEmitter) {
       const thinkingTool = createThinkingTool(opts.transcriptMarkerEmitter);
       toolMap[thinkingTool.name] = thinkingTool;

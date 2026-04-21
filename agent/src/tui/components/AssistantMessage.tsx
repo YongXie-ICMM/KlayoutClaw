@@ -94,10 +94,17 @@ function renderSegment(
           </Box>
         );
       }
-      // Expanded: delegate to ThinkingIndicator
+      // Expanded: delegate to ThinkingIndicator. Pass the segment's
+      // source so TH-6 / TH-9 visual distinction kicks in live (tool
+      // scratchpad vs. native streaming). `source` is optional on the
+      // segment; ThinkingIndicator defaults to "native" when undefined.
       return (
         <Box key={`thinking-${idx}`}>
-          <ThinkingIndicator chunks={segment.chunks} isActive={isActive} />
+          <ThinkingIndicator
+            chunks={segment.chunks}
+            isActive={isActive}
+            source={segment.source}
+          />
         </Box>
       );
     }
