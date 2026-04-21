@@ -423,14 +423,18 @@ export async function createDesignSession(
   })();
 
   // --- Verbose transcript writer (spec §4.3, runtime-ephemeral) ---
-  // When verbose=true we mirror every entry that reaches
-  // InteractionHistory.transcript.jsonl into a JSONL file next to where the
-  // user launched qlaybot (process.cwd()), not the internal qlaybot
-  // workspace (~/.qlaybot/workspace). The writer is attached as a mirror on
-  // the history instance so the two transcripts are byte-for-byte identical
-  // — previously we tapped raw session.subscribe events (deltas, partial
-  // results, etc.) which produced a transcript that did not match
-  // ~/.qlaybot/history/.../transcript.jsonl.
+  // When verbose=true we mirror every NON-MARKER history entry
+  // (user_prompt, agent_response, tool_call, …) into a JSONL file next
+  // to where the user launched qlaybot (process.cwd()), not the
+  // internal qlaybot workspace (~/.qlaybot/workspace).
+  //
+  // v0.4.4 §4.7 changes: transcript_marker entries do NOT flow through
+  // the mirror path. Instead, the VerboseTranscriptWriter subscribes
+  // DIRECTLY to the TranscriptMarkerEmitter — parallel to (and
+  // independent of) the InteractionHistory subscription above. This
+  // guarantees both sinks produce byte-equal envelope lines (T43(b)
+  // precursor) and that clearing the mirror via history.setMirror(null)
+  // does not stop markers from reaching the verbose JSONL.
   const verboseTranscriptDir = process.cwd();
   const verboseWriter: VerboseTranscriptWriter | null =
     verbose
@@ -439,8 +443,30 @@ export async function createDesignSession(
           history.getSessionId(),
         )
       : null;
+  let verboseMarkerUnsub: (() => void) | null = null;
   if (verboseWriter) {
-    history.setMirror((entry) => verboseWriter.write(entry));
+    // Legacy non-marker mirror: every OTHER history entry is mirrored
+    // to the verbose JSONL. transcript_marker entries are routed via
+    // the direct emitter subscription below to preserve v0.4.4's
+    // "independent subscribers" contract.
+    history.setMirror((entry) => {
+      if (entry.type === "transcript_marker") return;
+      verboseWriter.write(entry);
+    });
+    // Direct subscription — the verbose writer wraps each marker in
+    // the same {timestamp, type, data} envelope that the history sink
+    // uses. Same envelope across both sinks → T43(b) byte-equality.
+    const verboseListener = (m: unknown): void => {
+      const marker = m as TranscriptMarker;
+      verboseWriter.write({
+        timestamp: marker.ts,
+        type: "transcript_marker",
+        data: marker,
+      });
+    };
+    transcriptMarkerEmitter.on("marker", verboseListener);
+    verboseMarkerUnsub = () =>
+      transcriptMarkerEmitter.off("marker", verboseListener);
   }
 
   // --- Auto-save: subscribe to session events for interaction history ---
@@ -512,6 +538,7 @@ export async function createDesignSession(
   async function dispose(): Promise<void> {
     historyUnsub();
     historyMarkerUnsub();
+    verboseMarkerUnsub?.();
     if (verboseWriter) {
       try {
         await verboseWriter.close();
