@@ -30,6 +30,7 @@ import { createBashTool } from "./bash.js";
 import { createEditTool } from "./edit.js";
 import { createWriteTool } from "./write.js";
 import { createMemorySaveTool, createMemorySearchTool } from "./memory.js";
+import { createThinkingTool } from "./thinking.js";
 import { Type } from "@sinclair/typebox";
 import { SubagentRunner } from "../subagent/runner.js";
 import { createDelegateTool } from "./delegate.js";
@@ -244,6 +245,15 @@ export function assembleTools(opts: any): any {
       // Memory tools unavailable in mocked environment
     }
 
+    // v0.4.4 §3 / TH-4 — register the `thinking` tool whenever a
+    // TranscriptMarkerEmitter is threaded through. Phase 0 made the
+    // emitter available on every session; the producer wiring lives
+    // here so it shows up in every `tools/list` (TH-4).
+    if (opts.transcriptMarkerEmitter) {
+      const thinkingTool = createThinkingTool(opts.transcriptMarkerEmitter);
+      toolMap[thinkingTool.name] = thinkingTool;
+    }
+
     // Filter out disabled tools (base tools are never filtered)
     if (opts.disabledTools && opts.disabledTools.length > 0) {
       const baseNames = new Set(['read', 'bash', 'edit', 'write']);
@@ -290,7 +300,7 @@ export function assembleTools(opts: any): any {
       toolMap[enterTool.name] = enterTool;
       toolMap[exitTool.name] = exitTool;
 
-      // Wrap every MCP-backed tool (exclude base/memory/plan/delegate).
+      // Wrap every MCP-backed tool (exclude base/memory/plan/delegate/thinking).
       const NON_MCP = new Set([
         "read",
         "write",
@@ -301,6 +311,10 @@ export function assembleTools(opts: any): any {
         "enter_plan_mode",
         "exit_plan_mode",
         "delegate",
+        // v0.4.4 §3 / TH-4 — `thinking` is a qlaybot-native tool, not
+        // MCP-backed. Exclude from MCP-wrap loop so it keeps its bare
+        // factory handler (which the annotations allow under TH-7).
+        "thinking",
       ]);
       const wrappedMCPTools = new Set<string>();
       for (const [name, tool] of Object.entries(toolMap)) {
@@ -324,6 +338,9 @@ export function assembleTools(opts: any): any {
         "enter_plan_mode",
         "exit_plan_mode",
         "delegate",
+        // v0.4.4 §3 / TH-4 — `thinking` is allowlisted in plan mode
+        // (TH-7 / annotations.ts classifies it readonly).
+        "thinking",
       ]);
       for (const name of Object.keys(toolMap)) {
         if (!ALLOWED_BASE.has(name) && !wrappedMCPTools.has(name)) {
