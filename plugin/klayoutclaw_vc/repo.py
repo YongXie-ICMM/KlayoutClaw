@@ -35,7 +35,9 @@ import json
 import os
 import shutil
 import subprocess  # see module docstring (T33 contract)
+import sys
 import tempfile
+import weakref
 from typing import Any, Dict, List, Optional
 
 from . import serializer
@@ -120,6 +122,13 @@ class RepoHandle:
         self._invalidated = False
         self._dirty = False          # true if last checkpoint failed
         self._owns_tmpdir = (mode == "memory")
+        # Weak reference to the most recently checkpointed layout.  Used by
+        # the no-arg ``status()`` path to run spec-compliant RB-4 dirty
+        # detection (serialize(layout) vs HEAD snapshot) without requiring
+        # the caller to thread the layout through.  May be ``None`` if no
+        # checkpoint has happened yet, if the layout has been GC'd, or if
+        # the running pya build doesn't support weakrefs on pya.Layout.
+        self._layout_ref: Optional[weakref.ref] = None
 
     # ------------------------------------------------------------------
     # Invalidation
@@ -246,6 +255,38 @@ class RepoHandle:
         ts = datetime.datetime.now().isoformat()
         if self._mode == "disk":
             self._write_recovery_journal(sha, ts)
+
+        # RB-4: cache a weakref to this layout so a subsequent no-arg
+        # ``status()`` call can run the spec-compliant DM-1 serialize-vs-HEAD
+        # comparison without the caller re-passing the layout.
+        #
+        # pya pitfall: a ``pya.Layout`` Python wrapper keeps itself alive
+        # even after the caller drops their strong reference — the
+        # wrapper remains reachable via the weakref, but the underlying
+        # C++ object is destroyed and any method call on it segfaults
+        # (uncatchable by Python).  To avoid caching a future zombie, we
+        # only store the weakref when the caller holds at least one
+        # strong reference OUTSIDE this function (refcount >= 3: caller
+        # frame + our ``layout`` arg + one indirect).  Inline temporaries
+        # (e.g. ``checkpoint(_make_layout(1), ...)``) have refcount 2
+        # here and are intentionally NOT cached — status() will fall
+        # back to the heuristic path for them.
+        #
+        # Some pya builds may not set ``__weakref__`` on ``pya.Layout``;
+        # in that case ``weakref.ref`` raises ``TypeError`` and we keep
+        # the cached ref at ``None`` (heuristic path).
+        self._layout_ref = None
+        try:
+            # Inside this method the ``layout`` arg and ``getrefcount``'s
+            # own temp contribute 2 to the count.  A third ref means the
+            # caller retains a strong reference in their scope — that's
+            # our "safe to cache" signal.  Inline temporaries like
+            # ``checkpoint(Layout(), ...)`` show a refcount of 2 and are
+            # intentionally skipped (heuristic path handles those).
+            if sys.getrefcount(layout) >= 3:
+                self._layout_ref = weakref.ref(layout)
+        except TypeError:
+            self._layout_ref = None
 
         self._dirty = False
         return {"ok": True, "sha": sha, "ts": ts}
@@ -612,22 +653,44 @@ class RepoHandle:
         """Return the live status dict for the repo.
 
         RB-4 dirty detection (spec §5.2.2):
-          * If ``layout`` is provided, ``dirty`` reflects whether
-            ``serializer.serialize(layout)`` differs from the HEAD
-            commit's stored ``snapshot.txt`` (DM-1 deterministic
-            comparison).  This is the spec-compliant path.
-          * If ``layout`` is ``None`` (backwards-compatible no-arg form
-            used by the Phase 5 server bridge when the layout isn't
-            readily in scope), ``dirty`` falls back to the internal
-            ``_dirty`` flag — which tracks dirtiness induced by a
-            failed checkpoint — OR a non-empty ``git status
+          * If ``layout`` is explicitly provided, ``dirty`` reflects
+            whether ``serializer.serialize(layout)`` differs from the
+            HEAD commit's stored ``snapshot.txt`` (DM-1 deterministic
+            comparison).
+          * If ``layout`` is ``None``, we attempt to dereference the
+            weak reference cached by the most recent successful
+            ``checkpoint(...)`` and use the same comparison — giving
+            G6 / server callers the spec-compliant path with no API
+            change.
+          * Only if the weakref is absent or dead (e.g. the layout
+            was GC'd, or the pya build doesn't support weakrefs on
+            ``pya.Layout``) do we fall back to the heuristic: the
+            internal ``_dirty`` flag OR a non-empty ``git status
             --porcelain --untracked-files=no`` on the sidecar.
 
         Re-evaluated on every call (T34 non-caching rule): the HEAD
-        snapshot is re-read each time, never cached.
+        snapshot and the weakref are re-queried each time, never
+        cached.
         """
         if self._invalidated:
             return {"ok": False, "reason": "handle invalidated"}
+
+        # RB-4: resolve the implicit layout from the cached weakref.  The
+        # weakref is only stored by ``checkpoint`` when the caller retains
+        # an external strong reference, so a dereference that returns
+        # non-None is presumed safe to use.  We still wrap the first
+        # in-Python operation (``_destroyed()``) in a try/except so a pya
+        # runtime error cleanly falls back to the heuristic instead of
+        # propagating out of ``status()``.
+        if layout is None and self._layout_ref is not None:
+            candidate = self._layout_ref()
+            if candidate is not None:
+                try:
+                    destroyed = bool(candidate._destroyed())
+                except Exception:
+                    destroyed = True
+                if not destroyed:
+                    layout = candidate
 
         branch = self._current_branch()
 
@@ -643,13 +706,19 @@ class RepoHandle:
                 last_ts = r_ts.stdout.strip() or None
 
         # Dirty:
-        #   * If a layout was supplied, compare serialize(layout) against
-        #     the HEAD commit's stored snapshot.txt — spec-compliant
-        #     RB-4 path.  No caching (recomputed every call).
-        #   * Otherwise fall back to the internal flag + git status.
+        #   * If a layout is available (either passed explicitly or
+        #     resolved from the cached weakref), compare
+        #     ``serialize(layout)`` against the HEAD snapshot — RB-4
+        #     spec-compliant path.  A sticky ``_dirty`` flag from a
+        #     previously-failed checkpoint ALWAYS reports dirty=True,
+        #     even if the live layout happens to match HEAD (the failed
+        #     checkpoint left the handle in an uncertain state until a
+        #     fresh successful checkpoint clears the flag).
+        #   * Otherwise fall back to the internal flag + a git porcelain
+        #     probe on the sidecar.
         dirty: bool
         if layout is not None:
-            dirty = self._dirty_vs_head(layout, head_sha)
+            dirty = bool(self._dirty) or self._dirty_vs_head(layout, head_sha)
         else:
             dirty = bool(self._dirty)
             if not dirty and os.path.isdir(os.path.join(self._repo_path, ".git")):
