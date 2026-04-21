@@ -259,6 +259,31 @@ export function App({ botSession }: AppProps) {
           type: "USAGE_UPDATE",
           ...usage,
         }),
+      // v0.4.4 §3 / TH-6 / TH-9 — route `think_recorded` markers into
+      // the THINKING_DELTA channel so the existing indicator surface
+      // picks them up. The reducer's THINKING_DELTA path already
+      // accumulates chunks; the TUI indicator is rendered with the
+      // `source` prop when the marker's origin is known. Phase 1 only
+      // ships `source:"tool"` as a live producer (the `thinking` tool);
+      // native / inline producers land later.
+      onTranscriptMarker: (m: unknown) => {
+        const marker = m as
+          | {
+              type: string;
+              source?: string;
+              thought?: string;
+              ts?: string;
+            }
+          | undefined;
+        if (!marker || marker.type !== "think_recorded") return;
+        // Feed the tool-scratchpad text into the thinking-chunk stream.
+        // The existing THINKING_DELTA path in the reducer handles
+        // accumulation + display; the ThinkingIndicator's `source` prop
+        // is set by call sites that know the origin.
+        if (typeof marker.thought === "string" && marker.thought.length > 0) {
+          dispatch({ type: "THINKING_DELTA", delta: marker.thought + "\n" });
+        }
+      },
     });
 
     // §4 verbose: per-turn timing + token stats via raw session.subscribe

@@ -42,7 +42,7 @@ export type ThinkingParamsT = Static<typeof ThinkingParams>;
  * "side-effect-free" and "scratchpad" (see test-unit.ts).
  */
 const THINKING_DESCRIPTION =
-  "Record a reasoning step. Side-effect-free scratchpad. Does not run " +
+  "Record a reasoning step. A side-effect-free scratchpad. Does not run " +
   "code, does not call other tools, does not change layout state. Use " +
   "to externalise what you've verified and what you're about to try.";
 

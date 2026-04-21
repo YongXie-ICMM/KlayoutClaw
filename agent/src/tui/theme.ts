@@ -29,6 +29,12 @@ export const theme = {
   // Thinking
   thinking: c.dim.italic,
   thinkingBorder: c.gray,
+  // v0.4.4 §3 / TH-6 / TH-9 — distinct color for `source:"tool"` markers.
+  // Any distinct chalk function satisfies the "raw frames differ" test
+  // in test-components.ts; we pick dim-italic-cyan to visually separate
+  // tool-scratchpad from native reasoning while keeping the same dim/italic
+  // weight so the two read as a matched pair.
+  thinkingTool: c.dim.italic.cyan,
 
   // Tools
   toolRunning: c.yellow,
