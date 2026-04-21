@@ -510,5 +510,20 @@ def to_pya_code(layout: "pya.Layout") -> str:
     lines.append("            _ci = pya.CellInstArray(_target.cell_index(), _tr, _a, _b, int(_arr['na']), int(_arr['nb']))")
     lines.append("        else:")
     lines.append("            _ci = pya.CellInstArray(_target.cell_index(), _tr)")
-    lines.append("        _cell.insert(_ci)")
+    lines.append("        _inst = _cell.insert(_ci)")
+    # Mirror the shape-property encoding: emit as integer-keyed
+    # `<key>|<value>` so a GDS round-trip preserves them (string-keyed
+    # PROPATTRs would be silently dropped by pya's GDS writer).  The
+    # serialiser's `_canonical_properties` decodes this on read-back so
+    # `serialize(in_memory) == serialize(gds_roundtripped)` still holds
+    # at the instance level.
+    lines.append("        _iprops = _i.get('properties') or {}")
+    lines.append("        if _iprops and _inst is not None:")
+    lines.append("            _iidx = 1")
+    lines.append("            for _k in sorted(_iprops.keys()):")
+    lines.append("                _v = _iprops[_k]")
+    lines.append("                _encoded = str(_k) + _PROP_DELIM + str(_v)")
+    lines.append("                try: _inst.set_property(_iidx, _encoded)")
+    lines.append("                except Exception: pass")
+    lines.append("                _iidx += 1")
     return "\n".join(lines) + "\n"
