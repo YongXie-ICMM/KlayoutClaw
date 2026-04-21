@@ -19,6 +19,12 @@ export type { ToolAnnotation } from "../types/v04-contracts.js";
  * Group 2 future wiring that injects per-registration annotations.
  */
 export const TOOL_ANNOTATIONS: ToolAnnotation[] = [
+  // ── qlaybot-native tools (readonly) ────────────────────────────────────
+  // v0.4.4 §3 / TH-7 — the `thinking` tool is a pure side-effect-free
+  // scratchpad (spec TH-3); plan-mode classifies it readonly so it
+  // remains callable during plan_drafting / plan_executing.
+  { name: "thinking", readonly: true },
+
   // ── Native MCP tools (readonly) ────────────────────────────────────────
   { name: "screenshot", readonly: true },
   { name: "get_layout_info", readonly: true },
