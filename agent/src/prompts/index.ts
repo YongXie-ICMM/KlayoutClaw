@@ -8,6 +8,7 @@ import { buildMemorySection } from "./sections/memory.js";
 import { buildContextSection } from "./sections/context.js";
 import { buildSkillsSection } from "./sections/skills.js";
 import { buildDelegationSection } from "./sections/delegation.js";
+import { buildThinkingSection } from "./sections/thinking.js";
 import type { SubagentConfig } from "../types/v04-contracts.js";
 
 export enum PromptMode {
@@ -33,6 +34,13 @@ export function buildSystemPrompt(ctx: PromptBuildContext): string {
   // Tooling
   const tooling = buildToolingSection(ctx.toolNames);
   if (tooling) sections.push(tooling);
+
+  // v0.4.4 §3.4 — thinking-tool guidance. Appears in BOTH Full and Sub
+  // modes when the tool is registered: subagents also call `thinking`
+  // and benefit from the same advisory text (see test-prompts.ts
+  // interpretation note).
+  const thinkingGuidance = buildThinkingSection(ctx.toolNames);
+  if (thinkingGuidance) sections.push(thinkingGuidance);
 
   // Plan Mode awareness paragraph (full mode only — subagents don't plan).
   if (ctx.mode === PromptMode.Full) {
