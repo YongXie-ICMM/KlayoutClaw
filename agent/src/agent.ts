@@ -39,6 +39,11 @@ import { createEmbedder } from "./memory/embedder.js";
 import { createAutoRecallTransform, defaultAutoRecallConfig } from "./memory/auto-recall.js";
 import { InteractionHistory } from "./history.js";
 import { VerboseTranscriptWriter } from "./verbose-transcript.js";
+import {
+  TranscriptMarkerEmitter,
+  setTranscriptMarkerEmitter,
+} from "./events/marker-emitter.js";
+import type { TranscriptMarker } from "./events/marker-types.js";
 import { CommandRegistry, createCommandRegistry } from "./commands/index.js";
 import { PlanManager } from "./planning/index.js";
 import { createToolResultPruner } from "./compaction/tool-result-pruner.js";
@@ -209,6 +214,16 @@ export async function createDesignSession(
   const planManager = new PlanManager(workspaceDir);
   const backgroundTaskManager = new BackgroundTaskManager();
 
+  // --- TranscriptMarkerEmitter (v0.4.4 §4.7) ---
+  // Constructed up-front so it can be threaded into assembleTools opts
+  // (consumed by the thinking tool factory — G2 Phase 1) AND registered
+  // on the session via setTranscriptMarkerEmitter AFTER session
+  // construction. Chicken-and-egg: the WeakMap registry can't be keyed
+  // until the session object exists, but tools need the emitter at
+  // assembly time. The single instance threaded through both paths
+  // resolves the ordering without duplication.
+  const transcriptMarkerEmitter = new TranscriptMarkerEmitter();
+
   // --- Assemble tools ---
   // Collect disabled tools from ALL servers
   const allServers = getAllMCPServers(config);
@@ -235,6 +250,7 @@ export async function createDesignSession(
       modelRegistry,
       planManager,
       isSubagent: false,
+      transcriptMarkerEmitter,
     });
     subagentRunner = runner;
     // Extended signature returns tool map + runner — split into base + custom
@@ -264,6 +280,7 @@ export async function createDesignSession(
       modelRegistry,
       planManager,
       isSubagent: false,
+      transcriptMarkerEmitter,
     });
     rawBaseTools = {};
     rawCustomTools = [];
@@ -380,6 +397,31 @@ export async function createDesignSession(
 
   session.setAutoCompactionEnabled(false);
 
+  // --- Register the TranscriptMarkerEmitter on the session (§4.7) ---
+  // Post-session-construction: keyed by the session object reference so
+  // consumers (RPC, history sink, verbose writer, TUI callback) can
+  // reach the SAME emitter instance via getTranscriptMarkerEmitter.
+  setTranscriptMarkerEmitter(session, transcriptMarkerEmitter);
+
+  // --- Subscribe InteractionHistory to the emitter (§4.7 Persistence 1) ---
+  // Direct subscription — the history sink wraps each marker in the
+  // canonical {timestamp, type, data} envelope. `timestamp` copies
+  // marker.ts verbatim (canonical-ts rule). This subscription is
+  // INDEPENDENT of the verbose writer's subscription (Task 0.5); neither
+  // mirrors the other.
+  const historyMarkerUnsub = ((): (() => void) => {
+    const listener = (m: unknown): void => {
+      const marker = m as TranscriptMarker;
+      history.appendTranscript({
+        timestamp: marker.ts,
+        type: "transcript_marker",
+        data: marker,
+      });
+    };
+    transcriptMarkerEmitter.on("marker", listener);
+    return () => transcriptMarkerEmitter.off("marker", listener);
+  })();
+
   // --- Verbose transcript writer (spec §4.3, runtime-ephemeral) ---
   // When verbose=true we mirror every entry that reaches
   // InteractionHistory.transcript.jsonl into a JSONL file next to where the
@@ -469,6 +511,7 @@ export async function createDesignSession(
   // --- Dispose ---
   async function dispose(): Promise<void> {
     historyUnsub();
+    historyMarkerUnsub();
     if (verboseWriter) {
       try {
         await verboseWriter.close();

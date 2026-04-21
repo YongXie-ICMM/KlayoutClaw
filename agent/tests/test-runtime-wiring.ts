@@ -20,7 +20,7 @@
  *   G8: 15 SUBAGENT_* reducer actions never dispatched from anywhere
  */
 
-import { describe, it, expect, afterEach, beforeAll } from "vitest";
+import { describe, it, expect, afterEach, beforeAll, vi } from "vitest";
 import { readFileSync, writeFileSync, mkdtempSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -852,4 +852,630 @@ describeLLM("LLM integration: delegate tool reachable via real model", () => {
     },
     180_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Section 7: Phase 0 — Shared Marker Infrastructure (Tasks 0.4, 0.6, 0.7)
+//
+// These tests assert end-to-end behaviour of the TranscriptMarkerEmitter:
+//   - onTranscriptMarker callback forwarded from subscribeToSession (Task 0.6)
+//   - RPC stream forwards transcript_marker events (Task 0.7)
+//   - single emit fires across ALL FOUR sinks with identical ts (Task 0.4 capstone)
+// ---------------------------------------------------------------------------
+
+describe("Phase 0: subscribeToSession onTranscriptMarker — Task 0.6", () => {
+  let botSession: any;
+
+  afterEach(async () => {
+    if (botSession?.dispose) {
+      try { await botSession.dispose(); } catch { /* */ }
+    }
+    botSession = null;
+  });
+
+  it("onTranscriptMarker callback is invoked with the marker argument (object identity)", async () => {
+    const { createDesignSession } = await import("../src/agent.js");
+    const { subscribeToSession } = await import("../src/events.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    botSession = await createDesignSession({ ephemeral: true });
+    const emitter = getTranscriptMarkerEmitter(botSession.session);
+    expect(emitter, "emitter must be registered on the session").toBeDefined();
+
+    const received: unknown[] = [];
+    // NO intersection escape hatch (e.g. `QlayBotEventCallbacks & {...}`).
+    // TypeScript intersections ALWAYS compile whether or not the LHS has
+    // the field, so they cannot gate Task 0.6. The `ts.createProgram`
+    // probe at the end of this describe block is the authoritative gate.
+    const callbacks: import("../src/events.js").QlayBotEventCallbacks = {
+      onTranscriptMarker: (m: unknown) => received.push(m),
+    };
+    const unsubscribe = subscribeToSession(botSession.session, callbacks);
+
+    const marker = {
+      type: "think_recorded",
+      source: "tool",
+      thought: "subscribeToSession-probe",
+      ts: "2026-04-21T00:20:00.000Z",
+    };
+    emitter!.emit("marker", marker);
+
+    await sleep(20);
+
+    expect(received.length).toBe(1);
+    // Identity: subscribeToSession must NOT wrap/clone the marker.
+    expect(received[0]).toBe(marker);
+
+    unsubscribe();
+
+    // After unsubscribe, a second emit does NOT reach the callback.
+    emitter!.emit("marker", {
+      type: "think_recorded",
+      source: "tool",
+      thought: "post-unsubscribe",
+      ts: "2026-04-21T00:20:01.000Z",
+    });
+    await sleep(20);
+    expect(received.length).toBe(1); // unchanged
+  });
+
+  it("passing ONLY onTranscriptMarker (no other callbacks) still works — callback is optional and independent", async () => {
+    const { createDesignSession } = await import("../src/agent.js");
+    const { subscribeToSession } = await import("../src/events.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    botSession = await createDesignSession({ ephemeral: true });
+    const emitter = getTranscriptMarkerEmitter(botSession.session);
+
+    const received: unknown[] = [];
+    // Same rationale as the sibling test: no intersection escape hatch.
+    const callbacks: import("../src/events.js").QlayBotEventCallbacks = {
+      onTranscriptMarker: (m: unknown) => received.push(m),
+    };
+    const unsubscribe = subscribeToSession(botSession.session, callbacks);
+
+    const marker = {
+      type: "think_recorded",
+      source: "tool",
+      thought: "solo-probe",
+      ts: "2026-04-21T00:21:00.000Z",
+    };
+    emitter!.emit("marker", marker);
+    await sleep(20);
+
+    expect(received.length).toBe(1);
+    expect(received[0]).toBe(marker);
+    unsubscribe();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Task 0.6 type gate — programmatic ts.createProgram probe.
+  //
+  // Reviewer v3 concern: an intersection type `QlayBotEventCallbacks & {
+  // onTranscriptMarker?: ... }` ALWAYS compiles regardless of whether
+  // the LHS interface declares the field, so an intersection cannot gate
+  // Task 0.6. A source-regex backup can be satisfied by a comment or a
+  // local param named `onTranscriptMarker`. This test compiles a minimal
+  // probe snippet that imports `QlayBotEventCallbacks` directly and
+  // constructs `{ onTranscriptMarker: ... }` against it — if the
+  // Executor hasn't added the field to the interface itself, TypeScript
+  // emits a "Type ... is not assignable to type 'QlayBotEventCallbacks'"
+  // diagnostic which this test surfaces as a RED failure.
+  //
+  // Parallels the Task 0.3 ts.createProgram gate at
+  // test-unit.ts:Task 0.3 type gate.
+  // ──────────────────────────────────────────────────────────────────────
+  it("Task 0.6 type gate: QlayBotEventCallbacks accepts onTranscriptMarker under strict TS (programmatic tsc probe)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ts = require("typescript") as typeof import("typescript");
+    const probeFilename = "events-callback-probe.ts";
+    const eventsTsPath = join(__dirname, "..", "src", "events.ts");
+    const eventsSrc = readFileSync(eventsTsPath, "utf-8");
+
+    // Minimal probe: import QlayBotEventCallbacks directly (NO
+    // intersection) and construct a value with onTranscriptMarker. If
+    // the Executor hasn't widened the interface, TS reports:
+    //   Object literal may only specify known properties, and
+    //   'onTranscriptMarker' does not exist in type 'QlayBotEventCallbacks'
+    const probeSource = `
+      import type { QlayBotEventCallbacks } from "./events.js";
+      const cbs: QlayBotEventCallbacks = {
+        onTranscriptMarker: (m: unknown) => { void m; },
+      };
+      void cbs;
+    `;
+
+    const files = new Map<string, string>([
+      [eventsTsPath, eventsSrc],
+      [join(__dirname, "..", "src", probeFilename), probeSource],
+    ]);
+
+    const compilerOptions: import("typescript").CompilerOptions = {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      esModuleInterop: true,
+      skipLibCheck: true,
+      noEmit: true,
+    };
+
+    const host = ts.createCompilerHost(compilerOptions);
+    const originalReadFile = host.readFile.bind(host);
+    host.readFile = (fn: string): string | undefined => {
+      if (files.has(fn)) return files.get(fn);
+      return originalReadFile(fn);
+    };
+    const originalFileExists = host.fileExists.bind(host);
+    host.fileExists = (fn: string): boolean => {
+      if (files.has(fn)) return true;
+      return originalFileExists(fn);
+    };
+
+    const program = ts.createProgram(
+      [join(__dirname, "..", "src", probeFilename)],
+      compilerOptions,
+      host,
+    );
+    const diagnostics = ts
+      .getPreEmitDiagnostics(program)
+      .filter((d) => {
+        // Only care about diagnostics originating from the probe file —
+        // downstream import-resolution diagnostics from events.ts's own
+        // deps are noise for this specific gate.
+        const fn = d.file?.fileName ?? "";
+        return fn.endsWith(probeFilename);
+      });
+
+    if (diagnostics.length > 0) {
+      const messages = diagnostics
+        .map((d) =>
+          typeof d.messageText === "string"
+            ? d.messageText
+            : d.messageText.messageText,
+        )
+        .join("\n");
+      throw new Error(
+        `Task 0.6 type gate FAILED — QlayBotEventCallbacks does not accept 'onTranscriptMarker' as a known property. Diagnostics:\n${messages}`,
+      );
+    }
+  });
+});
+
+describe("Phase 0: RPC forwards transcript_marker events — Task 0.7", () => {
+  // These tests drive the REAL RPC code path in src/rpc.ts. The approach:
+  //
+  //   1. Import the helper `subscribeMarkersToRPC(session, sendEvent)` from
+  //      `../src/rpc.js`. The plan contract (§4.7 Consumers) requires rpc.ts
+  //      to subscribe to `getTranscriptMarkerEmitter(session)` and forward
+  //      each marker to `sendEvent("transcript_marker", marker)`. The clean
+  //      factoring is a small exported helper — that way (a) the test
+  //      exercises a code-path defined in rpc.ts (Executor cannot ship
+  //      Phase 0 with rpc.ts unchanged), and (b) we avoid spinning up the
+  //      full readline pump on stdin (which hijacks the test process).
+  //
+  //   2. Fallback: if the Executor chooses to inline the subscription
+  //      inside startRPCServer instead of exposing a helper, the source
+  //      regression test in the final `it` of this describe catches it by
+  //      asserting the initialize handler contains the subscription.
+  //
+  //   3. Ship a full end-to-end smoke test that spawns `node dist/cli.js
+  //      --mode rpc`, sends `initialize`, and checks the stdout event
+  //      stream for a `transcript_marker` frame. This is gated on
+  //      `dist/cli.js` existing (the plan mandates `npm run build` between
+  //      tasks) and on ANTHROPIC_API_KEY (the SDK needs a provider creds
+  //      probe). When skipped, the in-process helper test above is the
+  //      authoritative gate.
+  let botSession: any;
+
+  afterEach(async () => {
+    if (botSession?.dispose) {
+      try { await botSession.dispose(); } catch { /* */ }
+    }
+    botSession = null;
+  });
+
+  it("rpc.ts exports subscribeMarkersToRPC(session, sendEvent) that forwards `marker` emits to sendEvent('transcript_marker', marker)", async () => {
+    const { createDesignSession } = await import("../src/agent.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    // This import is load-bearing: the Executor MUST add
+    // `subscribeMarkersToRPC` as a named export of src/rpc.ts. Without it,
+    // this await throws and the test fails RED with a clear message —
+    // "rpc.ts is missing subscribeMarkersToRPC".
+    const rpcModule = await import("../src/rpc.js");
+    expect(
+      (rpcModule as any).subscribeMarkersToRPC,
+      "src/rpc.ts must export subscribeMarkersToRPC(session, sendEvent) — this proves a code-path in rpc.ts emits the marker frame (Task 0.7 Step 3).",
+    ).toBeDefined();
+    expect(typeof (rpcModule as any).subscribeMarkersToRPC).toBe("function");
+
+    botSession = await createDesignSession({ ephemeral: true });
+    const emitter = getTranscriptMarkerEmitter(botSession.session);
+    expect(emitter, "RPC must see the session's emitter via getTranscriptMarkerEmitter").toBeDefined();
+
+    // Capture sendEvent calls — this is EXACTLY the surface rpc.ts uses
+    // internally (see `sendEvent` at src/rpc.ts:84). subscribeMarkersToRPC
+    // MUST call it with ("transcript_marker", marker).
+    const sendEventCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const sendEvent = (method: string, params: Record<string, unknown>): void => {
+      sendEventCalls.push({ method, params });
+    };
+
+    const subscribeMarkersToRPC = (rpcModule as any).subscribeMarkersToRPC as (
+      session: unknown,
+      sendEvent: (method: string, params: Record<string, unknown>) => void,
+    ) => () => void;
+    const unsub = subscribeMarkersToRPC(botSession.session, sendEvent);
+    expect(typeof unsub).toBe("function");
+
+    const marker = {
+      type: "think_recorded",
+      source: "tool",
+      thought: "rpc-forward-probe",
+      ts: "2026-04-21T00:30:00.000Z",
+    };
+    emitter!.emit("marker", marker);
+    await sleep(20);
+
+    expect(sendEventCalls.length).toBe(1);
+    const call = sendEventCalls[0];
+    expect(call.method).toBe("transcript_marker");
+    // params IS the marker object — no wrapper envelope.
+    // §4.7 Canonical timestamp: marker.ts wins; no wrapper ts.
+    expect(call.params).toBe(marker); // object identity
+    expect((call.params as any).ts).toBe(marker.ts);
+    // No wrapper-level divergent ts inside the sendEvent params payload.
+    // (sendEvent wraps in the JSON-RPC envelope `{jsonrpc, method, params}`
+    //  at rpc.ts:84 — that wrapper has no `ts` field at all.)
+
+    // Unsubscribe cleanly — subsequent emits MUST NOT produce further
+    // sendEvent calls.
+    unsub();
+    emitter!.emit("marker", {
+      type: "think_recorded",
+      source: "tool",
+      thought: "post-unsub",
+      ts: "2026-04-21T00:30:01.000Z",
+    });
+    await sleep(10);
+    expect(sendEventCalls.length).toBe(1); // unchanged
+  });
+
+  it("subscribeMarkersToRPC returns an unsubscribe that is called on dispose (rpc.ts integration contract)", async () => {
+    // This test ensures that even if rpc.ts stores the unsub in a closure,
+    // the helper's public contract is "returns an unsubscribe function" —
+    // the dispose path in startRPCServer MUST call it.
+    const rpcModule = await import("../src/rpc.js");
+    const subscribeMarkersToRPC = (rpcModule as any).subscribeMarkersToRPC;
+    expect(subscribeMarkersToRPC).toBeDefined();
+
+    const { createDesignSession } = await import("../src/agent.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    botSession = await createDesignSession({ ephemeral: true });
+    const emitter = getTranscriptMarkerEmitter(botSession.session);
+
+    const calls: unknown[] = [];
+    const unsub = subscribeMarkersToRPC(
+      botSession.session,
+      (_method: string, params: Record<string, unknown>) => calls.push(params),
+    );
+    emitter!.emit("marker", {
+      type: "think_recorded",
+      source: "tool",
+      thought: "pre-unsub",
+      ts: "2026-04-21T00:31:00.000Z",
+    });
+    await sleep(10);
+    expect(calls.length).toBe(1);
+
+    // Invoke the returned unsub — this models `startRPCServer`'s dispose
+    // call-site at rpc.ts:260-271.
+    unsub();
+
+    emitter!.emit("marker", {
+      type: "think_recorded",
+      source: "tool",
+      thought: "post-unsub",
+      ts: "2026-04-21T00:31:01.000Z",
+    });
+    await sleep(10);
+    expect(calls.length).toBe(1); // no additional forwards
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Source-code regression — guarantee that rpc.ts's initialize handler
+  // actually wires up the marker subscription. Parallels the existing
+  // RPC re-init / concurrent-init source checks in
+  // test-plan-mode-v043-group6.ts. This is the second line of defence:
+  // even if subscribeMarkersToRPC is mis-implemented as a no-op that
+  // returns () => {} and never subscribes, this source check will fail if
+  // rpc.ts doesn't also USE it inside startRPCServer.
+  // ──────────────────────────────────────────────────────────────────────
+  it("src/rpc.ts wires subscribeMarkersToRPC (or an equivalent emitter.on('marker') forward) in the initialize path", () => {
+    const raw = readFileSync(
+      join(__dirname, "..", "src", "rpc.ts"),
+      "utf8",
+    );
+    // Slice from startRPCServer header to EOF.
+    const startIdx = raw.indexOf("startRPCServer");
+    expect(
+      startIdx,
+      "src/rpc.ts missing `startRPCServer` — if renamed, update this test",
+    ).toBeGreaterThan(0);
+    const body = raw.slice(startIdx);
+
+    // Accept either idiom:
+    //   (a) `subscribeMarkersToRPC(session, sendEvent)` call
+    //   (b) `getTranscriptMarkerEmitter(...).on("marker", ...)` +
+    //       `sendEvent("transcript_marker", ...)`
+    const hasHelper = /subscribeMarkersToRPC\s*\(/.test(body);
+    const hasInlineEmitterOn =
+      /getTranscriptMarkerEmitter\s*\(/.test(body) &&
+      /on\s*\(\s*["'`]marker["'`]\s*,/.test(body) &&
+      /sendEvent\s*\(\s*["'`]transcript_marker["'`]/.test(body);
+
+    expect(
+      hasHelper || hasInlineEmitterOn,
+      `startRPCServer in src/rpc.ts must wire the TranscriptMarkerEmitter to sendEvent("transcript_marker", marker). Neither the helper form (subscribeMarkersToRPC(...)) nor the inline form (getTranscriptMarkerEmitter(...).on("marker", ...) → sendEvent("transcript_marker", ...)) was found.`,
+    ).toBe(true);
+
+    // Also: sendEvent with method "transcript_marker" must exist — this is
+    // the §4.7 wire contract.
+    expect(
+      /sendEvent\s*\(\s*["'`]transcript_marker["'`]/.test(body) ||
+        hasHelper, // helper takes sendEvent as an argument, so the method literal lives elsewhere
+      "rpc.ts must emit RPC events with method=\"transcript_marker\"",
+    ).toBe(true);
+  });
+});
+
+describe("Phase 0 capstone: one emit fans out to all 4 sinks with identical ts — Task 0.4 end-to-end", () => {
+  let botSession: any;
+  let originalCwd: string;
+  let verboseCwd: string;
+  let originalWrite: typeof process.stdout.write;
+  let rpcCapture: string[];
+
+  afterEach(async () => {
+    if (originalWrite) {
+      process.stdout.write = originalWrite;
+      originalWrite = undefined as any;
+    }
+    if (originalCwd) {
+      try { process.chdir(originalCwd); } catch { /* */ }
+      originalCwd = undefined as any;
+    }
+    if (botSession?.dispose) {
+      try { await botSession.dispose(); } catch { /* */ }
+    }
+    botSession = null;
+  });
+
+  it("synthesised think_recorded emit reaches history JSONL + verbose JSONL + TUI callback + RPC event — identical ts throughout", async () => {
+    originalCwd = process.cwd();
+    verboseCwd = makeTmpDir();
+    process.chdir(verboseCwd);
+
+    const { createDesignSession } = await import("../src/agent.js");
+    const { subscribeToSession } = await import("../src/events.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    // Sink 4 uses the REAL rpc.ts export — no self-emulated forward.
+    // If the Executor has NOT yet added subscribeMarkersToRPC, the module
+    // dynamic import resolves but the named export is undefined, and the
+    // assertion below fails RED with a clean message.
+    const rpcModule = await import("../src/rpc.js");
+    const subscribeMarkersToRPC = (rpcModule as any).subscribeMarkersToRPC as
+      | ((
+          session: unknown,
+          sendEvent: (method: string, params: Record<string, unknown>) => void,
+        ) => () => void)
+      | undefined;
+    expect(
+      subscribeMarkersToRPC,
+      "Sink 4 requires src/rpc.ts to export subscribeMarkersToRPC — the capstone MUST drive the real RPC code path, not a self-emulated forward.",
+    ).toBeDefined();
+
+    // No intersection escape hatch — the ts.createProgram probe in the
+    // Task 0.6 describe block is the authoritative type gate. This line
+    // only exercises the runtime path.
+
+    rpcCapture = [];
+    originalWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as any).write = ((chunk: any) => {
+      try { rpcCapture.push(typeof chunk === "string" ? chunk : String(chunk)); } catch { /* */ }
+      return true;
+    }) as any;
+
+    botSession = await createDesignSession({ ephemeral: true, verbose: true });
+    const emitter = getTranscriptMarkerEmitter(botSession.session);
+    expect(emitter).toBeDefined();
+
+    // Sink 3: TUI callback via subscribeToSession({onTranscriptMarker})
+    const tuiReceived: unknown[] = [];
+    const tuiCallbacks: import("../src/events.js").QlayBotEventCallbacks = {
+      onTranscriptMarker: (m: unknown) => tuiReceived.push(m),
+    };
+    const unsubTui = subscribeToSession(botSession.session, tuiCallbacks);
+
+    // Sink 4: REAL RPC forward via src/rpc.ts export.
+    // sendEvent's behaviour is exactly what rpc.ts:84 does on wire:
+    //   process.stdout.write(JSON.stringify({jsonrpc:"2.0", method, params}) + "\n")
+    // We use the SAME function shape here so the capstone exercises the
+    // real code-path's expected invocation contract.
+    const rpcSendCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const sendEvent = (method: string, params: Record<string, unknown>): void => {
+      rpcSendCalls.push({ method, params });
+      // Mirror the on-wire behaviour for the stdout-based frame count
+      // assertion below — if rpc.ts ever writes the frame differently,
+      // this mirror still yields the same observable.
+      process.stdout.write(
+        JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n",
+      );
+    };
+    const unsubRPC = subscribeMarkersToRPC!(botSession.session, sendEvent);
+
+    const ts = "2026-04-21T00:40:00.000Z";
+    const marker = {
+      type: "think_recorded",
+      source: "tool",
+      thought: "phase-0-capstone",
+      ts,
+    };
+
+    emitter!.emit("marker", marker);
+
+    // Allow async fs.createWriteStream drain
+    await sleep(200);
+
+    // --- Sink 1: history JSONL -------------------------------------------
+    const historyPath = join(
+      botSession.history.getSessionDir(),
+      "transcript.jsonl",
+    );
+    const historyEntries = readFileSync(historyPath, "utf8")
+      .split("\n")
+      .filter((l: string) => l.trim().length > 0)
+      .map((l: string) => JSON.parse(l));
+    const historyMarkers = historyEntries.filter(
+      (e: any) => e.type === "transcript_marker",
+    );
+    expect(historyMarkers.length).toBe(1);
+    expect(historyMarkers[0].timestamp).toBe(ts);
+    expect(historyMarkers[0].data.ts).toBe(ts);
+
+    // --- Sink 2: verbose JSONL -------------------------------------------
+    const verboseDir = join(verboseCwd, "qlaybot-transcripts");
+    expect(existsSync(verboseDir)).toBe(true);
+    const { readdirSync: rds } = await import("fs");
+    const verboseFiles = rds(verboseDir).filter((f: string) => f.endsWith(".jsonl"));
+    expect(verboseFiles.length).toBeGreaterThanOrEqual(1);
+    let verboseMatches: any[] = [];
+    for (const f of verboseFiles) {
+      const raw = readFileSync(join(verboseDir, f), "utf8");
+      for (const line of raw.split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const obj = JSON.parse(t);
+          if (obj.type === "transcript_marker" && obj.data?.ts === ts) {
+            verboseMatches.push(obj);
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    expect(verboseMatches.length).toBe(1);
+    expect(verboseMatches[0].timestamp).toBe(ts);
+    expect(verboseMatches[0].data.ts).toBe(ts);
+
+    // --- Sink 3: TUI callback --------------------------------------------
+    expect(tuiReceived.length).toBe(1);
+    expect((tuiReceived[0] as any).ts).toBe(ts);
+
+    // --- Sink 4: RPC event via subscribeMarkersToRPC ---------------------
+    // (a) The real helper observed exactly one sendEvent call.
+    expect(rpcSendCalls.length).toBe(1);
+    expect(rpcSendCalls[0].method).toBe("transcript_marker");
+    // §4.7 canonical ts — no wrapper ts, params IS the marker
+    expect(rpcSendCalls[0].params).toBe(marker);
+    expect((rpcSendCalls[0].params as any).ts).toBe(ts);
+
+    // (b) Cross-check the on-wire frame captured via stdout hook.
+    const rpcFrames: any[] = [];
+    for (const ln of rpcCapture) {
+      for (const chunk of ln.split("\n")) {
+        const t = chunk.trim();
+        if (!t.startsWith("{")) continue;
+        try {
+          const obj = JSON.parse(t);
+          if (obj.method === "transcript_marker") rpcFrames.push(obj);
+        } catch { /* */ }
+      }
+    }
+    expect(rpcFrames.length).toBe(1);
+    expect(rpcFrames[0].params.ts).toBe(ts);
+    expect(rpcFrames[0].jsonrpc).toBe("2.0");
+    // No divergent wrapper ts on the JSON-RPC envelope
+    expect((rpcFrames[0] as any).ts).toBeUndefined();
+
+    // Canonical ts is identical across all four sinks
+    const observed = [
+      historyMarkers[0].timestamp,
+      historyMarkers[0].data.ts,
+      verboseMatches[0].timestamp,
+      verboseMatches[0].data.ts,
+      (tuiReceived[0] as any).ts,
+      rpcSendCalls[0].params.ts,
+      rpcFrames[0].params.ts,
+    ];
+    expect(new Set(observed).size).toBe(1);
+
+    // cleanup
+    unsubTui();
+    unsubRPC();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Task 0.4(c) identity check — the emitter in the tool map
+  // (opts.transcriptMarkerEmitter passed to assembleTools) MUST be the
+  // SAME instance returned by getTranscriptMarkerEmitter(session).
+  //
+  // Strategy: spy on `assembleTools` to capture the opts at call time, then
+  // compare. The Executor's Task 0.4 Step 3 sequence creates the emitter
+  // once and threads it through both sites (tool map + session registry).
+  // Any test that only checks the session-side WILL NOT catch a regression
+  // where the tool map receives a different instance.
+  // ──────────────────────────────────────────────────────────────────────
+  it("Task 0.4(c): opts.transcriptMarkerEmitter passed to assembleTools is === getTranscriptMarkerEmitter(session)", async () => {
+    const assembleToolsModule = await import("../src/tools/index.js");
+    const { createDesignSession } = await import("../src/agent.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    // Capture every `opts.transcriptMarkerEmitter` that assembleTools sees.
+    const captured: unknown[] = [];
+    const originalAssemble = (assembleToolsModule as any).assembleTools;
+    const spy = vi
+      .spyOn(assembleToolsModule as any, "assembleTools")
+      .mockImplementation((opts: any) => {
+        captured.push(opts.transcriptMarkerEmitter);
+        return originalAssemble(opts);
+      });
+
+    try {
+      botSession = await createDesignSession({ ephemeral: true });
+      const sessionEmitter = getTranscriptMarkerEmitter(botSession.session);
+
+      // The spy observed at least one assembleTools call with a bound emitter.
+      expect(
+        captured.length,
+        "assembleTools must be invoked by createDesignSession",
+      ).toBeGreaterThan(0);
+      const toolMapEmitter = captured[0];
+      expect(
+        toolMapEmitter,
+        "opts.transcriptMarkerEmitter must be passed into assembleTools (Task 0.4 Step 3.2)",
+      ).toBeDefined();
+      // IDENTITY — same JS reference on both sides.
+      expect(toolMapEmitter).toBe(sessionEmitter);
+
+      // Every subsequent assembleTools call (e.g. subagent re-assembly) must
+      // also receive the SAME emitter — no accidental per-call reconstruction.
+      for (const e of captured) {
+        expect(e).toBe(sessionEmitter);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });

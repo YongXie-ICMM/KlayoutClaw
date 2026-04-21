@@ -182,6 +182,14 @@ export function assembleTools(opts: {
   modelRegistry: import("@mariozechner/pi-coding-agent").ModelRegistry;
   planManager?: PlanManager;
   isSubagent?: boolean;
+  /**
+   * v0.4.4 §4.7 — the per-session TranscriptMarkerEmitter. Constructed
+   * once in createDesignSession and threaded through to tool factories
+   * that need to emit markers (notably the `thinking` tool, landed by
+   * G2 in Phase 1). Phase 0 only accepts the param and threads it; the
+   * first producer wiring is G2's concern.
+   */
+  transcriptMarkerEmitter?: import("../events/marker-emitter.js").TranscriptMarkerEmitter;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 }): { toolMap: Record<string, AgentTool<any>>; runner: SubagentRunner | null };
 
