@@ -65,3 +65,56 @@ export class TranscriptMarkerEmitter {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Per-session registry (Task 0.2)
+// ---------------------------------------------------------------------------
+//
+// WeakMap<AgentSession, TranscriptMarkerEmitter> — parallels the
+// PlanSlugCache pattern from PM-12. The registry never auto-creates an
+// emitter; consumers must call setTranscriptMarkerEmitter first. Keys
+// are session object references (WeakMap semantics), so a primitive key
+// throws at registration time.
+//
+// We deliberately leave the key type as `object` rather than binding to
+// the SDK's `AgentSession` so the module stays import-cheap and doesn't
+// pull the SDK's full surface just to type a map key.
+
+const SESSION_EMITTER_REGISTRY: WeakMap<object, TranscriptMarkerEmitter> =
+  new WeakMap();
+
+/**
+ * Look up the emitter bound to a session. Returns `undefined` if none is
+ * registered — callers must handle that case (typically by constructing
+ * one and registering via `setTranscriptMarkerEmitter`). This getter
+ * NEVER auto-creates an emitter.
+ */
+export function getTranscriptMarkerEmitter(
+  session: object,
+): TranscriptMarkerEmitter | undefined {
+  return SESSION_EMITTER_REGISTRY.get(session);
+}
+
+/**
+ * Register the emitter on the session. WeakMap keys must be objects —
+ * passing a primitive throws synchronously (guards against a regression
+ * that swaps the WeakMap for a plain Map keyed by JSON).
+ */
+export function setTranscriptMarkerEmitter(
+  session: object,
+  emitter: TranscriptMarkerEmitter,
+): void {
+  // Node's native WeakMap.set already throws a TypeError for primitive
+  // keys, but we guard explicitly so the error message points at THIS
+  // function rather than at a WeakMap internal trace. Accept objects and
+  // functions (WeakMap semantics).
+  if (
+    session === null ||
+    (typeof session !== "object" && typeof session !== "function")
+  ) {
+    throw new TypeError(
+      "setTranscriptMarkerEmitter: session key must be an object (WeakMap registry)",
+    );
+  }
+  SESSION_EMITTER_REGISTRY.set(session, emitter);
+}
