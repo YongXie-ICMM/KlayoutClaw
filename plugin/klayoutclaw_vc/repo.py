@@ -197,10 +197,12 @@ class RepoHandle:
             )
             if r_add.returncode != 0:
                 self._dirty = True
+                self._rollback_to_clean()
                 return {"ok": False,
                         "reason": f"git add failed: {r_add.stderr.strip()}"}
         except Exception as e:
             self._dirty = True
+            self._rollback_to_clean()
             return {"ok": False, "reason": f"git add raised: {e}"}
 
         # Commit.  T33: ``subprocess.run`` is monkeypatched to raise OSError
@@ -217,26 +219,15 @@ class RepoHandle:
             )
         except OSError as e:
             # T33 fault-injection path.  Undo the staging so HEAD/refs are
-            # unchanged and the on-disk snapshot reverts to the prior commit.
+            # unchanged and the on-disk state reverts to the prior commit
+            # (or to an empty state if no HEAD existed yet).
             self._dirty = True
-            try:
-                subprocess.run(
-                    ["git", "-C", self._repo_path, "reset", "--hard", "HEAD"],
-                    capture_output=True, text=True, env=_GIT_ENV,
-                )
-            except Exception:
-                pass
+            self._rollback_to_clean()
             return {"ok": False, "reason": f"commit failed: {e}"}
 
         if r_commit.returncode != 0:
             self._dirty = True
-            try:
-                subprocess.run(
-                    ["git", "-C", self._repo_path, "reset", "--hard", "HEAD"],
-                    capture_output=True, text=True, env=_GIT_ENV,
-                )
-            except Exception:
-                pass
+            self._rollback_to_clean()
             return {"ok": False,
                     "reason": f"git commit failed: {r_commit.stderr.strip()}"}
 
@@ -736,6 +727,53 @@ class RepoHandle:
             r2 = _git(self._repo_path, "rev-parse", "HEAD")
             return r2.stdout.strip() if r2.returncode == 0 else None
         return name
+
+    def _rollback_to_clean(self) -> None:
+        """RB-2: restore worktree+index to the state before the failed
+        checkpoint attempt.
+
+        Standard case (HEAD exists) — ``git reset --hard HEAD`` clears the
+        index and restores the worktree to the previous commit.
+
+        Edge case (no HEAD yet — first-ever checkpoint fails): ``git reset
+        --hard HEAD`` itself fails, leaving the staged ``snapshot.txt`` in
+        the index and on disk.  We fall back to manual cleanup:
+        ``git rm --cached`` to empty the index, then unlink any snapshot
+        file we may have written to the worktree.  DM-5 recovery journal
+        is already gated behind successful commit, so no journal cleanup
+        is needed here.
+        """
+        # Does HEAD exist?
+        r = subprocess.run(
+            ["git", "-C", self._repo_path, "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True, env=_GIT_ENV,
+        )
+        if r.returncode == 0:
+            # Standard path — reset index + worktree to HEAD.
+            try:
+                subprocess.run(
+                    ["git", "-C", self._repo_path, "reset", "--hard", "HEAD"],
+                    capture_output=True, text=True, env=_GIT_ENV,
+                )
+            except Exception:
+                pass
+            return
+        # No-HEAD path — first-checkpoint failure on a freshly initialised
+        # repo.  Clear the index and remove any snapshot we wrote.
+        try:
+            subprocess.run(
+                ["git", "-C", self._repo_path,
+                 "rm", "-rf", "--cached", "--quiet", "."],
+                capture_output=True, text=True, env=_GIT_ENV,
+            )
+        except Exception:
+            pass
+        snap = os.path.join(self._repo_path, _SNAPSHOT_FILENAME)
+        try:
+            if os.path.exists(snap):
+                os.unlink(snap)
+        except Exception:
+            pass
 
     def _dirty_vs_head(self, layout, head_sha: Optional[str]) -> bool:
         """Spec-compliant RB-4 dirty detection.
