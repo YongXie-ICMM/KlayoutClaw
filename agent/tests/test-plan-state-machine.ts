@@ -140,6 +140,30 @@ describe("PlanStateMachine + exit_plan_mode (Task 2.7)", () => {
   });
 });
 
+describe("exit_plan_mode compatibility without a configured state machine", () => {
+  it("falls back to the legacy deferred exit flow and closes plan mode", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const plan = planManager.enterPlanMode("Legacy compatibility probe");
+    expect(plan).not.toBeNull();
+
+    const result = await createExitPlanModeTool(planManager).execute(
+      "tool-call-legacy-exit",
+      { approved: true, summary: "Legacy summary" },
+    );
+    const body = parseTextPayload(result);
+
+    expect(body.status).toBe("plan_approved");
+    expect(body.plan_id).toBe(plan?.id);
+    expect(body.plan_file).toBe(plan?.filePath);
+    expect(body.summary).toBe("Legacy summary");
+    expect(planManager.inPlanMode).toBe(false);
+  });
+});
+
 describe("plan_drafted hard freeze (T36)", () => {
   it("rejects all tool calls while approval is pending", async () => {
     const { PlanManager } = await import("../src/planning/index.js");

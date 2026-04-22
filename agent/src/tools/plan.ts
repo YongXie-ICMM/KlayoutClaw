@@ -183,6 +183,20 @@ export function createExitPlanModeTool(
         });
       }
 
+      if (!planManager.stateMachine) {
+        const legacyPlan = planManager.exitPlanMode(true);
+        if (!legacyPlan) {
+          return ok({ status: "error", message: "Failed to exit plan mode." });
+        }
+        return ok({
+          status: "plan_approved",
+          plan_id: legacyPlan.id,
+          plan_file: legacyPlan.filePath,
+          summary: p.summary || "Plan approved and ready for execution.",
+          message: "Plan approved. You may now execute it.",
+        });
+      }
+
       const plan = planManager.currentPlan;
       if (!plan) {
         return ok({ status: "error", message: "Failed to exit plan mode." });
