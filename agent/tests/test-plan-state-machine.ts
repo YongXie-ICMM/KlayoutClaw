@@ -1293,3 +1293,106 @@ describe("illegal-transition guard (T41)", () => {
   });
 });
 
+/**
+ * Task 2.17 — planLengthChars telemetry (PM-13 / T37).
+ *
+ * Spec §4.6 PlanDraftedMarker: planLengthChars = JS String.length of the plan
+ * (UTF-16 code-unit count, NOT UTF-8 byte length).
+ *
+ * Much of this may already be satisfied by Task 2.7's plan_drafted emission.
+ * We verify the contract with (a) a 4096-ASCII plan and (d) a multibyte plan
+ * where UTF-16 code units (String.length) diverge from UTF-8 bytes.
+ */
+describe("planLengthChars telemetry (PM-13 / T37)", () => {
+  it("T37(a): 4096-ASCII plan reports planLengthChars === 4096", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+
+    planManager.enterPlanMode("ASCII length probe");
+    const body = "a".repeat(4096);
+    planManager.writePlanContent(body);
+    expect(body.length).toBe(4096);
+
+    // Interactive mode blocks on waitForPlanApproval; issue the exit call
+    // without awaiting and resolve after the drafted marker lands.
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const promise = createExitPlanModeTool(planManager).execute(
+      "tc-t37-ascii",
+      { approved: true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    await promise;
+
+    const drafted = markers.find((m) => m.type === "plan_drafted");
+    expect(drafted).toBeDefined();
+    expect(drafted.planLengthChars).toBe(4096);
+    // Sanity: the plan content must itself be 4096 chars, not truncated.
+    expect(drafted.plan.length).toBe(4096);
+  });
+
+  it("T37(d): multi-byte (π×1000) plan reports UTF-16 code-units (1000), not UTF-8 bytes (2000)", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+
+    planManager.enterPlanMode("Multibyte length probe");
+    const body = "π".repeat(1000);
+    planManager.writePlanContent(body);
+    // JS String.length = UTF-16 code units; π (U+03C0) fits in ONE unit.
+    expect(body.length).toBe(1000);
+    // But UTF-8 bytes = 2000 (each π is 2 bytes).
+    expect(Buffer.byteLength(body, "utf-8")).toBe(2000);
+
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const promise = createExitPlanModeTool(planManager).execute(
+      "tc-t37-pi",
+      { approved: true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    await promise;
+
+    const drafted = markers.find((m) => m.type === "plan_drafted");
+    expect(drafted).toBeDefined();
+    // The critical assertion: 1000 (UTF-16 code units), NOT 2000 (UTF-8 bytes).
+    expect(drafted.planLengthChars).toBe(1000);
+    expect(drafted.planLengthChars).not.toBe(2000);
+  });
+});
+
