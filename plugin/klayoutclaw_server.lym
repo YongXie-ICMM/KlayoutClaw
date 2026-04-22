@@ -356,6 +356,109 @@ TOOLS = [
                 "mode": {"type": "string", "enum": ["current", "others", "all"], "default": "others", "description": "Close strategy when 'index' is omitted: 'current' closes only the active tab; 'others' closes every tab except the active one (default — typical end-of-task cleanup); 'all' closes every open tab."}
             }
         }
+    },
+    {
+        "name": "vc_init",
+        "description": "Initialise version control for the current layout. mode='auto' detects sidecar (memory/disk), 'memory' forces tmpdir, 'disk' hard-requires writable sidecar (no silent fallback).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["auto", "memory", "disk"], "default": "auto", "description": "Repo mode. auto=detect (disk if sidecar exists, memory otherwise); memory=force tmpdir; disk=hard-require writable sidecar."},
+                "gds_path": {"type": "string", "description": "Absolute path to the .gds file this VC repo is associated with. Required."}
+            },
+            "required": ["gds_path"]
+        }
+    },
+    {
+        "name": "vc_checkpoint",
+        "description": "Create a version-control checkpoint (commit) of the current layout. Returns {ok, sha, ts} on success.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Human-readable commit message."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional list of tag names to apply to the new commit."}
+            },
+            "required": ["message"]
+        }
+    },
+    {
+        "name": "vc_history",
+        "description": "List checkpoint history. Returns {ok, commits:[{sha, message, ts, tags, branch, stats}, ...]}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum number of commits to return (most recent first)."},
+                "branch": {"type": "string", "description": "Optional branch name; defaults to HEAD."}
+            }
+        }
+    },
+    {
+        "name": "vc_checkout",
+        "description": "Restore the layout to a prior checkpoint. Moves sidecar HEAD AND rewrites the in-memory layout to match. Returns {ok, sha}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Commit sha, tag, or branch name to checkout."}
+            },
+            "required": ["ref"]
+        }
+    },
+    {
+        "name": "vc_diff",
+        "description": "Compare two checkpoints by polygon-level delta. Returns added_polygons, removed_polygons, moved_polygons, layer_stats, bbox_delta, polygon_count_delta.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref_a": {"type": "string", "description": "Base reference (sha/tag/branch)."},
+                "ref_b": {"type": "string", "description": "Target reference (sha/tag/branch)."}
+            },
+            "required": ["ref_a", "ref_b"]
+        }
+    },
+    {
+        "name": "vc_branch",
+        "description": "Branch operations: list, create, switch, merge. Unknown ops are rejected with ok=False.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["list", "create", "switch", "merge"], "description": "Branch op to perform."},
+                "name": {"type": "string", "description": "Branch name (required for create/switch/merge)."},
+                "from_ref": {"type": "string", "description": "Optional starting ref for 'create'."}
+            },
+            "required": ["op"]
+        }
+    },
+    {
+        "name": "vc_tag",
+        "description": "Create an annotated tag at a ref (default HEAD). Duplicate tag names return ok=False with 'already exists'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Tag name."},
+                "ref": {"type": "string", "description": "Optional ref to tag (default HEAD)."}
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "vc_export",
+        "description": "Export a checkpoint's layout as GDS bytes (base64-inlined) or pya code. Payloads over 256 KiB are written to a tempfile and returned via path=, with truncated=True.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Commit sha / tag / branch to export."},
+                "format": {"type": "string", "enum": ["gds", "pya"], "description": "Export format. 'gds'=base64 GDS bytes; 'pya'=executable klayout.db Python code."}
+            },
+            "required": ["ref", "format"]
+        }
+    },
+    {
+        "name": "vc_status",
+        "description": "Report the live VC status. Returns {ok, branch, dirty, last_checkpoint_ts, pending, mode}. Uninitialised layouts return ok=False with reason='vc not initialized'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -539,6 +642,15 @@ def _tool_save_layout(args):
     else:
         save_opts.format = "GDS2"
     _layout.write(abs_path, save_opts)
+    # DM-4: if a memory-mode VC handle exists for this layout, migrate it
+    # to disk now that we have a concrete .gds path.  Best-effort: any
+    # failure is logged but does not fail the save itself.
+    try:
+        _vc_ensure_handlers_importable()
+        import tools.vc_mcp_handlers as _vch
+        _vch.migrate_on_save(_layout, abs_path)
+    except Exception as _e:
+        _log("save_layout: VC migrate_on_save skipped: {}".format(_e))
     return json.dumps({"status": "ok", "filepath": abs_path, "format": fmt})
 
 
@@ -1588,6 +1700,141 @@ def _tool_close_layout_view(args):
     return json.dumps(result)
 
 
+# ---------------------------------------------------------------------------
+# VC (Version Control) tool thunks — Phase 5 §5.2.4
+#
+# Each thunk ensures cached layout handles are fresh, imports the pure-Python
+# handler module lazily (so macro load doesn't fail if the tools/ tree is
+# misplaced), and forwards to tools.vc_mcp_handlers.  The handler module
+# owns the REGISTRY keyed by id(layout).
+# ---------------------------------------------------------------------------
+
+
+def _vc_ensure_handlers_importable():
+    """Insert the tools/ directory onto sys.path so ``import
+    tools.vc_mcp_handlers`` resolves no matter where the plugin was
+    installed from.  Idempotent."""
+    # Candidate parents that contain a ``tools/`` subdir with
+    # ``vc_mcp_handlers.py``.
+    candidates = [
+        os.path.expanduser("~/Documents/GitHub/KlayoutClaw"),
+        os.path.expanduser("~/testFolder/KlayoutClaw"),
+        os.path.expanduser("~/.klayout/pymacros"),
+    ]
+    try:
+        candidates.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    for parent in candidates:
+        if not parent:
+            continue
+        handler_path = os.path.join(parent, "tools", "vc_mcp_handlers.py")
+        if os.path.isfile(handler_path):
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            return
+
+
+def _vc_gds_hint():
+    """Best-effort detection of the gds path associated with the current
+    layout.  Returns None if unavailable."""
+    try:
+        cv = _layout_view.active_cellview() if _layout_view is not None else None
+        if cv is not None:
+            fn = getattr(cv, "filename", None)
+            if isinstance(fn, str) and fn:
+                return os.path.abspath(fn)
+    except Exception:
+        pass
+    return None
+
+
+def _tool_vc_init(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    hint = args.get("gds_path") or _vc_gds_hint()
+    result = _handlers.vc_init(args or {}, layout=_layout, gds_path_hint=hint)
+    return json.dumps(result)
+
+
+def _tool_vc_checkpoint(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_checkpoint(args or {}, layout=_layout,
+                                     gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_history(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_history(args or {}, layout=_layout,
+                                  gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_checkout(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_checkout(args or {}, layout=_layout,
+                                   gds_path_hint=_vc_gds_hint())
+    # checkout rewrites the layout — refresh the GUI.
+    try:
+        _refresh_view()
+    except Exception:
+        pass
+    return json.dumps(result)
+
+
+def _tool_vc_diff(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_diff(args or {}, layout=_layout,
+                               gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_branch(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_branch(args or {}, layout=_layout,
+                                 gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_tag(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_tag(args or {}, layout=_layout,
+                              gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_export(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_export(args or {}, layout=_layout,
+                                 gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
+def _tool_vc_status(args):
+    _ensure_valid_handles()
+    _vc_ensure_handlers_importable()
+    import tools.vc_mcp_handlers as _handlers
+    result = _handlers.vc_status(args or {}, layout=_layout,
+                                 gds_path_hint=_vc_gds_hint())
+    return json.dumps(result)
+
+
 _TOOL_DISPATCH = {
     "create_layout": _tool_create_layout,
     "execute_script": _tool_execute_script,
@@ -1599,6 +1846,15 @@ _TOOL_DISPATCH = {
     "evaluate_design": _tool_evaluate_design,
     "validate_pixel_size": _tool_validate_pixel_size,
     "close_layout_view": _tool_close_layout_view,
+    "vc_init": _tool_vc_init,
+    "vc_checkpoint": _tool_vc_checkpoint,
+    "vc_history": _tool_vc_history,
+    "vc_checkout": _tool_vc_checkout,
+    "vc_diff": _tool_vc_diff,
+    "vc_branch": _tool_vc_branch,
+    "vc_tag": _tool_vc_tag,
+    "vc_export": _tool_vc_export,
+    "vc_status": _tool_vc_status,
 }
 
 
