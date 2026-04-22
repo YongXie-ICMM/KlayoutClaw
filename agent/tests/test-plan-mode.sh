@@ -71,12 +71,16 @@ if [ "${EXIT1}" -ne 0 ]; then
   exit 1
 fi
 
-# Assertion 1: at least one plans/plan-*.md file exists in the workspace.
+# Assertion 1: at least one plans/*.md file exists in the workspace.
+# v0.4.4 Task 2.19 rebase: plan IDs changed from `plan-<ts>[-N]` to word
+# slugs (`<adj>-<noun>`) per design spec §4.3 PM-11 line 297. The
+# `plan-*.md` glob no longer matches the new slug shape, so we widen it to
+# `*.md` (the plans/ directory contains only plan files anyway).
 shopt -s nullglob
-PLAN_FILES=("${TMP_WORKSPACE}/plans"/plan-*.md)
+PLAN_FILES=("${TMP_WORKSPACE}/plans"/*.md)
 shopt -u nullglob
 if [ "${#PLAN_FILES[@]}" -eq 0 ]; then
-  echo "[FAIL] no plans/plan-*.md file in ${TMP_WORKSPACE}/plans/" >&2
+  echo "[FAIL] no plans/*.md file in ${TMP_WORKSPACE}/plans/" >&2
   exit 1
 fi
 

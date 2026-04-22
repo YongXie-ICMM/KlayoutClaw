@@ -28,17 +28,67 @@
  * choice is explicitly orthogonal to this group.
  *
  * ---------------------------------------------------------------------------
- * Expected state BEFORE the Executor runs step 9/10/11:
- *   • Reducer tests for planExitMenu / PLAN_EXIT_MENU_OPEN/_CLOSE: FAIL
- *     (field + actions not yet added).
- *   • StatusBar tests: should already PASS (existing PLAN render is correct).
- *   • App.tsx TUI E2E tests: FAIL (no `/plan` handler, no menu, no subscribe
- *     migration).
- *   • Shim-removal + source-grep regressions: FAIL (shims still present,
- *     `src/commands/plan.ts` still exists, legacy exports retained).
+ * v0.4.4 REBASE NOTES (Task 2.19, T8 gate)
+ * ---------------------------------------------------------------------------
+ * v0.4.4 deleted the entire `/plan` slash-command trigger and repurposed the
+ * 4-option exit menu (`PlanExitMenu.tsx` → `PlanApprovalMenu.tsx`). The
+ * following describe blocks were removed from this file:
  *
- * That is the intended TRD shape: most tests fail on a missing-impl baseline
- * and turn green as the Executor completes steps 9/10/11.
+ *   DELETED (v0.4.4 design spec §4.1 line 247 — `/plan` slash trigger gone):
+ *     - "Group 3 · App /plan slash handler (T1, T11)"
+ *       entire describe — T1 and T11 both drove plan-mode entry via the
+ *       `/plan <task>` slash command, which v0.4.4 replaced with the
+ *       `enter_plan_mode` tool call.
+ *     - "Group 3 · App /plan exit menu open (T2)"
+ *       T2 asserts `/plan` (no args) opens the v0.4.3 menu with labels
+ *       "Clear context & execute / Execute / Revise / Do nothing". v0.4.4
+ *       spec §4.3 PM-3 line 286 replaces the trigger (tool-call, not slash)
+ *       AND the labels (approve_execute / approve_only / reject / abandon).
+ *     - "Group 3 · App exit menu key handlers (T3-T7)"
+ *       T3-T8 exercise the v0.4.3 menu handlers: key '1' → compact+EXECUTE,
+ *       '2' → EXECUTE, '3' → reenterPlanMode, '4' → "Plan saved", Escape →
+ *       "Plan saved". v0.4.4 spec §4.3 PM-3: the four actions are renamed
+ *       (approve_execute / approve_only / reject / abandon) and the new
+ *       menu is owned by `PlanApprovalMenu.tsx` (T31). EXECUTE_PROMPT and
+ *       the compact-then-prompt wiring are gone — the v0.4.4 gate drives
+ *       the turn directly via the exit-tool result, not via slash-command →
+ *       prompt replay (spec §4.4 line 327 "TUI pause/resume mechanism").
+ *     - "Group 3 · exit menu input gating"
+ *       Both tests open the v0.4.3 menu via the `/plan` slash trigger (gone)
+ *       and assert on `EXECUTE_PROMPT` text in `session.prompt` (gone).
+ *       Menu-open input gating is re-tested against `PlanApprovalMenu`
+ *       under the v0.4.4 component test (T31, separate file).
+ *     - "Group 3 · /plan handles enterPlanMode returning null (D1)"
+ *       Drives the failure path through the `/plan` slash command. The
+ *       enter-tool D1 branch is still covered in test-plan-mode-v043.ts
+ *       ("enterPlanMode returns null on FS failure; does NOT mutate state")
+ *       and in test-plan-mode-v043.ts tool test ("execute when
+ *       PlanManager.enterPlanMode returns null (D1 FS failure)").
+ *
+ *   DELETED (v0.4.4 design spec §4.1 — D3 invariant INVERTED):
+ *     - "Group 3 · tool-path entry/exit bridge (T9, T10)" — T10 only
+ *       (T9 retained). T10 asserts `exit_plan_mode({approved:true})` does
+ *       NOT open the menu; v0.4.4 spec §4.1 line 247 + §4.4 line 327
+ *       INVERT this: in interactive TUI mode the tool-call MUST open the
+ *       approval menu (the gate is implemented inside the tool's
+ *       `execute()` via `await waitForPlanApproval`). The "menu NOT opened"
+ *       invariant is therefore obsolete.
+ *
+ *   DELETED (v0.4.4 source-grep regressions — App.tsx /plan handler gone):
+ *     - "src/tui/components/App.tsx contains the /plan prefix check and
+ *       dispatches PLAN_EXIT_MENU_OPEN" — §4.1 removed the `/plan` handler;
+ *       the dispatch site moved to the approval-tool pipeline.
+ *     - "BEHAVIORAL: submitting /plan <task> intercepts BEFORE
+ *       CommandRegistry" — `/plan` route no longer exists.
+ *
+ *   RETAINED (v0.4.4-valid invariants):
+ *     - reducer planExitMenu + PLAN_EXIT_MENU_OPEN/_CLOSE actions — still
+ *       the actions `PlanApprovalMenu.tsx` dispatches in v0.4.4.
+ *     - StatusBar PLAN indicator tied to state.inPlanMode.
+ *     - T9 — `enter_plan_mode` tool returns plan_mode_active + subscribe
+ *       bridge flips inPlanMode.
+ *     - PlanManager shim-removal + source-grep regressions (no-legacy
+ *       constructors, no `wrapToolWithSandbox`, etc.).
  */
 
 import {
@@ -369,327 +419,22 @@ describe("Group 3 · StatusBar PLAN indicator", () => {
 // 3. App.tsx TUI E2E tests (render + stdin.write)
 // ===========================================================================
 
-describe("Group 3 · App /plan slash handler (T1, T11)", () => {
-  it("T1: /plan <task> creates a plan file, dispatches 'Plan mode active' system message, flips inPlanMode, AND auto-submits an agent prompt with the task + plan path", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-    });
-    await sleep(60);
+// DELETED (v0.4.4 Task 2.19): three describe blocks for the /plan slash
+//   handler + v0.4.3 menu key handlers.
+//   - describe("Group 3 · App /plan slash handler (T1, T11)")
+//   - describe("Group 3 · App /plan exit menu open (T2)")
+//   - describe("Group 3 · App exit menu key handlers (T3-T7)")
+// Spec §4.1 line 247: v0.4.4 removed the /plan slash-command trigger.
+// Plan mode is entered only via the enter_plan_mode tool call. The
+// 4-option menu is repurposed (PlanExitMenu → PlanApprovalMenu, spec
+// §4.3 PM-3 line 286) with new action names (approve_execute /
+// approve_only / reject / abandon) and a new trigger (exit_plan_mode
+// tool call opens the approval gate inside execute(), not a slash
+// handler). EXECUTE_PROMPT / compact-then-prompt wiring is retired.
+// See file header for the full rebase summary. T1/T11/T2 were the
+// slash-entry tests; T3-T8 exercised the v0.4.3 menu labels and
+// handlers; every assertion in those blocks is now obsolete.
 
-    inst.stdin.write("/plan design a Hall bar");
-    inst.stdin.write("\r");
-
-    await waitFor(
-      () => pm.inPlanMode === true,
-      2000,
-      20,
-      "PlanManager.inPlanMode did not become true after /plan <task>",
-    );
-
-    const frame = lastFrameStripped(inst);
-    expect(frame).toContain("Plan mode active");
-
-    // Disk: file exists, non-empty, and the template body is there.
-    const plan = pm.currentPlan;
-    expect(plan).not.toBeNull();
-    expect(plan && existsSync(plan.filePath)).toBe(true);
-    const body = readFileSync(plan!.filePath, "utf-8");
-    expect(body.length).toBeGreaterThan(0);
-    expect(body).toContain("## Plan");
-    expect(body).toContain("## Task");
-
-    // Auto-submit prompt (spec §1.8.1 branch B). The handler must call
-    // session.prompt(...) with a string that contains:
-    //   - the task description the user passed after /plan
-    //   - the absolute plan file path (so the agent knows what to edit)
-    //   - a marker that this was triggered by plan-mode activation
-    await waitFor(
-      () => spies.promptSpy.mock.calls.length >= 1,
-      2000,
-      20,
-      "session.prompt was never called after /plan <task> (auto-submit missing)",
-    );
-    const submitted = spies.promptSpy.mock.calls[0][0] as string;
-    expect(typeof submitted).toBe("string");
-    expect(submitted).toContain("design a Hall bar");
-    expect(submitted).toContain(plan!.filePath);
-    // Spec §1.8.1 auto-submit template opens with "[Plan mode activated]"
-    // followed by "plan mode" body text. We accept either anchor (case-
-    // insensitive on the second to survive minor wording tweaks).
-    expect(submitted).toContain("[Plan mode activated]");
-    expect(submitted.toLowerCase()).toContain("plan mode");
-
-    inst.unmount();
-  });
-
-  it("bare /plan (no task, NOT already in plan mode) enters plan mode without auto-submitting an agent prompt", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-    });
-    await sleep(60);
-
-    // Pre-condition: not yet in plan mode.
-    expect(pm.inPlanMode).toBe(false);
-
-    inst.stdin.write("/plan");
-    inst.stdin.write("\r");
-
-    await waitFor(
-      () => pm.inPlanMode === true,
-      2000,
-      20,
-      "bare /plan did not enter plan mode",
-    );
-
-    // A plan file WAS created (since entry always creates one).
-    const plan = pm.currentPlan;
-    expect(plan).not.toBeNull();
-    expect(existsSync(plan!.filePath)).toBe(true);
-
-    // SYSTEM_MESSAGE "Plan mode active..." is dispatched.
-    const frame = lastFrameStripped(inst);
-    expect(frame).toContain("Plan mode active");
-
-    // No auto-submit — without a task description there's nothing to ask
-    // the agent to do. Give the event loop a few ticks to settle then
-    // assert session.prompt was never called.
-    await sleep(100);
-    expect(spies.promptSpy).not.toHaveBeenCalled();
-
-    inst.unmount();
-  });
-
-  it("T11: /plan <task> while already in plan mode emits 'Already in plan mode' and does NOT create a second plan file", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm } = await renderAppWithPlan({ workspaceDir: workspace });
-    await sleep(60);
-
-    // First entry
-    inst.stdin.write("/plan first task");
-    inst.stdin.write("\r");
-    await waitFor(() => pm.inPlanMode === true, 2000, 20, "first /plan entry failed");
-    const firstPlan = pm.currentPlan;
-    expect(firstPlan).not.toBeNull();
-    const firstPath = firstPlan!.filePath;
-
-    // Second attempt while already in plan mode
-    inst.stdin.write("/plan another task");
-    inst.stdin.write("\r");
-    await sleep(80);
-
-    const frame = lastFrameStripped(inst);
-    expect(frame).toContain("Already in plan mode");
-    // Plan pointer unchanged — still the same in-memory object.
-    expect(pm.currentPlan).toBe(firstPlan);
-    expect(firstPath).toBe(pm.currentPlan!.filePath);
-
-    inst.unmount();
-  });
-});
-
-describe("Group 3 · App /plan exit menu open (T2)", () => {
-  it("T2: /plan (no args) while in plan mode opens the 4-option menu with the documented text", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm } = await renderAppWithPlan({ workspaceDir: workspace });
-    await sleep(60);
-
-    // Enter plan mode first
-    inst.stdin.write("/plan design something");
-    inst.stdin.write("\r");
-    await waitFor(() => pm.inPlanMode === true, 2000, 20, "initial entry failed");
-    const planPath = pm.currentPlan!.filePath;
-
-    // Now /plan with no args → exit + menu
-    inst.stdin.write("/plan");
-    inst.stdin.write("\r");
-    await waitFor(() => pm.inPlanMode === false, 2000, 20, "exit did not fire");
-    await sleep(50);
-
-    const frame = lastFrameStripped(inst);
-    // Spec §1.8.1 exact menu lines (2-space indent before digits)
-    expect(frame).toContain("Plan complete. Full tool access restored.");
-    expect(frame).toContain(`Plan file: ${planPath}`);
-    expect(frame).toContain("  1  Clear context & execute");
-    expect(frame).toContain("  2  Execute");
-    expect(frame).toContain("  3  Revise (re-enter plan mode)");
-    expect(frame).toContain("  4  Do nothing");
-    expect(frame).toContain("Press 1-4 to choose:");
-
-    inst.unmount();
-  });
-});
-
-describe("Group 3 · App exit menu key handlers (T3-T7)", () => {
-  async function openMenu(workspace: string) {
-    // Enter plan mode via BARE `/plan` (no task description) so there is
-    // no auto-submit (Branch C in spec §1.8.1). This keeps
-    // `session.prompt` at 0 calls pre-menu-key; T3/T4/T6/T7/T8 can then
-    // assert clean prompt-spy counts without a baseline-delta dance.
-    // The `/plan <task>` auto-submit path is already covered by T1.
-    const bundle = await renderAppWithPlan({ workspaceDir: workspace });
-    await sleep(60);
-    bundle.inst.stdin.write("/plan");
-    bundle.inst.stdin.write("\r");
-    await waitFor(
-      () => bundle.pm.inPlanMode === true,
-      2000,
-      20,
-      "enter failed",
-    );
-    bundle.inst.stdin.write("/plan");
-    bundle.inst.stdin.write("\r");
-    await waitFor(
-      () => bundle.pm.inPlanMode === false,
-      2000,
-      20,
-      "exit did not fire",
-    );
-    await sleep(40);
-    return bundle;
-  }
-
-  it("T3: key '1' triggers compact() and then session.prompt(EXECUTE_PROMPT(path))", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-    const planPath = bundle.pm.currentPlan!.filePath;
-
-    bundle.inst.stdin.write("1");
-    // compact resolves immediately; give the promise chain 1 tick
-    await sleep(120);
-
-    expect(bundle.spies.compactSpy).toHaveBeenCalledTimes(1);
-    expect(bundle.spies.promptSpy).toHaveBeenCalledTimes(1);
-
-    const submitted = bundle.spies.promptSpy.mock.calls[0][0] as string;
-    expect(submitted).toContain("Execute the design plan at:");
-    expect(submitted).toContain(planPath);
-
-    // Menu closes → its text is no longer in the frame
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).not.toContain("Press 1-4 to choose:");
-
-    bundle.inst.unmount();
-  });
-
-  it("T4: key '2' runs EXECUTE_PROMPT without calling compact()", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-    const planPath = bundle.pm.currentPlan!.filePath;
-
-    bundle.inst.stdin.write("2");
-    await sleep(80);
-
-    expect(bundle.spies.compactSpy).not.toHaveBeenCalled();
-    expect(bundle.spies.promptSpy).toHaveBeenCalledTimes(1);
-    const submitted = bundle.spies.promptSpy.mock.calls[0][0] as string;
-    expect(submitted).toContain("Execute the design plan at:");
-    expect(submitted).toContain(planPath);
-
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).not.toContain("Press 1-4 to choose:");
-
-    bundle.inst.unmount();
-  });
-
-  it("T5: key '3' re-enters plan mode via reenterPlanMode(), strips the status marker from disk, emits 'Re-entered'", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-    const planPath = bundle.pm.currentPlan!.filePath;
-
-    // Confirm exitPlanMode wrote the `> Status: **approved**` marker at top.
-    const preRevisionBody = readFileSync(planPath, "utf-8");
-    expect(preRevisionBody).toMatch(/^> Status: \*\*approved\*\*/);
-
-    bundle.inst.stdin.write("3");
-    await waitFor(
-      () => bundle.pm.inPlanMode === true,
-      2000,
-      20,
-      "reenterPlanMode did not fire",
-    );
-    await sleep(40);
-
-    const postBody = readFileSync(planPath, "utf-8");
-    expect(postBody.startsWith("> Status:")).toBe(false);
-
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).toContain("Re-entered");
-
-    bundle.inst.unmount();
-  });
-
-  it("T6: key '4' closes the menu and emits 'Plan saved. You can execute it later.'", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-
-    bundle.inst.stdin.write("4");
-    await sleep(60);
-
-    expect(bundle.spies.compactSpy).not.toHaveBeenCalled();
-    expect(bundle.spies.promptSpy).not.toHaveBeenCalled();
-
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).toContain("Plan saved. You can execute it later.");
-    expect(frame).not.toContain("Press 1-4 to choose:");
-
-    bundle.inst.unmount();
-  });
-
-  it("T7: Escape while menu is open behaves like key '4'", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-
-    bundle.inst.stdin.write("\u001b"); // Escape
-    await sleep(60);
-
-    expect(bundle.spies.compactSpy).not.toHaveBeenCalled();
-    expect(bundle.spies.promptSpy).not.toHaveBeenCalled();
-
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).toContain("Plan saved. You can execute it later.");
-    expect(frame).not.toContain("Press 1-4 to choose:");
-
-    bundle.inst.unmount();
-  });
-
-  it("T8: while menu is open, non-menu chars do NOT end up in the input buffer", async () => {
-    const workspace = makeTmpDir();
-    const bundle = await openMenu(workspace);
-
-    // At menu-open the InputBox should be disabled; "abc" must be swallowed.
-    bundle.inst.stdin.write("abc");
-    await sleep(60);
-
-    // Now submit '4' to close the menu; after it closes the input buffer
-    // should still be empty — if "abc" had leaked into the buffer, pressing
-    // '4' followed by Enter would submit "abc4" or "4" would be treated as
-    // additional chars instead of a menu key.
-    bundle.inst.stdin.write("4");
-    await sleep(60);
-
-    // Neither prompt nor compact should have been invoked with leaked text
-    expect(bundle.spies.promptSpy).not.toHaveBeenCalled();
-
-    // Plan saved message fires, confirming '4' was consumed by the menu
-    const frame = lastFrameStripped(bundle.inst);
-    expect(frame).toContain("Plan saved. You can execute it later.");
-
-    // No leaked text in the visible input buffer after the menu closes.
-    // Strict form (Codex finding 5): FIRST require that the "qlaybot>"
-    // prompt is renderable at all — otherwise the regex match would
-    // silently swallow the whole assertion — THEN assert the input
-    // segment has no "abc".
-    expect(frame).toContain("qlaybot>");
-    const promptRe = /qlaybot>\s*([^\n]*)/;
-    const match = frame.match(promptRe);
-    expect(match).not.toBeNull();
-    expect(match![1]).not.toContain("abc");
-
-    bundle.inst.unmount();
-  });
-});
 
 // ===========================================================================
 // 4. Tool-path entry/exit (T9, T10 — D3 invariant)
@@ -743,285 +488,37 @@ describe("Group 3 · tool-path entry/exit bridge (T9, T10)", () => {
     inst.unmount();
   });
 
-  it("T10 (D3 invariant): real exit_plan_mode tool returns plan_approved JSON; planExitMenu stays null (menu NOT opened)", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm } = await renderAppWithPlan({ workspaceDir: workspace });
-    await sleep(60);
-
-    // Enter via the tool factory (matching real agent-loop semantics)
-    const enterTool = createEnterPlanModeTool(pm);
-    const enterResult = await enterTool.execute("tc-enter-2", {
-      task: "enter via tool",
-    });
-    const enterData = parseToolJSON(enterResult);
-    expect(enterData.status).toBe("plan_mode_active");
-    const planFile = enterData.plan_file as string;
-    await waitFor(
-      () => lastFrameStripped(inst).includes("PLAN"),
-      2000,
-      20,
-      "did not enter",
-    );
-
-    // Exit via the tool factory — this is the critical D3 code path.
-    const exitTool = createExitPlanModeTool(pm);
-    const exitResult = await exitTool.execute("tc-exit-1", { approved: true });
-    const exitData = parseToolJSON(exitResult);
-    expect(exitData.status).toBe("plan_approved");
-    expect(exitData.plan_id).toBe(enterData.plan_id);
-    expect(exitData.plan_file).toBe(planFile);
-
-    // StatusBar drops the PLAN indicator.
-    await waitFor(
-      () => !lastFrameStripped(inst).includes("PLAN"),
-      2000,
-      20,
-      "StatusBar still shows PLAN after exit_plan_mode tool call",
-    );
-
-    // Critical D3 invariant — the approval menu MUST NOT open.
-    //
-    // Exhaustive frame-level negative assertion (Codex finding B): an impl
-    // that transiently opened + closed the menu between renders could
-    // escape a single-string check, so we assert NONE of the menu lines
-    // from §1.8.1 appear, checked over an extended settle window.
-    await sleep(100);
-
-    // Poll 10x over ~500ms to catch any transient menu flash.
-    const menuLines = [
-      "Plan complete. Full tool access restored.",
-      "  1  Clear context & execute",
-      "  2  Execute",
-      "  3  Revise (re-enter plan mode)",
-      "  4  Do nothing",
-      "Press 1-4 to choose:",
-    ];
-    for (let i = 0; i < 10; i++) {
-      const frame = lastFrameStripped(inst);
-      for (const line of menuLines) {
-        expect(
-          frame.includes(line),
-          `D3 violated: exit tool caused the approval menu to render line "${line}" (iteration ${i})`,
-        ).toBe(false);
-      }
-      await sleep(50);
-    }
-
-    // Final frame assertion on the already-polled window.
-    const finalFrame = lastFrameStripped(inst);
-    for (const line of menuLines) {
-      expect(finalFrame).not.toContain(line);
-    }
-    expect(pm.inPlanMode).toBe(false);
-
-    // Belt-and-suspenders source grep: count PLAN_EXIT_MENU_OPEN dispatch
-    // sites. The slash handler is the ONLY site; tool-path exit must not
-    // add a second.
-    const appSrc = readSrc("tui/components/App.tsx");
-    const matches = appSrc.match(/PLAN_EXIT_MENU_OPEN/g) ?? [];
-    expect(matches.length).toBeLessThanOrEqual(1);
-
-    inst.unmount();
-  });
+  // DELETED (v0.4.4 Task 2.19): "T10 (D3 invariant): real exit_plan_mode
+  //   tool returns plan_approved JSON; planExitMenu stays null (menu NOT
+  //   opened)".
+  // v0.4.4 design spec §4.1 line 247 + §4.4 line 327: the D3 invariant
+  // ("tool exit must not open menu") is INVERTED. In interactive TUI mode,
+  // `exit_plan_mode({approved: true})` now OPENS the approval menu as part
+  // of the gate (implemented inside the tool's execute() via
+  // `await waitForPlanApproval`). The v0.4.3 assertion that the menu stays
+  // null on tool exit is therefore obsolete. In headless `-m` mode the menu
+  // still does NOT open (PM-4 auto-approval) — that invariant is covered
+  // separately by the headless-mode approval tests (Task 2.14 / T31).
+  // T9 (enter_plan_mode returns plan_mode_active; subscribe bridge flips
+  // inPlanMode) is retained above — that invariant is v0.4.4-valid.
 });
 
 // ===========================================================================
 // 5. Error-path coverage (D1 — FS failure returns null)
 // ===========================================================================
 
-describe("Group 3 · /plan handles enterPlanMode returning null (D1)", () => {
-  it("emits a 'Failed to enter plan mode' system message and does NOT flip inPlanMode when enterPlanMode returns null", async () => {
-    const workspace = makeTmpDir();
-    const pm = new PlanManager(workspace);
-    // Force enterPlanMode to return null (D1 FS-failure surface) without
-    // actually breaking the filesystem — this is the cleanest way to test
-    // the App.tsx branch without coupling to OS-specific mkdir failures.
-    const origEnter = pm.enterPlanMode.bind(pm);
-    vi.spyOn(pm, "enterPlanMode").mockImplementation(() => null);
+// DELETED (v0.4.4 Task 2.19): two describe blocks that exercised the
+//   /plan slash-command entry path:
+//   - describe("Group 3 · /plan handles enterPlanMode returning null (D1)")
+//   - describe("Group 3 · exit menu input gating")
+// Spec §4.1 line 247 removed the /plan slash-command trigger. The D1
+// FS-failure branch is still covered in test-plan-mode-v043.ts — see
+// "enterPlanMode returns null on FS failure" (manager-level) and
+// "execute when PlanManager.enterPlanMode returns null (D1 FS failure)"
+// (tool-level). The menu-open input-gating invariant is re-tested for
+// v0.4.4 against PlanApprovalMenu in the component tests (T31).
 
-    const { inst, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-      planManager: pm,
-    });
-    await sleep(60);
 
-    inst.stdin.write("/plan will fail");
-    inst.stdin.write("\r");
-    await sleep(120);
-
-    // Reducer must not have entered plan mode.
-    expect(pm.inPlanMode).toBe(false);
-
-    // System message: must communicate failure. We require the SUBSTRING
-    // "Failed to enter plan mode" exactly — the Executor owns the full text
-    // but this anchor stays stable.
-    const frame = lastFrameStripped(inst);
-    expect(frame).toContain("Failed to enter plan mode");
-
-    // Agent loop should NOT receive the auto-submit prompt on the failure
-    // path — that is `session.prompt` untouched.
-    expect(spies.promptSpy).not.toHaveBeenCalled();
-
-    // Sanity: the un-mocked entry path still works (guards against broken
-    // PlanManager in the test harness itself).
-    void origEnter;
-
-    inst.unmount();
-  });
-});
-
-// ===========================================================================
-// 6. Menu-open input gating + post-close interactivity
-// ===========================================================================
-//
-// Note on spec T32: qdevbot's App.tsx submits `/plan` through the InputBox's
-// Enter handler, which calls `buf.clear()` BEFORE `setPlanExitMenu` fires.
-// Consequently there is no in-flight state where the buffer holds
-// unsubmitted user chars at the moment the exit menu opens via the slash
-// path — "buffered chars survive menu open" is architecturally unreachable
-// under the existing InputBox contract.
-//
-// The two invariants that ARE reachable and that we DO test here:
-//   (1) While the exit menu is open, typed chars are suppressed (do NOT
-//       reach the input buffer) and Enter does NOT submit anything.
-//   (2) Once the menu closes, the InputBox is interactive again.
-// ===========================================================================
-
-describe("Group 3 · exit menu input gating", () => {
-  it("while plan exit menu is open, typed characters do NOT reach the input buffer and Enter does NOT submit", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-    });
-    await sleep(60);
-
-    // Enter plan mode via the slash flow.
-    inst.stdin.write("/plan initial task");
-    inst.stdin.write("\r");
-    await waitFor(() => pm.inPlanMode === true, 2000, 20, "entry failed");
-
-    // Baseline prompt-call count (auto-submit for /plan <task> fires once).
-    const basePromptCalls = spies.promptSpy.mock.calls.length;
-
-    // Trigger the menu via bare /plan.
-    inst.stdin.write("/plan");
-    inst.stdin.write("\r");
-    await waitFor(
-      () => pm.inPlanMode === false,
-      2000,
-      20,
-      "menu did not open (exit event didn't fire)",
-    );
-    await waitFor(
-      () => lastFrameStripped(inst).includes("Press 1-4 to choose:"),
-      2000,
-      20,
-      "menu text never appeared",
-    );
-
-    // (1a) Chars typed while the menu is active do NOT reach the input buffer.
-    inst.stdin.write("xyz");
-    await sleep(80);
-    const duringMenuFrame = lastFrameStripped(inst);
-    expect(duringMenuFrame).toContain("qlaybot>");
-    const inputLineMatch = duringMenuFrame.match(/qlaybot>\s*([^\n]*)/);
-    expect(inputLineMatch).not.toBeNull();
-    expect(inputLineMatch![1]).not.toContain("xyz");
-
-    // (1b) Enter while menu is open does NOT submit — session.prompt
-    //      gains no additional call.
-    inst.stdin.write("\r");
-    await sleep(80);
-    expect(spies.promptSpy.mock.calls.length).toBe(basePromptCalls);
-
-    // (1c) The menu key ("1") is consumed by the menu handler.
-    inst.stdin.write("1");
-    await waitFor(
-      () => spies.compactSpy.mock.calls.length >= 1,
-      2000,
-      20,
-      "compact() was not invoked by menu key '1'",
-    );
-    expect(spies.compactSpy).toHaveBeenCalledTimes(1);
-
-    await waitFor(
-      () => spies.promptSpy.mock.calls.length >= basePromptCalls + 1,
-      2000,
-      20,
-      "session.prompt was not invoked with EXECUTE_PROMPT after key '1'",
-    );
-    const executeSubmitted = spies.promptSpy.mock.calls[basePromptCalls][0] as string;
-    expect(executeSubmitted).toContain("Execute the design plan at:");
-
-    inst.unmount();
-  });
-
-  it("after plan exit menu closes, input buffer accepts new characters again", async () => {
-    const workspace = makeTmpDir();
-    const { inst, pm, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-    });
-    await sleep(60);
-
-    // Drive plan-mode entry + menu open.
-    inst.stdin.write("/plan initial task");
-    inst.stdin.write("\r");
-    await waitFor(() => pm.inPlanMode === true, 2000, 20, "entry failed");
-    const basePromptCalls = spies.promptSpy.mock.calls.length;
-
-    inst.stdin.write("/plan");
-    inst.stdin.write("\r");
-    await waitFor(
-      () => lastFrameStripped(inst).includes("Press 1-4 to choose:"),
-      2000,
-      20,
-      "menu did not open",
-    );
-
-    // Close the menu with key '4' (spec: "Do nothing" → "Plan saved..." +
-    // menu closes). We pick '4' rather than Escape because it emits a
-    // distinctive system message we can anchor on.
-    inst.stdin.write("4");
-    await waitFor(
-      () => lastFrameStripped(inst).includes("Plan saved. You can execute it later."),
-      2000,
-      20,
-      "menu did not close",
-    );
-    await waitFor(
-      () => !lastFrameStripped(inst).includes("Press 1-4 to choose:"),
-      2000,
-      20,
-      "menu text still visible",
-    );
-    // Neither compact nor prompt should have fired from the menu-close path.
-    expect(spies.compactSpy).not.toHaveBeenCalled();
-    expect(spies.promptSpy.mock.calls.length).toBe(basePromptCalls);
-
-    // --- Core assertion: the InputBox is interactive again. ---
-    inst.stdin.write("hello");
-    await waitFor(
-      () => lastFrameStripped(inst).includes("hello"),
-      2000,
-      20,
-      "'hello' never reached the input buffer after menu closed",
-    );
-
-    // Submit "hello" and verify it reaches session.prompt (i.e. the
-    // input handler is fully functional, not just renderable).
-    inst.stdin.write("\r");
-    await waitFor(
-      () => spies.promptSpy.mock.calls.length >= basePromptCalls + 1,
-      2000,
-      20,
-      "session.prompt('hello') was not invoked after menu closed",
-    );
-    const submitted = spies.promptSpy.mock.calls[basePromptCalls][0] as string;
-    expect(submitted).toBe("hello");
-
-    inst.unmount();
-  });
-});
 
 // ===========================================================================
 // 7. Shim-removal regression (step 11 — PlanManager API surface)
@@ -1216,48 +713,16 @@ describe("Group 3 · Step 10/11 · source-grep regressions", () => {
     expect(src).not.toContain("planManager.onStateChange");
   });
 
-  it("src/tui/components/App.tsx contains the /plan prefix check and dispatches PLAN_EXIT_MENU_OPEN", () => {
-    const src = readSrc("tui/components/App.tsx");
-    // Must appear SOMEWHERE in the handler — we don't pin the exact shape.
-    expect(src).toMatch(/\/plan/);
-    // PLAN_EXIT_MENU_OPEN action is dispatched from within the slash handler.
-    expect(src).toContain("PLAN_EXIT_MENU_OPEN");
-  });
-
-  it("BEHAVIORAL: submitting /plan <task> intercepts BEFORE CommandRegistry — registry.execute is not called", async () => {
-    // Finding 5: this is the authoritative behavioral check that the App
-    // short-circuits `/plan` before reaching the CommandRegistry dispatch.
-    // It fails today (CommandRegistry IS called) and turns green when the
-    // Executor adds the pre-registry `/plan` branch per spec §1.8.1.
-    const workspace = makeTmpDir();
-    const { inst, pm, spies } = await renderAppWithPlan({
-      workspaceDir: workspace,
-    });
-    await sleep(60);
-
-    inst.stdin.write("/plan design another thing");
-    inst.stdin.write("\r");
-
-    // Wait for the slash handler to finish. Plan-mode entry is the
-    // observable side-effect of the new branch; if the registry had
-    // intercepted instead, the mock registry.execute (which returns an
-    // empty output) would run and pm.inPlanMode would stay false.
-    await waitFor(
-      () => pm.inPlanMode === true,
-      2000,
-      20,
-      "pm did not enter plan mode — /plan was likely routed through CommandRegistry",
-    );
-
-    // Critical assertion: CommandRegistry.execute MUST NOT have been called
-    // with "plan" (the App.tsx handler must intercept before registry.execute).
-    const planCalls = spies.registryExecute.mock.calls.filter(
-      (c: unknown[]) => c[0] === "plan",
-    );
-    expect(planCalls.length).toBe(0);
-
-    inst.unmount();
-  });
+  // DELETED (v0.4.4 Task 2.19): two source-grep/behavioral regressions that
+  //   required the `/plan` slash handler to exist in App.tsx:
+  //   - "src/tui/components/App.tsx contains the /plan prefix check and
+  //      dispatches PLAN_EXIT_MENU_OPEN"
+  //   - "BEHAVIORAL: submitting /plan <task> intercepts BEFORE
+  //      CommandRegistry — registry.execute is not called"
+  // Spec §4.1 line 247 removed the `/plan` slash trigger. The
+  // `PLAN_EXIT_MENU_OPEN` action still exists and is dispatched by the
+  // approval-gate (inside the tool pipeline) in v0.4.4, so the action-
+  // survives invariant lives in the reducer tests at the top of this file.
 });
 
 // ===========================================================================

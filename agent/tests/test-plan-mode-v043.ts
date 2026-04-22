@@ -12,6 +12,36 @@
  *   src/tools/annotations.ts   (canonicalToolName + getReadOnlyForPlanMode)
  *   src/tools/plan.ts          (createEnterPlanModeTool + createExitPlanModeTool
  *                               + PLAN_MODE_INSTRUCTIONS)
+ *
+ * ---------------------------------------------------------------------------
+ * v0.4.4 REBASE NOTES (Task 2.19, T8 gate)
+ * ---------------------------------------------------------------------------
+ * v0.4.4 replaced several v0.4.3 plan-mode behaviours. The following tests
+ * were either deleted or rebased in this file:
+ *
+ *   DELETED (obsolete invariants):
+ *     - "plan file content matches the spec §1.2 template EXACTLY"
+ *       → v0.4.4 spec §4.2 line 262: enterPlanMode writes an EMPTY file; the
+ *         agent drafts into it via plansDir-scoped write/edit. The fixed
+ *         template is gone.
+ *     - "plan ID collision fallback → single -1 suffix (T33)"
+ *     - "plan ID collision fallback → lands at -2 with two pre-existing files"
+ *     - "plan ID collision exhaustion → throws when all 10 slots occupied"
+ *       → v0.4.4 spec §4.3 PM-11 line 297: slug is now a word-slug
+ *         (`<adj>-<noun>`), collisions retry 10 times and return a structured
+ *         `{status: "error"}` (no throw, no `-N` suffix). Collision coverage
+ *         migrated to tests/test-plan-slug.ts (T24 a/b/c/f).
+ *     - "execute when already in plan mode → status:'already_in_plan_mode'"
+ *       → v0.4.4 spec §4.3 PM-11 cache-first lookup line 295: repeat
+ *         enter_plan_mode reuses the cached slug and returns plan_mode_active
+ *         (same plan_id/plan_file). The "already_in_plan_mode" status is
+ *         retired; slug-reuse coverage is in tests/test-plan-slug.ts.
+ *
+ *   REBASED (format change only):
+ *     - `plan_id` regex: /^plan-\d+/ → /^[a-z]+-[a-z]+$/ (word-slug per PM-11)
+ *     - "reenterPlanMode strips status marker" — removed the `# task` body
+ *       assertion since v0.4.4 plan files start empty; only the marker-strip
+ *       invariant is still applicable.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -148,7 +178,8 @@ describe("PlanManager — new API (spec §1.2)", () => {
     const plan = pm.enterPlanMode("Design a Hall bar with 6 contacts");
     expect(plan).not.toBeNull();
     const p = plan as Plan;
-    expect(p.id).toMatch(/^plan-\d+/);
+    // v0.4.4 PM-11: plan_id is a word-slug (`<adj>-<noun>`), not `plan-<ts>`.
+    expect(p.id).toMatch(/^[a-z]+-[a-z]+$/);
     expect(p.title).toBe("Design a Hall bar with 6 contacts");
     expect(p.task).toBe("Design a Hall bar with 6 contacts");
     expect(p.status).toBe("active");
@@ -162,27 +193,11 @@ describe("PlanManager — new API (spec §1.2)", () => {
     expect(pm.currentPlan).toEqual(p);
   });
 
-  it("plan file content matches the spec §1.2 template EXACTLY", () => {
-    const pm = new PlanManager(tmpRoot);
-    const plan = pm.enterPlanMode("Build X", "Title Here");
-    const content = readFileSync((plan as Plan).filePath, "utf-8");
-    const expected = [
-      `# Title Here`,
-      ``,
-      `## Task`,
-      `Build X`,
-      ``,
-      `## Plan`,
-      ``,
-      `<!-- The agent will fill in the plan during plan mode -->`,
-      ``,
-      `## Tasks`,
-      ``,
-      `<!-- Checklist of implementation tasks -->`,
-      ``,
-    ].join("\n");
-    expect(content).toBe(expected);
-  });
+  // DELETED (v0.4.4 Task 2.19): "plan file content matches the spec §1.2
+  // template EXACTLY". v0.4.4 design spec §4.2 line 262 — enterPlanMode now
+  // writes an EMPTY file; the agent populates it via plansDir-scoped
+  // write/edit during `plan_drafting`. The fixed markdown template from
+  // v0.4.3 is no longer part of the contract.
 
   it("enterPlanMode uses explicit title argument when provided", () => {
     const pm = new PlanManager(tmpRoot);
@@ -214,66 +229,17 @@ describe("PlanManager — new API (spec §1.2)", () => {
     expect((plan as Plan).title).toBe("First sentence");
   });
 
-  it("plan ID collision fallback → single -1 suffix (T33)", () => {
-    const pm = new PlanManager(tmpRoot);
-    const plansDir = pm.plansDir;
-    mkdirSync(plansDir, { recursive: true });
-    const fixedTs = 1_744_912_345_678;
-    const preExisting = join(plansDir, `plan-${fixedTs}.md`);
-    writeFileSync(preExisting, "# pre-existing\n", "utf-8");
-
-    vi.spyOn(Date, "now").mockReturnValue(fixedTs);
-
-    const plan = pm.enterPlanMode("colliding task");
-    expect(plan).not.toBeNull();
-    const p = plan as Plan;
-    expect(p.id).toBe(`plan-${fixedTs}-1`);
-    expect(p.filePath).toBe(join(plansDir, `plan-${fixedTs}-1.md`));
-    expect(existsSync(p.filePath)).toBe(true);
-    // The pre-existing file must not have been clobbered.
-    expect(readFileSync(preExisting, "utf-8")).toBe("# pre-existing\n");
-  });
-
-  it("plan ID collision fallback → lands at -2 with two pre-existing files (T33)", () => {
-    const pm = new PlanManager(tmpRoot);
-    const plansDir = pm.plansDir;
-    mkdirSync(plansDir, { recursive: true });
-    const fixedTs = 1_744_912_345_999;
-    writeFileSync(join(plansDir, `plan-${fixedTs}.md`), "a", "utf-8");
-    writeFileSync(join(plansDir, `plan-${fixedTs}-1.md`), "b", "utf-8");
-
-    vi.spyOn(Date, "now").mockReturnValue(fixedTs);
-
-    const plan = pm.enterPlanMode("another colliding task") as Plan;
-    expect(plan.id).toBe(`plan-${fixedTs}-2`);
-    expect(plan.filePath).toBe(join(plansDir, `plan-${fixedTs}-2.md`));
-    // id and filePath derive from the SAME resolved stem
-    expect(plan.filePath.endsWith(`${plan.id}.md`)).toBe(true);
-  });
-
-  it("plan ID collision exhaustion → throws when all 10 slots occupied (spec §1.2)", () => {
-    // Spec §1.2: "If all 10 attempts collide, throw — this should be
-    // unreachable outside pathological test scenarios." Note: this throw is
-    // OUTSIDE divergence D1's try/catch (D1 only catches FS write errors).
-    const pm = new PlanManager(tmpRoot);
-    const plansDir = pm.plansDir;
-    mkdirSync(plansDir, { recursive: true });
-    const fixedTs = 1_744_912_999_000;
-
-    // Pre-create plan-${ts}.md, plan-${ts}-1.md, ..., plan-${ts}-9.md → 10 total.
-    writeFileSync(join(plansDir, `plan-${fixedTs}.md`), "base", "utf-8");
-    for (let i = 1; i <= 9; i++) {
-      writeFileSync(join(plansDir, `plan-${fixedTs}-${i}.md`), `dup-${i}`, "utf-8");
-    }
-
-    vi.spyOn(Date, "now").mockReturnValue(fixedTs);
-
-    // All 10 slots taken → spec mandates throw (must propagate, not wrapped by D1).
-    expect(() => pm.enterPlanMode("exhausted collision")).toThrow();
-    // State must remain untouched.
-    expect(pm.inPlanMode).toBe(false);
-    expect(pm.currentPlan).toBeNull();
-  });
+  // DELETED (v0.4.4 Task 2.19): three v0.4.3 collision tests that asserted
+  // the `plan-${Date.now()}-N` fallback scheme
+  //   - "plan ID collision fallback → single -1 suffix (T33)"
+  //   - "plan ID collision fallback → lands at -2 with two pre-existing files"
+  //   - "plan ID collision exhaustion → throws when all 10 slots occupied"
+  // v0.4.4 design spec §4.3 PM-11 line 297: plan IDs are word-slugs
+  // (`<adj>-<noun>`) generated by `generateWordSlug()`, and collisions retry
+  // up to 10 times and return a structured `{status: "error"}` on exhaustion
+  // (no throw, no `-N` suffix, no Date.now() semantics). Equivalent coverage
+  // lives in tests/test-plan-slug.ts — T24 a/b/c (slug + cache) and T24 f
+  // (structured collision error after 10 retries).
 
   it("enterPlanMode returns null on FS failure; does NOT mutate state; emits no event (D1)", () => {
     // Uses the top-level `vi.mock("fs", { spy: true })` to spy on writeFileSync.
@@ -380,6 +346,12 @@ describe("PlanManager — new API (spec §1.2)", () => {
   });
 
   it("reenterPlanMode strips status marker from disk and re-emits plan_mode_entered", () => {
+    // REBASED (v0.4.4 Task 2.19): the `contentAfter.startsWith("# task")`
+    // assertion was removed because v0.4.4 spec §4.2 line 262 specifies
+    // enterPlanMode writes an EMPTY plan file; the agent populates the body
+    // during drafting. In this test the agent never drafts, so after the
+    // marker is stripped the body is empty. The marker-strip invariant
+    // itself is unchanged and still asserted.
     const pm = new PlanManager(tmpRoot);
     const entered = pm.enterPlanMode("task") as Plan;
     pm.exitPlanMode(true);
@@ -394,8 +366,6 @@ describe("PlanManager — new API (spec §1.2)", () => {
     expect(pm.inPlanMode).toBe(true);
     const contentAfter = readFileSync(entered.filePath, "utf-8");
     expect(/^> Status:/.test(contentAfter)).toBe(false);
-    // The stripped content still matches the rest of the original template
-    expect(contentAfter.startsWith("# task")).toBe(true);
     expect(events.some((e) => e.type === "plan_mode_entered")).toBe(true);
   });
 
@@ -974,7 +944,8 @@ describe("tools/plan.ts — enter_plan_mode (spec §1.6, D1)", () => {
     const body = parseOkResult(result);
     expect(body.status).toBe("plan_mode_active");
     expect(typeof body.plan_id).toBe("string");
-    expect(body.plan_id).toMatch(/^plan-\d+/);
+    // v0.4.4 PM-11: plan_id is a word-slug (`<adj>-<noun>`).
+    expect(body.plan_id).toMatch(/^[a-z]+-[a-z]+$/);
     expect(typeof body.plan_file).toBe("string");
     expect(body.plan_file).toContain("plans");
     expect(body.instructions).toBe(PLAN_MODE_INSTRUCTIONS);
@@ -983,7 +954,15 @@ describe("tools/plan.ts — enter_plan_mode (spec §1.6, D1)", () => {
     expect(pm.inPlanMode).toBe(true);
   });
 
-  it("execute when already in plan mode → status:\"already_in_plan_mode\"; no new plan created", async () => {
+  it("execute when already in plan mode → reuses cached slug; same plan_id/plan_file", async () => {
+    // REBASED (v0.4.4 Task 2.19): design spec §4.3 PM-11 cache-first lookup
+    // (line 295) — repeat enter_plan_mode while already in plan mode no
+    // longer returns `status:"already_in_plan_mode"` (that status is retired).
+    // Instead the cached slug is reused, the existing plan file is
+    // preserved, and the tool returns another `plan_mode_active` response
+    // with the SAME plan_id + plan_file. Active-state slug reuse invariant
+    // is covered in detail by tests/test-plan-slug.ts. We assert the
+    // tool-surface of that invariant here.
     const pm = new PlanManager(tmpRoot);
     const tool = createEnterPlanModeTool(pm);
     const firstRes = parseOkResult(
@@ -994,10 +973,9 @@ describe("tools/plan.ts — enter_plan_mode (spec §1.6, D1)", () => {
     const secondRes = parseOkResult(
       await (tool as any).execute("call-2", { task: "second" }),
     );
-    expect(secondRes.status).toBe("already_in_plan_mode");
+    expect(secondRes.status).toBe("plan_mode_active");
     expect(secondRes.plan_id).toBe(firstId);
     expect(secondRes.plan_file).toBe(firstRes.plan_file);
-    expect(typeof secondRes.message).toBe("string");
   });
 
   it("execute when PlanManager.enterPlanMode returns null (D1 FS failure) → status:\"error\"", async () => {
