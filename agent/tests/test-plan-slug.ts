@@ -198,3 +198,104 @@ describe("plan slug reset on abandon (T24 d.2)", () => {
     expect(secondPlan!.id).toBe("silver-grove");
   });
 });
+
+describe("terminal marker slug reuse + truncation", () => {
+  it("reuses the same slug and truncates the file after a successful execute path", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("harbor-signal");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("headless");
+    planManager.attachStateMachine(new PlanStateMachine(new TranscriptMarkerEmitter()));
+
+    const firstPlan = planManager.enterPlanMode("Successful execute");
+    planManager.writePlanContent("1. Execute successfully");
+    await createExitPlanModeTool(planManager).execute("tc-success", { approved: true });
+
+    const secondPlan = planManager.enterPlanMode("Fresh turn after success");
+    expect(secondPlan).not.toBeNull();
+    expect(secondPlan!.id).toBe(firstPlan!.id);
+    expect(readFileSync(secondPlan!.filePath, "utf-8")).toBe("");
+  });
+
+  it("reuses the same slug and truncates the file after approve_only", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("cedar-basin");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const {
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+
+    const firstPlan = planManager.enterPlanMode("Approve only");
+    planManager.writePlanContent("1. Save the draft");
+    const promise = createExitPlanModeTool(planManager).execute("tc-approve-only", {
+      approved: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_only" });
+    await promise;
+
+    const secondPlan = planManager.enterPlanMode("Fresh turn after approve only");
+    expect(secondPlan).not.toBeNull();
+    expect(secondPlan!.id).toBe(firstPlan!.id);
+    expect(readFileSync(secondPlan!.filePath, "utf-8")).toBe("");
+  });
+
+  it("reuses the same slug and truncates the file after plan_done{status:'failed'}", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("glade-arrow");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const stateMachine = new PlanStateMachine(new TranscriptMarkerEmitter());
+    planManager.attachStateMachine(stateMachine);
+
+    const firstPlan = planManager.enterPlanMode("Failed execute");
+    planManager.writePlanContent("1. This plan fails");
+    stateMachine.transition(planManager.sessionKey, "plan_executing", "plan_done", {
+      status: "failed",
+      reason: "synthetic failure",
+    });
+
+    const secondPlan = planManager.enterPlanMode("Fresh turn after failed execute");
+    expect(secondPlan).not.toBeNull();
+    expect(secondPlan!.id).toBe(firstPlan!.id);
+    expect(readFileSync(secondPlan!.filePath, "utf-8")).toBe("");
+  });
+});

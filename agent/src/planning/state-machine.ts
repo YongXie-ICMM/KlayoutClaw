@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { TranscriptMarkerEmitter } from "../events/marker-emitter.js";
+import { planSlugCache, slugCacheState } from "./slug-cache.js";
 import type {
   PlanApprovedMarker,
   PlanDoneMarker,
@@ -106,6 +107,22 @@ export class PlanStateMachine {
         break;
       default:
         throw new PlanProtocolError(`unsupported plan state: ${to}`);
+    }
+
+    if (to === "plan_done") {
+      slugCacheState.markTerminal(session);
+    }
+    if (
+      to === "plan_approved" &&
+      (payload as Omit<PlanApprovedMarker, "type" | "ts">).executeAfterApproval === false
+    ) {
+      slugCacheState.markTerminal(session);
+    }
+    if (
+      to === "plan_rejected" &&
+      (payload as Omit<PlanRejectedMarker, "type" | "ts">).action === "abandon"
+    ) {
+      planSlugCache.delete(session);
     }
   }
 

@@ -232,6 +232,18 @@ export function createExitPlanModeTool(
               { auto: false, executeAfterApproval: true },
             );
             planManager.closePlanMode("approved");
+            stateMachine.transition(
+              planManager.sessionKey,
+              "plan_approved",
+              "plan_executing",
+              { planHash },
+            );
+            stateMachine.transition(
+              planManager.sessionKey,
+              "plan_executing",
+              "plan_done",
+              { status: "ok" },
+            );
             return ok({
               status: "plan_approved",
               plan_id: plan.id,

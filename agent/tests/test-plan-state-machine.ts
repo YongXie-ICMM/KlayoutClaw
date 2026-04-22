@@ -307,6 +307,8 @@ describe("waitForPlanApproval pause/resume", () => {
       "plan_drafted",
       "plan_file_written",
       "plan_approved",
+      "plan_executing",
+      "plan_done",
     ]);
   });
 
@@ -451,5 +453,160 @@ describe("permission-context coupling (T23)", () => {
       undefined,
     );
     expect(planManager.permissionMode).toBe("default");
+  });
+});
+
+describe("terminal marker ordering (T4)", () => {
+  async function setupPlan(actionMode: "interactive" | "headless" = "interactive") {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    if (actionMode === "interactive") {
+      planManager.setApprovalMode("interactive");
+    } else {
+      planManager.setApprovalMode("headless");
+    }
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    planManager.enterPlanMode("Marker ordering probe");
+    planManager.writePlanContent("1. Prepare\n2. Execute");
+
+    return {
+      planManager,
+      markers,
+      exitTool: createExitPlanModeTool(planManager),
+    };
+  }
+
+  it("execute path emits drafted → file_written → approved(true) → executing → done(ok)", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { planManager, markers, exitTool } = await setupPlan("interactive");
+
+    const promise = exitTool.execute("tc-order-execute", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    await promise;
+
+    expect(markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_approved",
+      "plan_executing",
+      "plan_done",
+    ]);
+    expect(markers[2]).toMatchObject({ executeAfterApproval: true });
+    expect(markers[4]).toMatchObject({ status: "ok" });
+  });
+
+  it("draft-only path terminates on plan_approved(false) without plan_done", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { planManager, markers, exitTool } = await setupPlan("interactive");
+
+    const promise = exitTool.execute("tc-order-draft-only", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_only" });
+    await promise;
+
+    expect(markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_approved",
+    ]);
+    expect(markers[2]).toMatchObject({ executeAfterApproval: false });
+  });
+
+  it("reject returns to drafting and a redraft emits a second drafted marker", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { planManager, markers, exitTool } = await setupPlan("interactive");
+
+    const firstAttempt = exitTool.execute("tc-order-reject", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, {
+      action: "reject",
+      feedback: "needs more detail",
+    });
+    await firstAttempt;
+
+    const secondAttempt = exitTool.execute("tc-order-redraft", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_only" });
+    await secondAttempt;
+
+    expect(markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_rejected",
+      "plan_drafted",
+      "plan_file_written",
+      "plan_approved",
+    ]);
+  });
+
+  it("abandon emits a terminal rejection, and the approved=false shortcut skips the drafted preamble", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const interactive = await setupPlan("interactive");
+
+    const gated = interactive.exitTool.execute("tc-order-abandon", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(interactive.planManager.sessionKey, { action: "abandon" });
+    await gated;
+
+    expect(interactive.markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_rejected",
+    ]);
+
+    const shortcut = await setupPlan("interactive");
+    await shortcut.exitTool.execute("tc-order-shortcut", { approved: false });
+    expect(shortcut.markers.map((marker) => marker.type)).toEqual([
+      "plan_rejected",
+    ]);
+  });
+
+  it("emits exactly one terminal marker on execute, draft-only, and abandon paths", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+
+    for (const action of [
+      "approve_execute",
+      "approve_only",
+      "abandon",
+    ] as const) {
+      const { planManager, markers, exitTool } = await setupPlan("interactive");
+      const promise = exitTool.execute(`tc-terminal-${action}`, { approved: true });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      resolvePlanApproval(planManager.sessionKey, { action } as any);
+      await promise;
+
+      const terminalCount = markers.filter((marker) =>
+        marker.type === "plan_done" ||
+        (marker.type === "plan_approved" && marker.executeAfterApproval === false) ||
+        (marker.type === "plan_rejected" && marker.action === "abandon"),
+      ).length;
+
+      expect(terminalCount).toBe(1);
+    }
   });
 });
