@@ -22,6 +22,8 @@ export const unitFiles = [
   "tests/test-plan-mode-v043-group6.ts",
   "tests/test-plan-mode-v043-group6b.ts",
   "tests/test-marker-emitter.ts",
+  "tests/test-plan-slug.ts",
+  "tests/test-plan-state-machine.ts",
   "tests/test-phase5-vc-mcp.ts",
   "tests/test-prompts.ts",
 ];
