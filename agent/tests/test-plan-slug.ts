@@ -149,3 +149,52 @@ describe("PlanManager enterPlanMode (T24 a/b/c/f)", () => {
     expect(body.message).toContain("slug collision after 10 retries");
   });
 });
+
+describe("plan slug reset on abandon (T24 d.2)", () => {
+  it("deletes the cached slug and emits terminal abandon marker on exit_plan_mode({approved:false})", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug")
+      .mockReturnValueOnce("ember-bridge")
+      .mockReturnValueOnce("silver-grove");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { planSlugCache } = await import("../src/planning/slug-cache.js");
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+
+    const firstPlan = planManager.enterPlanMode("First draft");
+    expect(firstPlan).not.toBeNull();
+    expect(planSlugCache.get(planManager.sessionKey)).toBe("ember-bridge");
+
+    const exitTool = createExitPlanModeTool(planManager);
+    const result = await exitTool.execute("tool-call-2", {
+      approved: false,
+      summary: "Abandon this draft",
+    });
+    const body = JSON.parse(result.content[0]!.text as string);
+
+    expect(body.status).toBe("plan_abandoned");
+    expect(planSlugCache.get(planManager.sessionKey)).toBeUndefined();
+    expect(markers).toContainEqual(
+      expect.objectContaining({
+        type: "plan_rejected",
+        action: "abandon",
+        feedback: "abandoned",
+      }),
+    );
+
+    const secondPlan = planManager.enterPlanMode("Fresh draft after abandon");
+    expect(secondPlan).not.toBeNull();
+    expect(secondPlan!.id).toBe("silver-grove");
+  });
+});

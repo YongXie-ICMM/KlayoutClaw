@@ -12,10 +12,12 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { getTranscriptMarkerEmitter } from "../events/marker-emitter.js";
 import type {
   EnterPlanModeResult,
   PlanManager,
 } from "../planning/index.js";
+import { planSlugCache } from "../planning/slug-cache.js";
 
 /**
  * KLayout-adapted plan-mode instructions. Tests assert every substring in
@@ -158,6 +160,18 @@ export function createExitPlanModeTool(
       }
 
       const approved = p.approved !== false; // default true
+
+      if (!approved) {
+        const emitter = getTranscriptMarkerEmitter(planManager.sessionKey);
+        emitter?.emit("marker", {
+          type: "plan_rejected",
+          action: "abandon",
+          feedback: "abandoned",
+          ts: new Date().toISOString(),
+        });
+        planSlugCache.delete(planManager.sessionKey);
+      }
+
       const plan = planManager.exitPlanMode(approved);
 
       if (!plan) {
