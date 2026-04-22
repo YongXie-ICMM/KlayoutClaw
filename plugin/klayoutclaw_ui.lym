@@ -17,6 +17,7 @@
  <dsl-interpreter-name/>
  <text>
 import pya
+import os
 import sys
 import datetime
 
@@ -28,6 +29,34 @@ _ui_dock = None
 _ui_log = None
 _ui_status = None
 _ui_timer = None
+_vc_controller = None
+
+
+def _ensure_vc_ui_importable():
+    candidates = []
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        here = None
+    if here:
+        candidates.extend([here, os.path.dirname(here)])
+    for base in candidates:
+        if not base:
+            continue
+        ui_path = os.path.join(base, "plugin", "klayoutclaw_vc", "ui.py")
+        if os.path.exists(ui_path) and base not in sys.path:
+            sys.path.insert(0, base)
+            return
+
+
+def _install_vc_ui(main_window):
+    global _vc_controller
+    try:
+        _ensure_vc_ui_importable()
+        from plugin.klayoutclaw_vc import ui as vc_ui
+        _vc_controller = vc_ui.install_ui(main_window=main_window)
+    except Exception as exc:
+        print("[KlayoutClaw UI] VC UI install failed: {}".format(exc))
 
 def _setup_ui():
     global _ui_dock, _ui_log, _ui_status, _ui_timer
@@ -79,6 +108,8 @@ def _setup_ui():
     # Check if server already started (server loads before UI alphabetically)
     if cb.server_port is not None:
         _on_server_start(cb.server_port)
+
+    _install_vc_ui(mw)
 
 
 def _set_status_running():
