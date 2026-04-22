@@ -88,6 +88,25 @@ def _gds_path_for_view(view) -> Optional[str]:
     return os.path.abspath(str(filename))
 
 
+def _resolve_top_cell(layout):
+    if layout is None:
+        return None
+    try:
+        top = layout.top_cell()
+        if top is not None:
+            return top
+    except Exception:
+        pass
+    try:
+        for cell in layout.each_top_cell():
+            if hasattr(cell, "cell_index"):
+                return cell
+            return layout.cell(int(cell))
+    except Exception:
+        return None
+    return None
+
+
 def _ensure_vc_handle_for_view(view):
     layout = _layout_for_view(view)
     gds_path = _gds_path_for_view(view)
@@ -475,6 +494,10 @@ class HistoryDockPanel:
     def dock(self):
         return self._dock
 
+    @property
+    def tree(self):
+        return self._tree
+
     def refresh(self) -> None:
         from tools import vc_mcp_handlers as vc_handlers
 
@@ -574,10 +597,174 @@ class HistoryDockPanel:
 
 
 class ContextMenus:
-    """Task 6.5 implementation lands later; placeholder for composition."""
+    """Background and history-row context menus."""
 
     def __init__(self, controller):
         self.controller = controller
+        self._connected_widgets: set[int] = set()
+        try:
+            tree = self.controller.history_dock.tree
+            tree.setContextMenuPolicy(pya.Qt.CustomContextMenu)
+            tree.customContextMenuRequested(self._show_history_menu_at)
+        except Exception:
+            pass
+
+    def attach_view(self, view) -> None:
+        try:
+            widget = view.widget()
+        except Exception:
+            return
+        widget_id = id(widget)
+        if widget_id in self._connected_widgets:
+            return
+        self._connected_widgets.add(widget_id)
+        try:
+            widget.setContextMenuPolicy(pya.Qt.CustomContextMenu)
+            widget.customContextMenuRequested(
+                lambda pos, _widget=widget: self._show_background_menu(_widget, pos)
+            )
+        except Exception:
+            pass
+
+    def menu_labels(self, menu) -> list[str]:
+        labels = []
+        for action in menu.actions():
+            try:
+                if action.isSeparator():
+                    continue
+            except Exception:
+                pass
+            labels.append(str(_callable_or_value(action, "text")))
+        return labels
+
+    def background_menu(self):
+        menu = pya.QMenu(self.controller.main_window)
+        action = pya.QAction("Checkpoint", menu)
+        action.triggered(self.trigger_background_checkpoint)
+        menu.addAction(action)
+        return menu
+
+    def trigger_background_checkpoint(self):
+        self.controller.show_checkpoint_dialog()
+
+    def history_row_menu_for_row(self, index: int):
+        row = self.controller.history_dock._rows[index]
+        ref = row["commit"]["sha"]
+        menu = pya.QMenu(self.controller.main_window)
+
+        checkout = pya.QAction("Checkout", menu)
+        checkout.triggered(lambda _checked=False, _ref=ref: self.checkout_ref(_ref))
+        menu.addAction(checkout)
+
+        branch = pya.QAction("Branch from here", menu)
+        branch.triggered(lambda _checked=False, _ref=ref: self._prompt_branch(_ref))
+        menu.addAction(branch)
+
+        tag = pya.QAction("Tag", menu)
+        tag.triggered(lambda _checked=False, _ref=ref: self._prompt_tag(_ref))
+        menu.addAction(tag)
+        return menu
+
+    def checkout_ref(self, ref: str) -> dict:
+        from tools import vc_mcp_handlers as vc_handlers
+
+        view = _current_view(self.controller.main_window)
+        layout, gds_path = self._active_layout_and_path()
+        result = vc_handlers.vc_checkout(
+            {"ref": ref},
+            layout=layout,
+            gds_path_hint=gds_path,
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            top = _resolve_top_cell(layout)
+            cellview = _active_cellview(view)
+            if cellview is not None and top is not None:
+                try:
+                    cellview.cell = top
+                except Exception:
+                    try:
+                        cellview.set_cell(top.cell_index())
+                    except Exception:
+                        pass
+        self.controller.refresh()
+        self.controller.history_dock.refresh()
+        return result
+
+    def branch_from_ref(self, ref: str, name: str) -> dict:
+        from tools import vc_mcp_handlers as vc_handlers
+
+        layout, gds_path = self._active_layout_and_path()
+        result = vc_handlers.vc_branch(
+            {"op": "create", "name": name, "from_ref": ref},
+            layout=layout,
+            gds_path_hint=gds_path,
+        )
+        self.controller.history_dock.refresh()
+        return result
+
+    def tag_ref(self, ref: str, name: str) -> dict:
+        from tools import vc_mcp_handlers as vc_handlers
+
+        layout, gds_path = self._active_layout_and_path()
+        result = vc_handlers.vc_tag(
+            {"name": name, "ref": ref},
+            layout=layout,
+            gds_path_hint=gds_path,
+        )
+        self.controller.history_dock.refresh()
+        return result
+
+    def _prompt_branch(self, ref: str) -> dict:
+        name = self._prompt_text("Create Branch", "Branch name")
+        if not name:
+            return {"ok": False, "reason": "branch name required"}
+        return self.branch_from_ref(ref, name)
+
+    def _prompt_tag(self, ref: str) -> dict:
+        name = self._prompt_text("Create Tag", "Tag name")
+        if not name:
+            return {"ok": False, "reason": "tag name required"}
+        return self.tag_ref(ref, name)
+
+    def _prompt_text(self, title: str, label: str) -> Optional[str]:
+        try:
+            value, ok = pya.QInputDialog.getText(
+                self.controller.main_window, title, label,
+            )
+        except Exception:
+            return None
+        if not ok:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _active_layout_and_path(self):
+        view = _current_view(self.controller.main_window)
+        return _layout_for_view(view), _gds_path_for_view(view)
+
+    def _show_background_menu(self, widget, pos) -> None:
+        menu = self.background_menu()
+        try:
+            menu.exec_(widget.mapToGlobal(pos))
+        except Exception:
+            menu.popup(widget.mapToGlobal(pos))
+
+    def _show_history_menu_at(self, pos) -> None:
+        try:
+            item = self.controller.history_dock.tree.itemAt(pos)
+        except Exception:
+            item = None
+        if item is None:
+            return
+        for index, row in enumerate(self.controller.history_dock._rows):
+            if row["item"] is item:
+                menu = self.history_row_menu_for_row(index)
+                try:
+                    tree = self.controller.history_dock.tree
+                    menu.exec_(tree.viewport().mapToGlobal(pos))
+                except Exception:
+                    pass
+                return
 
 
 class SaveIntegration:
@@ -750,6 +937,10 @@ class VCUIController:
             pass
         try:
             view.on_active_cellview_changed(lambda: self._handle_view_event(view))
+        except Exception:
+            pass
+        try:
+            self.context_menus.attach_view(view)
         except Exception:
             pass
         self._handle_view_event(view)

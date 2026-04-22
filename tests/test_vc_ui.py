@@ -371,3 +371,73 @@ def test_save_integration_auto_checkpoint_respects_setting_and_still_writes_gds(
     assert result["latest_after_first_save"] == "auto-checkpoint on save"
     assert result["history_one_count"] == result["history_two_count"]
     assert result["hash_one"] != result["hash_two"]
+
+
+def test_context_menus_expose_checkpoint_checkout_branch_and_tag(tmp_path):
+    gds_path = _create_disk_backed_repo(tmp_path)
+    _append_checkpoint(gds_path, "branch source", extra_box=True)
+
+    result = _run_klayout_script(
+        f"""
+        from plugin.klayoutclaw_vc import ui as vc_ui
+        import tools.vc_mcp_handlers as vc_handlers
+
+        mw = pya.Application.instance().main_window()
+        controller = vc_ui.install_ui(main_window=mw, poll_interval_ms=25)
+        mw.load_layout({str(gds_path)!r}, pya.LoadLayoutOptions(), "", 1)
+        pya.QApplication.processEvents()
+        controller.refresh()
+
+        background_menu = controller.context_menus.background_menu()
+        background_labels = controller.context_menus.menu_labels(background_menu)
+        controller.context_menus.trigger_background_checkpoint()
+        pya.QApplication.processEvents()
+        checkpoint_dialog_open = controller.checkpoint_dialog.is_open()
+        controller.checkpoint_dialog.dialog.reject()
+
+        controller.history_shortcut.emit_activated()
+        pya.QApplication.processEvents()
+        row_menu = controller.context_menus.history_row_menu_for_row(0)
+        row_labels = controller.context_menus.menu_labels(row_menu)
+        row_zero = controller.history_dock.row_data(0)
+
+        view = mw.current_view()
+        layout = view.active_cellview().layout()
+        li = layout.layer(1, 0)
+        before_checkout_shapes = layout.top_cell().shapes(li).size()
+        checkout_result = controller.context_menus.checkout_ref(row_zero["sha"])
+        pya.QApplication.processEvents()
+        after_checkout_shapes = layout.top_cell().shapes(li).size()
+
+        branch_result = controller.context_menus.branch_from_ref(row_zero["sha"], "ui-context-branch")
+        tag_result = controller.context_menus.tag_ref(row_zero["sha"], "ui-context-tag")
+        pya.QApplication.processEvents()
+
+        history_after = vc_handlers.vc_history(
+            {{}},
+            layout=layout,
+            gds_path_hint={str(gds_path)!r},
+        )
+
+        print("RESULT_JSON=" + json.dumps({{
+            "background_labels": background_labels,
+            "checkpoint_dialog_open": checkpoint_dialog_open,
+            "row_labels": row_labels,
+            "checkout_result": checkout_result,
+            "before_checkout_shapes": before_checkout_shapes,
+            "after_checkout_shapes": after_checkout_shapes,
+            "branch_result": branch_result,
+            "tag_result": tag_result,
+            "history_after_top_tags": history_after["commits"][0]["tags"],
+        }}))
+        """
+    )
+
+    assert "Checkpoint" in result["background_labels"]
+    assert result["checkpoint_dialog_open"] is True
+    assert result["row_labels"] == ["Checkout", "Branch from here", "Tag"]
+    assert result["checkout_result"]["ok"] is True
+    assert result["after_checkout_shapes"] > result["before_checkout_shapes"]
+    assert result["branch_result"]["ok"] is True
+    assert result["tag_result"]["ok"] is True
+    assert "ui-context-tag" in result["history_after_top_tags"]
