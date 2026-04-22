@@ -1049,3 +1049,247 @@ describe("replan counter user-turn boundary reset (T42)", () => {
     expect(stateMachine.getReplanCount(session)).toBe(1);
   });
 });
+
+/**
+ * Task 2.16 — Illegal-transition guard (T41).
+ *
+ * Spec §4.2 state invariants (line 271):
+ *   "Direct transitions are a harness protocol violation and are treated as a
+ *    fatal session error: the harness raises PlanProtocolError(...), emits
+ *    plan_rejected {feedback: 'protocol violation: illegal state transition',
+ *    action: 'abandon'} as the turn's terminal marker (satisfies the
+ *    terminal-marker invariant), and surfaces the error to the caller. No
+ *    plan_done is emitted."
+ *
+ * Contract the Executor must implement:
+ *   - PlanStateMachine.transition() validates the (from, to) pair against a
+ *     normative adjacency table. Illegal pairs:
+ *       * plan_drafting      → plan_executing
+ *       * plan_drafted       → plan_executing   (skips approval)
+ *       * plan_executing     → plan_drafting    (PM-6 replan loop uses
+ *                                                 direct WeakMap writes — it
+ *                                                 does NOT call transition(),
+ *                                                 so this direct call is
+ *                                                 illegal by construction)
+ *     ...and any other (from, to) pair not in the allow-list.
+ *
+ *   - On violation, BEFORE surfacing the error, the guard must emit ONE
+ *     plan_rejected marker with:
+ *       { type: "plan_rejected", action: "abandon",
+ *         feedback: <string matching /protocol violation/> }
+ *     so downstream observers (history JSONL, RPC, TUI) see exactly one
+ *     terminal marker on the turn's marker bus.
+ *
+ *   - The guard then throws PlanProtocolError with message matching
+ *     /illegal state transition/.
+ *
+ *   - The guard MUST NOT emit plan_done. plan_done is reserved for the
+ *     execute path (turn began in plan_executing).
+ *
+ * Encoding decision: the marker is emitted on the emitter BEFORE throw exits,
+ * so a synchronous emitter subscriber captures the marker before the caller's
+ * try/catch sees the thrown error.
+ */
+describe("illegal-transition guard (T41)", () => {
+  it("plan_drafting → plan_executing bypass emits abandon terminal and throws", async () => {
+    const { PlanStateMachine, PlanProtocolError } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+    stateMachine.setState(session, "plan_drafting");
+
+    let thrown: unknown = null;
+    try {
+      stateMachine.transition(
+        session,
+        "plan_drafting",
+        "plan_executing",
+        { planHash: "dead".padEnd(64, "0") },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(PlanProtocolError);
+    expect((thrown as Error).message).toMatch(/illegal state transition/);
+
+    // Exactly one marker emitted BEFORE the throw — the abandon terminal.
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      type: "plan_rejected",
+      action: "abandon",
+    });
+    expect(typeof (markers[0] as any).feedback).toBe("string");
+    expect((markers[0] as any).feedback).toMatch(/protocol violation/);
+
+    // No plan_done on illegal-transition paths (reserved for execute path).
+    expect(markers.find((m) => m.type === "plan_done")).toBeUndefined();
+
+    // Only ONE terminal marker: the plan_rejected{abandon}.
+    const terminals = markers.filter(
+      (m) =>
+        m.type === "plan_done" ||
+        (m.type === "plan_approved" && m.executeAfterApproval === false) ||
+        (m.type === "plan_rejected" && m.action === "abandon"),
+    );
+    expect(terminals).toHaveLength(1);
+  });
+
+  it("plan_drafted → plan_executing (skipping approval) emits abandon terminal and throws", async () => {
+    const { PlanStateMachine, PlanProtocolError } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+
+    // Legitimate entry into plan_drafted.
+    stateMachine.setState(session, "plan_drafting");
+    const planHash = "a".repeat(64);
+    stateMachine.transition(session, "plan_drafting", "plan_drafted", {
+      plan: "1. step",
+      planHash,
+      planLengthChars: 7,
+      planSlug: "calm-otter",
+      planFilePath: "/tmp/calm-otter.md",
+      replan_count: 0,
+    });
+    expect(markers).toHaveLength(1);
+    expect(markers[0].type).toBe("plan_drafted");
+
+    let thrown: unknown = null;
+    try {
+      stateMachine.transition(
+        session,
+        "plan_drafted",
+        "plan_executing",
+        { planHash },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(PlanProtocolError);
+    expect((thrown as Error).message).toMatch(/illegal state transition/);
+
+    // Account for the legitimate plan_drafted already on the bus: total 2.
+    expect(markers).toHaveLength(2);
+    expect(markers[1]).toMatchObject({
+      type: "plan_rejected",
+      action: "abandon",
+    });
+    expect((markers[1] as any).feedback).toMatch(/protocol violation/);
+
+    // No plan_done, and no plan_executing on the bus (illegal call must not
+    // have emitted its intended marker).
+    expect(markers.find((m) => m.type === "plan_done")).toBeUndefined();
+    expect(markers.find((m) => m.type === "plan_executing")).toBeUndefined();
+
+    // Exactly one terminal marker on the turn.
+    const terminals = markers.filter(
+      (m) =>
+        m.type === "plan_done" ||
+        (m.type === "plan_approved" && m.executeAfterApproval === false) ||
+        (m.type === "plan_rejected" && m.action === "abandon"),
+    );
+    expect(terminals).toHaveLength(1);
+  });
+
+  it("plan_executing → plan_drafting (direct transition without PM-6 replan path) emits abandon terminal and throws", async () => {
+    const { PlanStateMachine, PlanProtocolError } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+    const planHash = "b".repeat(64);
+
+    // Legitimate chain: drafting → drafted → approved → executing.
+    stateMachine.setState(session, "plan_drafting");
+    stateMachine.transition(session, "plan_drafting", "plan_drafted", {
+      plan: "1. step",
+      planHash,
+      planLengthChars: 7,
+      planSlug: "brisk-heron",
+      planFilePath: "/tmp/brisk-heron.md",
+      replan_count: 0,
+    });
+    stateMachine.transition(session, "plan_drafted", "plan_approved", {
+      auto: false,
+      executeAfterApproval: true,
+    });
+    stateMachine.transition(session, "plan_approved", "plan_executing", {
+      planHash,
+    });
+
+    expect(markers.map((m) => m.type)).toEqual([
+      "plan_drafted",
+      "plan_approved",
+      "plan_executing",
+    ]);
+    const preCount = markers.length;
+
+    // Illegal: plan_executing → plan_drafting via transition(). PM-6's replan
+    // loop uses direct WeakMap writes (bypassing transition()) for this hop;
+    // calling transition() directly is the protocol violation.
+    let thrown: unknown = null;
+    try {
+      stateMachine.transition(
+        session,
+        "plan_executing",
+        "plan_drafting",
+        {},
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(PlanProtocolError);
+    expect((thrown as Error).message).toMatch(/illegal state transition/);
+
+    // Exactly one NEW marker after the throw: the abandon terminal.
+    expect(markers.length).toBe(preCount + 1);
+    const abandon = markers[preCount];
+    expect(abandon).toMatchObject({
+      type: "plan_rejected",
+      action: "abandon",
+    });
+    expect((abandon as any).feedback).toMatch(/protocol violation/);
+
+    // No plan_done anywhere on this turn.
+    expect(markers.find((m) => m.type === "plan_done")).toBeUndefined();
+
+    // Exactly one terminal marker on the turn.
+    const terminals = markers.filter(
+      (m) =>
+        m.type === "plan_done" ||
+        (m.type === "plan_approved" && m.executeAfterApproval === false) ||
+        (m.type === "plan_rejected" && m.action === "abandon"),
+    );
+    expect(terminals).toHaveLength(1);
+  });
+});
+

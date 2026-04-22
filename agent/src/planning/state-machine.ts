@@ -47,6 +47,25 @@ const blockerReasons = new WeakMap<object, string[]>();
 /** PM-6 hard cap: 3 replans allowed per user turn, terminal on the 4th abort. */
 const REPLAN_CAP = 3;
 
+/**
+ * PM-8 / T41 state-machine adjacency table. Every legitimate `transition()`
+ * call-site in `src/tools/plan.ts` maps to one of these (from, to) pairs.
+ * Direct WeakMap writes (PM-6 replan loop in `handleToolResult`, gate-driven
+ * `setState` hops) intentionally bypass this guard.
+ */
+const LEGAL_TRANSITIONS: ReadonlyMap<PlanState, ReadonlySet<PlanState>> = new Map([
+  ["plan_drafting", new Set<PlanState>(["plan_drafted", "plan_rejected"])],
+  ["plan_drafted", new Set<PlanState>(["plan_approved", "plan_rejected"])],
+  // plan_approved → plan_rejected covers the post-approval integrity-violation
+  // path in plan.ts (executingHash !== planHash after approve_execute /
+  // headless): the caller has already emitted plan_approved and must now
+  // abandon via the shared `integrityViolation` helper.
+  ["plan_approved", new Set<PlanState>(["plan_executing", "plan_rejected"])],
+  ["plan_executing", new Set<PlanState>(["plan_done"])],
+  ["plan_rejected", new Set<PlanState>([])],
+  ["plan_done", new Set<PlanState>([])],
+]);
+
 export class PlanStateMachine {
   constructor(private emitter: TranscriptMarkerEmitter) {}
 
@@ -76,10 +95,30 @@ export class PlanStateMachine {
 
   transition(
     session: object,
-    _from: PlanState,
+    from: PlanState,
     to: PlanState,
     payload: MarkerPayload,
   ): void {
+    // PM-8 / T41 illegal-transition guard. Validate the caller-supplied
+    // (from, to) pair against the normative adjacency table. Direct WeakMap
+    // writes (PM-6 replan loop in `handleToolResult`, gate-driven `setState`
+    // hops in plan.ts) intentionally bypass this guard.
+    const allowedTargets = LEGAL_TRANSITIONS.get(from);
+    if (!allowedTargets || !allowedTargets.has(to)) {
+      // Emit the terminal abandon marker BEFORE throwing so synchronous
+      // subscribers (history JSONL, RPC, TUI) observe exactly one terminal
+      // marker before the exception propagates to the caller.
+      this.emitter.emit("marker", {
+        type: "plan_rejected",
+        action: "abandon",
+        feedback: "protocol violation: illegal state transition",
+        ts: new Date().toISOString(),
+      });
+      throw new PlanProtocolError(
+        `illegal state transition: ${from} → ${to}`,
+      );
+    }
+
     planStates.set(session, to);
     const ts = new Date().toISOString();
 
