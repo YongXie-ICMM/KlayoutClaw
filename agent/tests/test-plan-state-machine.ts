@@ -250,3 +250,126 @@ describe("plan_drafted hard freeze (T36)", () => {
     expect(passthrough).not.toHaveBeenCalled();
   });
 });
+
+describe("waitForPlanApproval pause/resume", () => {
+  async function setupInteractiveDraft() {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setHeadless(false);
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    planManager.enterPlanMode("Draft an approval-gated plan");
+    planManager.writePlanContent("1. Inspect\n2. Execute");
+
+    return {
+      planManager,
+      markers,
+      exitTool: createExitPlanModeTool(planManager),
+    };
+  }
+
+  it("waits for approve_execute and returns the final approval result", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { planManager, markers, exitTool } = await setupInteractiveDraft();
+
+    let settled = false;
+    const promise = exitTool.execute("tc-approve-execute", { approved: true });
+    void promise.then(() => {
+      settled = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+
+    const result = await promise;
+    const body = parseTextPayload(result);
+
+    expect(body.status).toBe("plan_approved");
+    expect(body.executeAfterApproval).toBe(true);
+    expect(markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_approved",
+    ]);
+  });
+
+  it("waits for approve_only, reject, and abandon actions", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+
+    for (const action of [
+      { action: "approve_only" as const, expectedStatus: "plan_approved" },
+      { action: "reject" as const, expectedStatus: "plan_rejected", feedback: "needs more detail" },
+      { action: "abandon" as const, expectedStatus: "plan_abandoned" },
+    ]) {
+      const { planManager, markers, exitTool } = await setupInteractiveDraft();
+      const promise = exitTool.execute(`tc-${action.action}`, { approved: true });
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (action.action === "reject") {
+        resolvePlanApproval(planManager.sessionKey, {
+          action: "reject",
+          feedback: action.feedback,
+        });
+      } else {
+        resolvePlanApproval(planManager.sessionKey, { action: action.action });
+      }
+
+      const result = await promise;
+      const body = parseTextPayload(result);
+
+      expect(body.status).toBe(action.expectedStatus);
+      expect(markers[2]).toMatchObject(
+        action.action === "approve_only"
+          ? {
+              type: "plan_approved",
+              executeAfterApproval: false,
+            }
+          : {
+              type: "plan_rejected",
+              action: action.action === "abandon" ? "abandon" : "reject",
+            },
+      );
+    }
+  });
+
+  it("abandons the draft when the caller disconnects during the wait", async () => {
+    const { rejectPlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { planManager, markers, exitTool } = await setupInteractiveDraft();
+
+    const promise = exitTool.execute("tc-disconnect", { approved: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    rejectPlanApproval(planManager.sessionKey, "caller_disconnected");
+
+    const result = await promise;
+    const body = parseTextPayload(result);
+
+    expect(body.status).toBe("plan_abandoned");
+    expect(body.reason).toBe("caller_disconnected");
+    expect(markers[2]).toMatchObject({
+      type: "plan_rejected",
+      action: "abandon",
+      feedback: "caller_disconnected",
+    });
+  });
+});

@@ -26,6 +26,7 @@ import { loadCommandRecency, saveCommandRecency } from "../hooks/useCommandHisto
 import { getConfigDir, getAllMCPServers } from "../../config.js";
 import { formatTurnMessage } from "../../verbose-helpers.js";
 import { TOOL_ANNOTATIONS } from "../../tools/annotations.js";
+import { resolvePlanApproval } from "../../planning/approval-gate.js";
 import type { MCPServerData } from "./ConfigPanel.js";
 
 function isCurrentlyThinking(msg: import("../types.js").AssistantMessageData | null): boolean {
@@ -43,11 +44,6 @@ export function App({ botSession }: AppProps) {
   // Keep phase accessible in stale closures (useInput, handleSubmit)
   const phaseRef = useRef(state.phase);
   phaseRef.current = state.phase;
-
-  // v0.4.3 Group 3: local mirror of plan-mode exit menu path (null when closed).
-  // Kept in lockstep with reducer dispatches so the menu useInput gate is
-  // synchronous while the UI re-renders on the open/close reducer actions.
-  const [planExitMenu, setPlanExitMenu] = useState<string | null>(null);
 
   // Track compacting state in a ref for the onAgentEnd callback
   const isCompactingRef = useRef(false);
@@ -110,82 +106,6 @@ export function App({ botSession }: AppProps) {
       }
     }
   });
-
-  // v0.4.3 Group 3: plan-mode exit menu key handler (1/2/3/4/Escape).
-  // Only active while planExitMenu !== null so it never interferes with
-  // normal input otherwise. Keys 1-4 map to §1.8.2 menu choices.
-  useInput(
-    (_input, key) => {
-      if (!planExitMenu) return;
-      const planPath = planExitMenu;
-
-      if (_input === "1") {
-        setPlanExitMenu(null);
-        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
-        dispatch({ type: "COMPACTION_START" });
-        dispatch({
-          type: "SYSTEM_MESSAGE",
-          text: "Compacting context before execution...",
-        });
-        botSession
-          .compact()
-          .then(() => {
-            dispatch({ type: "COMPACTION_END" });
-            dispatch({
-              type: "SYSTEM_MESSAGE",
-              text: "Context compacted. Executing plan...",
-            });
-            dispatch({ type: "USER_PROMPT", text: "Execute the plan" });
-            return botSession.session.prompt(
-              `Execute the design plan at: ${planPath}\n` +
-                `Read the plan file and execute it step by step. Full tool access is restored.`,
-            );
-          })
-          .catch((err: any) => {
-            dispatch({ type: "COMPACTION_END" });
-            dispatch({
-              type: "SESSION_ERROR",
-              error: err?.message ?? String(err),
-            });
-          });
-      } else if (_input === "2") {
-        setPlanExitMenu(null);
-        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
-        dispatch({ type: "USER_PROMPT", text: "Execute the plan" });
-        botSession.session
-          .prompt(
-            `Execute the design plan at: ${planPath}\n` +
-              `Read the plan file and execute it step by step. Full tool access is restored.`,
-          )
-          .catch((err: any) => {
-            dispatch({
-              type: "SESSION_ERROR",
-              error: err?.message ?? String(err),
-            });
-          });
-      } else if (_input === "3") {
-        setPlanExitMenu(null);
-        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
-        const plan = botSession.planManager?.reenterPlanMode();
-        if (plan) {
-          dispatch({
-            type: "SYSTEM_MESSAGE",
-            text: `Re-entered plan mode for revision.\nPlan file: ${plan.filePath}`,
-          });
-        } else {
-          dispatch({ type: "SYSTEM_MESSAGE", text: "No plan to revise." });
-        }
-      } else if (_input === "4" || key.escape) {
-        setPlanExitMenu(null);
-        dispatch({ type: "PLAN_EXIT_MENU_CLOSE" });
-        dispatch({
-          type: "SYSTEM_MESSAGE",
-          text: "Plan saved. You can execute it later.",
-        });
-      }
-    },
-    { isActive: !!planExitMenu },
-  );
 
   // Subscribe to session events
   useEffect(() => {
@@ -275,7 +195,14 @@ export function App({ botSession }: AppProps) {
               ts?: string;
             }
           | undefined;
-        if (!marker || marker.type !== "think_recorded") return;
+        if (!marker) return;
+        if (typeof marker.type === "string" && marker.type.startsWith("plan_")) {
+          dispatch({
+            type: "PLAN_MARKER_RECEIVED",
+            marker: marker as any,
+          });
+        }
+        if (marker.type !== "think_recorded") return;
         // Feed the tool-scratchpad text into the thinking-chunk stream.
         // Propagate `source` end-to-end so the reducer can start a new
         // segment when the origin flips (tool vs. native) and the
@@ -536,15 +463,12 @@ export function App({ botSession }: AppProps) {
         }
 
         if (pm.inPlanMode && !taskDesc) {
-          // Branch A: in plan mode, no args → exit + open the 4-option menu.
-          // The menu text itself is rendered by the <PlanExitMenu> component
-          // (conditionally mounted on planExitMenu !== null) so that closing
-          // the menu REMOVES the text from the frame — a persisted
-          // SYSTEM_MESSAGE would leave it behind after dismissal.
-          const planPath = pm.currentPlan?.filePath ?? "";
-          pm.exitPlanMode(true);
-          setPlanExitMenu(planPath);
-          dispatch({ type: "PLAN_EXIT_MENU_OPEN", planFilePath: planPath });
+          // v0.4.4 PM-3 — approval is now opened by exit_plan_mode marker
+          // flow, not by the /plan slash command.
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text: "Already in plan mode. Continue drafting in the plan file or call exit_plan_mode when ready.",
+          });
           return;
         }
 
@@ -740,7 +664,12 @@ export function App({ botSession }: AppProps) {
           verbose={botSession.config.verbose === true}
         />
       )}
-      {planExitMenu !== null && <PlanApprovalMenu planFilePath={planExitMenu} />}
+      {state.planState === "plan_drafted" && state.planApprovalMenuPath !== null && (
+        <PlanApprovalMenu
+          planFilePath={state.planApprovalMenuPath}
+          onAction={(action) => resolvePlanApproval(botSession.session, action)}
+        />
+      )}
       {state.error && <ErrorBanner error={state.error} />}
       <StreamingBar
         phase={state.phase}
@@ -752,7 +681,7 @@ export function App({ botSession }: AppProps) {
       <InputBox
         phase={state.phase}
         onSubmit={handleSubmit}
-        frozen={!!planExitMenu}
+        frozen={state.planState === "plan_drafted"}
         onToggleThinking={() => dispatch({ type: "TOGGLE_THINKING_VIEW" })}
         focusState={state.focusState}
         recency={commandRecency}

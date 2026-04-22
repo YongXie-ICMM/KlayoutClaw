@@ -36,6 +36,10 @@ export const theme = {
   // weight so the two read as a matched pair.
   thinkingTool: c.dim.italic.cyan,
 
+  // Plan approval gate
+  planApprovalBorder: c.yellow,
+  planApprovalText: c.yellowBright,
+
   // Tools
   toolRunning: c.yellow,
   toolSuccess: c.green,

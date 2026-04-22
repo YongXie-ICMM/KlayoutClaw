@@ -3,6 +3,8 @@
  */
 
 import type { FocusState, ConfigPanelState, ConfigPanelTab, SubagentTUIEntry } from "../types/v04-contracts.js";
+import type { TranscriptMarker } from "../events/marker-types.js";
+import type { PlanState } from "../planning/state-machine.js";
 
 export type { FocusState } from "../types/v04-contracts.js";
 export type { ConfigPanelState, ConfigPanelTab } from "../types/v04-contracts.js";
@@ -120,6 +122,9 @@ export interface TUIState {
   subagentInjectValue: string;
   // v0.4.3 Group 3: plan mode exit menu (null when closed, holds plan file path when open)
   planExitMenu: string | null;
+  // v0.4.4 Phase 2a: marker-driven plan approval gate
+  planState: PlanState | null;
+  planApprovalMenuPath: string | null;
 }
 
 export type TUIAction =
@@ -151,6 +156,7 @@ export type TUIAction =
   | { type: "PLAN_MODE_EXITED" }
   | { type: "PLAN_EXIT_MENU_OPEN"; planFilePath: string }
   | { type: "PLAN_EXIT_MENU_CLOSE" }
+  | { type: "PLAN_MARKER_RECEIVED"; marker: TranscriptMarker }
   | { type: "TOGGLE_DETAIL_VIEW" }
   // v0.4 actions
   | { type: "FOCUS_UP"; hasCompletions: boolean }

@@ -17,6 +17,7 @@ import type {
   EnterPlanModeResult,
   PlanManager,
 } from "../planning/index.js";
+import { waitForPlanApproval } from "../planning/approval-gate.js";
 import { planSlugCache } from "../planning/slug-cache.js";
 
 /**
@@ -219,6 +220,103 @@ export function createExitPlanModeTool(
         },
       );
       stateMachine.emitPlanFileWritten(plan.filePath, planHash, planBytes.length);
+
+      if (!planManager.headless) {
+        try {
+          const action = await waitForPlanApproval(planManager.sessionKey);
+          if (action.action === "approve_execute") {
+            stateMachine.transition(
+              planManager.sessionKey,
+              "plan_drafted",
+              "plan_approved",
+              { auto: false, executeAfterApproval: true },
+            );
+            planManager.closePlanMode("approved");
+            return ok({
+              status: "plan_approved",
+              plan_id: plan.id,
+              plan_file: plan.filePath,
+              executeAfterApproval: true,
+              auto: false,
+              message: "Plan approved for execution.",
+            });
+          }
+          if (action.action === "approve_only") {
+            stateMachine.transition(
+              planManager.sessionKey,
+              "plan_drafted",
+              "plan_approved",
+              { auto: false, executeAfterApproval: false },
+            );
+            planManager.closePlanMode("approved");
+            return ok({
+              status: "plan_approved",
+              plan_id: plan.id,
+              plan_file: plan.filePath,
+              executeAfterApproval: false,
+              auto: false,
+              message: "Plan approved without execution.",
+            });
+          }
+          if (action.action === "reject") {
+            stateMachine.transition(
+              planManager.sessionKey,
+              "plan_drafted",
+              "plan_rejected",
+              {
+                action: "reject",
+                feedback: action.feedback,
+              },
+            );
+            stateMachine.setState(planManager.sessionKey, "plan_drafting");
+            return ok({
+              status: "plan_rejected",
+              plan_id: plan.id,
+              plan_file: plan.filePath,
+              action: "reject",
+              feedback: action.feedback,
+              message: "Plan rejected. Continue drafting.",
+            });
+          }
+
+          stateMachine.transition(
+            planManager.sessionKey,
+            "plan_drafted",
+            "plan_rejected",
+            {
+              action: "abandon",
+              feedback: "abandoned",
+            },
+          );
+          planSlugCache.delete(planManager.sessionKey);
+          planManager.exitPlanMode(false);
+          return ok({
+            status: "plan_abandoned",
+            plan_id: plan.id,
+            message: "Plan abandoned. You may proceed without a formal plan.",
+          });
+        } catch (error) {
+          const feedback =
+            error instanceof Error ? error.message : "caller_disconnected";
+          stateMachine.transition(
+            planManager.sessionKey,
+            "plan_drafted",
+            "plan_rejected",
+            {
+              action: "abandon",
+              feedback,
+            },
+          );
+          planSlugCache.delete(planManager.sessionKey);
+          planManager.exitPlanMode(false);
+          return ok({
+            status: "plan_abandoned",
+            reason: "caller_disconnected",
+            plan_id: plan.id,
+            message: "Plan abandoned because the caller disconnected.",
+          });
+        }
+      }
 
       return ok({
         status: "plan_drafted",

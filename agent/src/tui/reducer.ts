@@ -150,6 +150,8 @@ export const initialState: TUIState = {
   subagentInjectValue: "",
   // v0.4.3 Group 3: plan-mode exit menu
   planExitMenu: null,
+  planState: null,
+  planApprovalMenuPath: null,
 };
 
 export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
@@ -538,6 +540,50 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
 
     case "PLAN_EXIT_MENU_CLOSE":
       return { ...state, planExitMenu: null };
+
+    case "PLAN_MARKER_RECEIVED": {
+      const marker = action.marker;
+      switch (marker.type) {
+        case "plan_drafted":
+          return {
+            ...state,
+            planState: "plan_drafted",
+            planApprovalMenuPath: marker.planFilePath,
+          };
+        case "plan_file_written":
+          return {
+            ...state,
+            planApprovalMenuPath: marker.planFilePath,
+          };
+        case "plan_approved":
+          return {
+            ...state,
+            planState: "plan_approved",
+            planApprovalMenuPath: null,
+          };
+        case "plan_rejected":
+          return {
+            ...state,
+            planState:
+              marker.action === "reject" ? "plan_drafting" : "plan_rejected",
+            planApprovalMenuPath: null,
+          };
+        case "plan_executing":
+          return {
+            ...state,
+            planState: "plan_executing",
+            planApprovalMenuPath: null,
+          };
+        case "plan_done":
+          return {
+            ...state,
+            planState: "plan_done",
+            planApprovalMenuPath: null,
+          };
+        default:
+          return state;
+      }
+    }
 
     case "TOGGLE_DETAIL_VIEW":
       return {

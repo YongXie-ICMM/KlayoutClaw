@@ -42,6 +42,7 @@ export class PlanManager {
   private _permissionMode: PlanPermissionMode = "default";
   private _prePlanMode: PlanPermissionMode | null = null;
   private _stateMachine: PlanStateMachineLike | null = null;
+  private _headless = true;
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
@@ -75,8 +76,16 @@ export class PlanManager {
     return this._stateMachine?.getState(this._sessionKey);
   }
 
+  get headless(): boolean {
+    return this._headless;
+  }
+
   bindSession(session: object): void {
     this._sessionKey = session;
+  }
+
+  setHeadless(headless: boolean): void {
+    this._headless = headless;
   }
 
   attachStateMachine(stateMachine: PlanStateMachineLike): void {
