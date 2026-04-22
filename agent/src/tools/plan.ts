@@ -325,6 +325,7 @@ export function createExitPlanModeTool(
           "plan_approved",
           { auto: true, executeAfterApproval: true },
         );
+        planManager.closePlanMode("approved");
         stateMachine.transition(
           planManager.sessionKey,
           "plan_approved",
@@ -337,7 +338,6 @@ export function createExitPlanModeTool(
           "plan_done",
           { status: "ok" },
         );
-        planManager.closePlanMode("approved");
         return ok({
           status: "plan_approved",
           plan_id: plan.id,

@@ -373,3 +373,83 @@ describe("waitForPlanApproval pause/resume", () => {
     });
   });
 });
+
+describe("permission-context coupling (T23)", () => {
+  it("keeps plan-mode restrictions during drafting, restores pre-plan permissions for execution, and leaves them unchanged after plan_done", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const {
+      wrapMCPToolForPlanMode,
+      wrapWriteForPlanMode,
+    } = await import("../src/planning/sandbox.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setHeadless(true);
+    const emitter = new TranscriptMarkerEmitter();
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    planManager.enterPlanMode("Permission swap probe");
+
+    const passthrough = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: "ok" }],
+      details: {},
+    }));
+
+    const executeScript = wrapMCPToolForPlanMode(
+      {
+        name: "klayout_native_execute_script",
+        label: "Execute Script",
+        description: "execute_script",
+        parameters: Type.Object({}),
+        execute: passthrough,
+      },
+      planManager,
+    );
+    const writeTool = wrapWriteForPlanMode(
+      {
+        name: "write",
+        label: "Write",
+        description: "write",
+        parameters: Type.Object({}),
+        execute: passthrough,
+      },
+      planManager,
+      workspaceDir,
+    );
+
+    expect(planManager.permissionMode).toBe("plan");
+    expect(parseTextPayload(await executeScript.execute("tc-blocked", {}))).toMatchObject({
+      error: "plan_mode_restricted",
+    });
+    expect(parseTextPayload(await writeTool.execute("tc-outside", {
+      path: join(workspaceDir, "outside.md"),
+    }))).toMatchObject({
+      error: "plan_mode_restricted",
+    });
+    await writeTool.execute("tc-inside-file", {
+      path: join(workspaceDir, "plans", "active.md"),
+    });
+    await writeTool.execute("tc-inside-sibling", {
+      path: join(workspaceDir, "plans", "notes.md"),
+    });
+
+    planManager.writePlanContent("1. Run execution step");
+    await createExitPlanModeTool(planManager).execute("tc-exit", { approved: true });
+
+    expect(planManager.permissionMode).toBe("default");
+    await executeScript.execute("tc-after-approve", {});
+    expect(passthrough).toHaveBeenCalledWith(
+      "tc-after-approve",
+      {},
+      undefined,
+      undefined,
+    );
+    expect(planManager.permissionMode).toBe("default");
+  });
+});
