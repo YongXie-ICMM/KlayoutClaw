@@ -30,6 +30,36 @@ def main():
         shutil.copy2(src, dst)
         print(f"Installed: {dst}")
 
+    # Phase 5: install tools/vc_mcp_handlers.py as pymacros/tools/vc_mcp_handlers.py
+    # so the lym server can import ``tools.vc_mcp_handlers``.
+    dst_tools_dir = klayout_dir / "tools"
+    dst_tools_dir.mkdir(parents=True, exist_ok=True)
+    # Make ``tools`` an importable package.
+    init_py = dst_tools_dir / "__init__.py"
+    if not init_py.exists():
+        init_py.write_text("")
+    vc_src = tools_dir / "vc_mcp_handlers.py"
+    if vc_src.exists():
+        shutil.copy2(vc_src, dst_tools_dir / "vc_mcp_handlers.py")
+        print(f"Installed: {dst_tools_dir / 'vc_mcp_handlers.py'}")
+
+    # Phase 4: install the klayoutclaw_vc package (G5 backend) next to the
+    # lym files so ``from plugin.klayoutclaw_vc import repo`` resolves via
+    # the sys.path bootstrap in tools/vc_mcp_handlers.py.
+    plugin_pkg_src = plugin_dir / "klayoutclaw_vc"
+    if plugin_pkg_src.is_dir():
+        # Mirror the `plugin/` parent so the import path matches source.
+        dst_plugin_parent = klayout_dir / "plugin"
+        dst_plugin_parent.mkdir(parents=True, exist_ok=True)
+        plugin_init = dst_plugin_parent / "__init__.py"
+        if not plugin_init.exists():
+            plugin_init.write_text("")
+        dst_pkg = dst_plugin_parent / "klayoutclaw_vc"
+        if dst_pkg.exists():
+            shutil.rmtree(dst_pkg)
+        shutil.copytree(plugin_pkg_src, dst_pkg)
+        print(f"Installed: {dst_pkg}")
+
 
     print("\nDone! No external Python dependencies needed (uses only stdlib + pya).")
     print("Restart KLayout to activate the MCP server.")
