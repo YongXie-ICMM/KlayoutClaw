@@ -1396,3 +1396,237 @@ describe("planLengthChars telemetry (PM-13 / T37)", () => {
   });
 });
 
+/**
+ * Task 2.18 — Subagent block preserved (PM-9 / T22).
+ *
+ * Spec §4.3 PM-9: while the parent is in plan mode (plan_drafting or
+ * plan_drafted), delegate() short-circuits with a plan_mode_restricted
+ * envelope BEFORE role validation. Subagents would otherwise bypass the
+ * sandbox and run arbitrary read-write tools.
+ *
+ * Exit conditions: after approve_execute/approve_only/abandon the parent is
+ * no longer in plan mode (inPlanMode=false) and delegate proceeds normally.
+ * After reject, the parent is back in plan_drafting and delegate stays
+ * blocked — the only "exit" that lifts inPlanMode is a terminal approval
+ * (execute/only) or an abandon.
+ */
+describe("subagent plan-mode block (PM-9 / T22)", () => {
+  function makeMinimalSubagentConfig(): any {
+    return {
+      enabled: true,
+      logDir: "/tmp/qlaybot-t22-logs",
+      maxLogFiles: 5,
+      roles: {
+        researcher: {
+          label: "Researcher",
+          promptFile: "subagent/researcher.md",
+          workspaceFiles: [],
+          baseTools: ["read"],
+          customTools: ["submit_result"],
+          mcpAccess: "shared-readonly",
+          maxTurns: 10,
+          maxTokens: 10000,
+        },
+      },
+    };
+  }
+
+  it("blocks delegate during plan_drafting with plan_mode_restricted and does not call runner.run", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const stateMachine = new PlanStateMachine(new TranscriptMarkerEmitter());
+    planManager.attachStateMachine(stateMachine);
+    planManager.enterPlanMode("T22 probe — drafting");
+    // enterPlanMode already sets state to plan_drafting, but assert explicitly
+    // so a regression that drops the plan_drafting entry fails here.
+    expect(stateMachine.getState(planManager.sessionKey)).toBe("plan_drafting");
+    expect(planManager.inPlanMode).toBe(true);
+
+    const runner: any = { run: vi.fn() };
+    const config = makeMinimalSubagentConfig();
+    const tool = createDelegateTool(runner, config, planManager);
+
+    const result = await tool.execute("tc-t22-drafting", {
+      role: "researcher",
+      task: "x",
+    });
+
+    expect((result as any).details?.error).toBe(true);
+    const parsed = parseTextPayload(result);
+    expect(parsed.error).toBe("plan_mode_restricted");
+    expect(parsed.tool).toBe("delegate");
+    expect(parsed.message).toMatch(/subagents would bypass the sandbox/);
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("blocks delegate during plan_drafted with plan_mode_restricted and does not call runner.run", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const stateMachine = new PlanStateMachine(new TranscriptMarkerEmitter());
+    planManager.attachStateMachine(stateMachine);
+    planManager.enterPlanMode("T22 probe — drafted");
+    stateMachine.setState(planManager.sessionKey, "plan_drafted");
+    expect(planManager.inPlanMode).toBe(true);
+
+    const runner: any = { run: vi.fn() };
+    const config = makeMinimalSubagentConfig();
+    const tool = createDelegateTool(runner, config, planManager);
+
+    const result = await tool.execute("tc-t22-drafted", {
+      role: "researcher",
+      task: "x",
+    });
+
+    expect((result as any).details?.error).toBe(true);
+    const parsed = parseTextPayload(result);
+    expect(parsed.error).toBe("plan_mode_restricted");
+    expect(parsed.tool).toBe("delegate");
+    expect(parsed.message).toMatch(/subagents would bypass the sandbox/);
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("allows delegate to proceed after approve_execute (inPlanMode lifted); runner.run IS called", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    planManager.enterPlanMode("T22 probe — approve_execute");
+    planManager.writePlanContent("1. step");
+
+    // Drive through the interactive gate to approve_execute → plan_done.
+    const exitPromise = createExitPlanModeTool(planManager).execute(
+      "tc-t22-approve-execute",
+      { approved: true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    await exitPromise;
+
+    // Sandbox should be fully lifted now.
+    expect(planManager.inPlanMode).toBe(false);
+
+    const runner: any = {
+      run: vi.fn().mockResolvedValue({
+        role: "researcher",
+        task: "x",
+        status: "completed",
+        findings: ["done"],
+        warnings: [],
+        dataPaths: [],
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 1 },
+        transcriptPath: "/tmp/t.md",
+      }),
+    };
+    const config = makeMinimalSubagentConfig();
+    const tool = createDelegateTool(runner, config, planManager);
+
+    const result = await tool.execute("tc-t22-after-approve", {
+      role: "researcher",
+      task: "post-approval delegation",
+    });
+
+    // runner.run MUST have been called — delegate passed the plan-mode gate.
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    const call = (runner.run as any).mock.calls[0][0];
+    expect(call.role).toBe("researcher");
+    expect(call.task).toBe("post-approval delegation");
+
+    // Result body must NOT be the plan_mode_restricted envelope.
+    const resultStr = JSON.stringify(result);
+    expect(resultStr).not.toContain("plan_mode_restricted");
+    expect(resultStr).toContain("completed");
+  });
+
+  it("keeps delegate blocked after reject (parent back in plan_drafting, inPlanMode still true)", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    const stateMachine = new PlanStateMachine(emitter);
+    planManager.attachStateMachine(stateMachine);
+    planManager.enterPlanMode("T22 probe — reject");
+    planManager.writePlanContent("1. step");
+
+    // Drive through the interactive gate to reject.
+    const exitPromise = createExitPlanModeTool(planManager).execute(
+      "tc-t22-reject",
+      { approved: true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, {
+      action: "reject",
+      feedback: "try again",
+    });
+    await exitPromise;
+
+    // After reject: state machine back in plan_drafting, and the parent is
+    // still in plan mode (reject loops back to drafting per PM-6).
+    expect(stateMachine.getState(planManager.sessionKey)).toBe("plan_drafting");
+    expect(planManager.inPlanMode).toBe(true);
+
+    const runner: any = { run: vi.fn() };
+    const config = makeMinimalSubagentConfig();
+    const tool = createDelegateTool(runner, config, planManager);
+
+    const result = await tool.execute("tc-t22-after-reject", {
+      role: "researcher",
+      task: "blocked again",
+    });
+
+    expect((result as any).details?.error).toBe(true);
+    const parsed = parseTextPayload(result);
+    expect(parsed.error).toBe("plan_mode_restricted");
+    expect(parsed.tool).toBe("delegate");
+    expect(parsed.message).toMatch(/subagents would bypass the sandbox/);
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+});
