@@ -756,11 +756,25 @@ describe("Task 1.8 — T19 native-thinking coexistence (round-3 Concern C)", () 
             // Prompt that requires genuine reasoning (forces native
             // thinking at medium+ effort) AND explicitly asks for the
             // thinking tool (forces tool_use).
+            //
+            // Prompt hardening (G4 flakiness fix, 2026-04-22): the earlier
+            // phrasing left the `thinking` tool call optional. Under
+            // real-API variance the model sometimes skipped the tool and
+            // relied solely on native thinking, collapsing T19(b)'s
+            // coexistence binding. The directive below mandates AT LEAST
+            // ONE `thinking` tool call and requires native step-by-step
+            // reasoning, giving both surfaces a non-optional anchor.
             await bot.session.prompt(
-              "Think step by step about which of these two approaches " +
+              "I need you to do TWO things in this response, in order:\n" +
+                "  (1) Think step by step about which of these two approaches " +
                 "is better for a Hall bar device: (A) top-contact geometry " +
-                "vs (B) side-contact geometry. Use the `thinking` tool " +
-                "to externalize your decision before answering.",
+                "vs (B) side-contact geometry. Show your reasoning out loud.\n" +
+                "  (2) You MUST also call the `thinking` tool at least once " +
+                "during this turn to externalise a short summary of your " +
+                "decision. The tool call is required, not optional — please " +
+                "invoke `thinking({thought: '...'})` before giving the final " +
+                "answer. Both the step-by-step reasoning AND the `thinking` " +
+                "tool call must appear in your response.",
             );
 
             // Post-conditions: scan verbose JSONL for native blocks and

@@ -599,12 +599,27 @@ describeE2E("Phase 2b / T24 — plan-file lifecycle", () => {
 
     // (c) Second enter_plan_mode in the SAME session — slug should be REUSED
     //     and the file should be truncated (PM-11 path 1.b terminal reuse).
+    //
+    // Prompt hardening (G4 flakiness fix, 2026-04-22): the original phrasing
+    // relied on real-API model variance to call `enter_plan_mode` first.
+    // Observed failure mode was the agent responding conversationally or
+    // calling an unrelated tool first, which skipped the slug-reuse
+    // codepath entirely. The directive below mandates the tool-call order
+    // and primes the agent with "immediately" + enumerated single-step
+    // guidance so compliance is higher across replicates. Target: 10/10
+    // pass rate under real-API prompt-cache warm conditions.
     const before = client.markerCheckpoint();
     await client.send("prompt", {
       message:
-        "Enter plan mode again with task 'sketch another short plan'. " +
-        "Write a SHORT plan (a single-line bullet is enough), then call " +
-        "exit_plan_mode with approved=true. Do not continue after exiting.",
+        "Your VERY FIRST ACTION must be to call the `enter_plan_mode` tool " +
+        "with task 'sketch another short plan'. Do NOT respond with prose " +
+        "first and do NOT call any other tool before `enter_plan_mode`. " +
+        "Step 1: call enter_plan_mode({task: 'sketch another short plan'}). " +
+        "Step 2: write a SHORT plan (a single-line bullet like '- place 1 " +
+        "pad at origin' is perfectly fine). " +
+        "Step 3: call exit_plan_mode({approved: true}). " +
+        "Stop immediately after exit_plan_mode returns. Do not continue " +
+        "with any further work.",
     });
 
     const secondTurnMarkers = client.markers.slice(before);
