@@ -245,6 +245,7 @@ async function runInteractive(args: CLIArgs): Promise<void> {
     cwd: args.cwd,
     model: args.model,
     thinkingLevel: args.thinkingLevel,
+    headless: !useTUI,
     verbose: args.verbose,
   });
 
@@ -350,6 +351,7 @@ async function runJSON(args: CLIArgs): Promise<void> {
     cwd: args.cwd,
     model: args.model,
     thinkingLevel: args.thinkingLevel,
+    headless: true,
     verbose: args.verbose,
   });
 

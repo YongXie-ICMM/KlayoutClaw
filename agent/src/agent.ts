@@ -65,6 +65,7 @@ export interface CreateDesignSessionOptions {
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   ephemeral?: boolean;
   promptMode?: PromptMode;
+  headless?: boolean;
   /** §4.4 runtime-ephemeral verbose flag. CLI --verbose → createDesignSession. */
   verbose?: boolean;
 }
@@ -104,6 +105,12 @@ export async function createDesignSession(
   const verbose = config.verbose === true;
   const compactionConfig = resolveCompactionConfig(config.compaction);
   const mode = opts.promptMode ?? PromptMode.Full;
+  if (config.autoApprovePlans === false) {
+    console.warn(
+      "autoApprovePlans=false is v0.4.5 (OQ-7); treating as true",
+    );
+    config.autoApprovePlans = true;
+  }
 
   // --- Session & Settings Managers ---
   let sessionManager: SessionManager;
@@ -213,6 +220,7 @@ export async function createDesignSession(
 
   // --- Plan Manager + Background Task Manager (created early for tool wrapping) ---
   const planManager = new PlanManager(workspaceDir);
+  planManager.setApprovalMode(opts.headless ? "headless" : "interactive");
   const backgroundTaskManager = new BackgroundTaskManager();
 
   // --- TranscriptMarkerEmitter (v0.4.4 §4.7) ---

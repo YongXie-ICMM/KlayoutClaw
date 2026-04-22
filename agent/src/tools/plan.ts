@@ -221,7 +221,7 @@ export function createExitPlanModeTool(
       );
       stateMachine.emitPlanFileWritten(plan.filePath, planHash, planBytes.length);
 
-      if (!planManager.headless) {
+      if (planManager.approvalMode === "interactive") {
         try {
           const action = await waitForPlanApproval(planManager.sessionKey);
           if (action.action === "approve_execute") {
@@ -316,6 +316,36 @@ export function createExitPlanModeTool(
             message: "Plan abandoned because the caller disconnected.",
           });
         }
+      }
+
+      if (planManager.approvalMode === "headless") {
+        stateMachine.transition(
+          planManager.sessionKey,
+          "plan_drafted",
+          "plan_approved",
+          { auto: true, executeAfterApproval: true },
+        );
+        stateMachine.transition(
+          planManager.sessionKey,
+          "plan_approved",
+          "plan_executing",
+          { planHash },
+        );
+        stateMachine.transition(
+          planManager.sessionKey,
+          "plan_executing",
+          "plan_done",
+          { status: "ok" },
+        );
+        planManager.closePlanMode("approved");
+        return ok({
+          status: "plan_approved",
+          plan_id: plan.id,
+          plan_file: plan.filePath,
+          executeAfterApproval: true,
+          auto: true,
+          message: "Plan auto-approved in headless mode.",
+        });
       }
 
       return ok({

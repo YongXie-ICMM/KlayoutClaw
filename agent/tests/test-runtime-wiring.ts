@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, afterEach, beforeAll, vi } from "vitest";
-import { readFileSync, writeFileSync, mkdtempSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdtempSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import React from "react";
@@ -1234,6 +1234,76 @@ describe("Phase 0: RPC forwards transcript_marker events — Task 0.7", () => {
         hasHelper, // helper takes sendEvent as an argument, so the method literal lives elsewhere
       "rpc.ts must emit RPC events with method=\"transcript_marker\"",
     ).toBe(true);
+  });
+});
+
+describe("T35: headless auto-approve + autoApprovePlans coercion", () => {
+  it("warns on autoApprovePlans=false and auto-executes in headless mode", async () => {
+    const homeDir = makeTmpDir();
+    const prevHome = process.env.HOME;
+    process.env.HOME = homeDir;
+    vi.resetModules();
+
+    const configDir = join(homeDir, ".qlaybot", "config");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "settings.json"),
+      JSON.stringify({ autoApprovePlans: false }, null, 2),
+      "utf-8",
+    );
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { createDesignSession } = await import("../src/agent.js");
+    const { getTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const botSession = await createDesignSession({
+      ephemeral: true,
+      headless: true,
+    });
+
+    try {
+      const markers: any[] = [];
+      const emitter = getTranscriptMarkerEmitter(botSession.session);
+      emitter?.on("marker", (marker: unknown) => markers.push(marker));
+
+      botSession.planManager?.enterPlanMode("Headless approval flow");
+      botSession.planManager?.writePlanContent("1. Execute the approved plan");
+
+      const result = await createExitPlanModeTool(botSession.planManager!).execute(
+        "tc-headless",
+        { approved: true },
+      );
+      const body = JSON.parse(textOf(result));
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("autoApprovePlans=false"),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("v0.4.5"),
+      );
+      expect(body.status).toBe("plan_approved");
+      expect(body.auto).toBe(true);
+      expect(body.executeAfterApproval).toBe(true);
+      expect(markers.map((marker) => marker.type)).toEqual([
+        "plan_drafted",
+        "plan_file_written",
+        "plan_approved",
+        "plan_executing",
+        "plan_done",
+      ]);
+    } finally {
+      await botSession.dispose();
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      vi.resetModules();
+    }
   });
 });
 

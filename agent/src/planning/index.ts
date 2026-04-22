@@ -17,6 +17,7 @@ export interface PlanEnterError {
 
 export type EnterPlanModeResult = Plan | PlanEnterError | null;
 export type PlanPermissionMode = "default" | "plan";
+export type PlanApprovalMode = "deferred" | "interactive" | "headless";
 
 interface PlanStateMachineLike {
   getState(session: object): string | undefined;
@@ -42,7 +43,7 @@ export class PlanManager {
   private _permissionMode: PlanPermissionMode = "default";
   private _prePlanMode: PlanPermissionMode | null = null;
   private _stateMachine: PlanStateMachineLike | null = null;
-  private _headless = true;
+  private _approvalMode: PlanApprovalMode = "deferred";
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
@@ -76,8 +77,12 @@ export class PlanManager {
     return this._stateMachine?.getState(this._sessionKey);
   }
 
+  get approvalMode(): PlanApprovalMode {
+    return this._approvalMode;
+  }
+
   get headless(): boolean {
-    return this._headless;
+    return this._approvalMode === "headless";
   }
 
   bindSession(session: object): void {
@@ -85,7 +90,11 @@ export class PlanManager {
   }
 
   setHeadless(headless: boolean): void {
-    this._headless = headless;
+    this._approvalMode = headless ? "headless" : "interactive";
+  }
+
+  setApprovalMode(mode: PlanApprovalMode): void {
+    this._approvalMode = mode;
   }
 
   attachStateMachine(stateMachine: PlanStateMachineLike): void {

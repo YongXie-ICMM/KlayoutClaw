@@ -179,6 +179,7 @@ export async function startRPCServer(opts: {
               thinkingLevel:
                 (req.params?.thinkingLevel as "high") ?? opts.thinkingLevel,
               ephemeral: req.params?.ephemeral !== false,
+              headless: true,
               verbose:
                 (req.params?.verbose as boolean) ?? opts.verbose ?? false,
             });

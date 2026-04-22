@@ -286,6 +286,7 @@ export async function runSetupWizard(options: WizardOptions): Promise<QlayBotCon
         },
       },
     },
+    autoApprovePlans: true,
     mcp: {},
     mcpTimeouts: {
       requestMs: 5000,

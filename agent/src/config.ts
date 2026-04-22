@@ -77,6 +77,7 @@ export interface QlayBotConfig {
    * at saveSettingsConfig serialization boundary.
    */
   verbose: boolean;
+  autoApprovePlans: boolean;
 }
 
 /**
@@ -237,6 +238,7 @@ function defaultConfig(): QlayBotConfig {
     search: defaultSearchConfig(),
     embedding: defaultEmbeddingConfig(),
     verbose: false,
+    autoApprovePlans: true,
   };
 }
 
@@ -363,6 +365,9 @@ export function loadConfig(configDir?: string): QlayBotConfig {
       if (settings.embedding) {
         config.embedding = { ...defaultEmbeddingConfig(), ...settings.embedding };
       }
+      if (typeof settings.autoApprovePlans === "boolean") {
+        config.autoApprovePlans = settings.autoApprovePlans;
+      }
     }
   } catch {
     // Use defaults on error
@@ -423,6 +428,7 @@ export function saveSettingsConfig(config: QlayBotConfig, configDir?: string): v
     subagent: config.subagent,
     search: config.search,
     embedding: config.embedding,
+    autoApprovePlans: config.autoApprovePlans,
   };
   writeFileSync(join(cfgDir, "settings.json"), JSON.stringify(data, null, 2));
 }
@@ -590,6 +596,7 @@ export function initializeUserDir(templateDir: string, baseDir?: string): void {
       subagent: defaults.subagent,
       search: defaults.search,
       embedding: defaults.embedding,
+      autoApprovePlans: defaults.autoApprovePlans,
     }, null, 2));
   }
 
