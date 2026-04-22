@@ -179,3 +179,171 @@ describe("Task 1.4 / T44 — §3.4 thinking prompt guidance (Sub mode, interpret
     expect(hasTrivial || hasNotRequired).toBe(true);
   });
 });
+
+/**
+ * Task 7.1 / T44 — §6 cross-track integration prompt guidance.
+ *
+ * Source of truth:
+ *  - docs/superpowers/specs/2026-04-19-qlaybot-0.4.4-design.md §6
+ *    (three prose blocks — checkpoint discipline, recovery on blocker,
+ *    reasoning discipline).
+ *  - docs/superpowers/plans/2026-04-21-qlaybot-0.4.4.md Task 7.1 Step 1.
+ *
+ * §6 blocks verbatim:
+ *  1. "Checkpoint discipline during plan execution. Before any destructive
+ *      MCP call during `plan_executing` (`klayout_native_save_layout`,
+ *      `klayout_native_auto_route`, `klayout_native_execute_script` that
+ *      mutates geometry), consider calling `klayout_native_vc_checkpoint`
+ *      with a short message so the user can roll back. If
+ *      `klayout_native_vc_status` returns `vc not initialized`, skip this
+ *      guidance silently."
+ *  2. "Recovery on blocker. If a `plan_executing` step fails unrecoverably,
+ *      consider `klayout_native_vc_checkout` to the last good checkpoint
+ *      before re-drafting. Record the decision via `thinking`."
+ *  3. "Reasoning discipline. Use `thinking` before destructive MCP calls,
+ *      when resolving ambiguity, and when choosing between approaches.
+ *      Reference the active VC branch/checkpoint when it's load-bearing."
+ *
+ * Mode coverage (per overseer instruction):
+ *  - §6 applies to Full mode (subagents don't plan; plan_executing is a
+ *    PlanManager-owned state).
+ *  - We assert the §6 block is PRESENT in Full mode.
+ *  - We are NEUTRAL about Sub mode — do not assert presence or absence.
+ *
+ * These are RED tests until the Executor lands Task 7.1 Step 2
+ * (§6 block added to agent/src/prompts/).
+ */
+describe("Task 7.1 / T44 — §6 cross-track prompt guidance (Full mode)", () => {
+  // --- (a) Checkpoint discipline ----------------------------------------
+
+  it("names the checkpoint-discipline anchor: 'before any destructive MCP call during `plan_executing`'", () => {
+    const prompt = buildFull();
+    // Canonical phrase from §6 block 1 — the agent must recognise that
+    // destructive MCP calls in plan_executing are the trigger condition.
+    expect(prompt).toMatch(
+      /before any destructive MCP call during `plan_executing`/i,
+    );
+  });
+
+  // NOTE: a naive "names the three destructive tools verbatim" assertion
+  // would pass transitively because those tool names also appear in the
+  // tooling section (TOOL_NAMES_WITH_THINKING) and in §3.4 bullet 1. The
+  // drift-guard test below covers this correctly by asserting the tool
+  // names appear *inside* the §6 contiguous block, not merely somewhere
+  // in the prompt.
+
+  it("§6 checkpoint block recommends `klayout_native_vc_checkpoint` with a rollback rationale", () => {
+    const prompt = buildFull();
+    expect(prompt).toContain("klayout_native_vc_checkpoint");
+    // Rollback rationale — spec says "so the user can roll back".
+    expect(prompt).toMatch(/roll back/i);
+  });
+
+  it("§6 includes the fallback clause: `vc not initialized` → skip silently", () => {
+    // Verbatim fallback from §6 block 1. Skipping silently is the agent's
+    // escape hatch when VC was never initialised on this layout.
+    const prompt = buildFull();
+    expect(prompt).toContain("klayout_native_vc_status");
+    expect(prompt).toContain("vc not initialized");
+    // "skip" + "silently" — the spec phrases it "skip this guidance silently".
+    expect(prompt).toMatch(/skip (this guidance )?silently/i);
+  });
+
+  // --- (b) Recovery on blocker ------------------------------------------
+
+  it("§6 recovery block recommends `klayout_native_vc_checkout` to the last good checkpoint before re-drafting", () => {
+    const prompt = buildFull();
+    expect(prompt).toContain("klayout_native_vc_checkout");
+    // "last good checkpoint before re-drafting" — verbatim anchor for
+    // block 2. Accept either hyphenation ("re-drafting" / "redrafting").
+    expect(prompt).toMatch(/last good checkpoint/i);
+    expect(prompt).toMatch(/before re-?drafting/i);
+  });
+
+  it("§6 recovery block requires recording the decision via `thinking`", () => {
+    const prompt = buildFull();
+    // Verbatim from spec: "Record the decision via `thinking`".
+    expect(prompt).toMatch(/record the decision via `?thinking`?/i);
+  });
+
+  it("§6 recovery block is triggered by an unrecoverable `plan_executing` step failure", () => {
+    const prompt = buildFull();
+    // Trigger condition for block 2: a plan_executing step that fails
+    // unrecoverably. Both anchors must appear.
+    expect(prompt).toContain("plan_executing");
+    expect(prompt).toMatch(/unrecoverabl/i);
+  });
+
+  // --- (c) Reasoning discipline -----------------------------------------
+  //
+  // NOTE: intentionally no individual `it(...)` for reasoning-discipline
+  // anchors. Every anchor the §6 reasoning-discipline bullet uses
+  // (`thinking`, "destructive", "ambiguity", "VC branch"/"checkpoint",
+  // "load-bearing") is ALREADY present in §3.4's thinking.ts block — so a
+  // prompt-level substring test would pass transitively even without a §6
+  // section. "choosing between approaches" is the one §6-unique phrase; it
+  // is enforced inside the drift-guard test below, which requires the
+  // phrase to appear inside the §6 contiguous block (anchored on the
+  // §6-unique "before any destructive MCP call during `plan_executing`"
+  // phrase) — not merely somewhere in the full prompt.
+
+  // --- Drift guard: the three §6 bullets must be a contiguous block ------
+
+  it("§6 block is a contiguous span of >=500 chars covering all three bullets (drift guard)", () => {
+    const prompt = buildFull();
+
+    // Anchor on the canonical §6-block-1 phrase. It is unique to §6 and
+    // does not collide with §3.4 (which uses "before destructive MCP
+    // calls" without the `plan_executing` qualifier).
+    const anchorMatch = prompt.match(
+      /before any destructive MCP call during `plan_executing`/i,
+    );
+    expect(
+      anchorMatch,
+      "§6 anchor 'before any destructive MCP call during `plan_executing`' not found in Full-mode prompt",
+    ).not.toBeNull();
+    const anchorIdx = anchorMatch ? (anchorMatch.index ?? -1) : -1;
+    expect(anchorIdx).toBeGreaterThanOrEqual(0);
+
+    // The block extends from some preamble-safe starting point up to the
+    // nearest section break after the last §6 anchor. We search for a
+    // `\n\n---\n\n` terminator; if absent, fall back to end-of-prompt.
+    const sectionEnd = prompt.indexOf("\n\n---\n\n", anchorIdx);
+    const end = sectionEnd === -1 ? prompt.length : sectionEnd;
+    // Small preamble window to capture the §6 heading / lead-in phrase.
+    const start = Math.max(0, anchorIdx - 200);
+    const block = prompt.slice(start, end);
+
+    // Minimum-size guard — three paragraphs of prose cannot fit in under
+    // ~500 chars; a stub one-liner would fail here.
+    expect(
+      block.length,
+      `§6 block only ${block.length} chars — expected >=500 for three bullets`,
+    ).toBeGreaterThanOrEqual(500);
+
+    // (a) Checkpoint discipline anchors all present in the same block.
+    expect(block).toMatch(
+      /before any destructive MCP call during `plan_executing`/i,
+    );
+    expect(block).toContain("klayout_native_save_layout");
+    expect(block).toContain("klayout_native_auto_route");
+    expect(block).toContain("klayout_native_execute_script");
+    expect(block).toContain("klayout_native_vc_checkpoint");
+    expect(block).toContain("klayout_native_vc_status");
+    expect(block).toContain("vc not initialized");
+    expect(block).toMatch(/skip (this guidance )?silently/i);
+
+    // (b) Recovery-on-blocker anchors all in the same block.
+    expect(block).toContain("klayout_native_vc_checkout");
+    expect(block).toMatch(/last good checkpoint/i);
+    expect(block).toMatch(/before re-?drafting/i);
+    expect(block).toMatch(/record the decision via `?thinking`?/i);
+
+    // (c) Reasoning-discipline anchors all in the same block.
+    expect(block).toContain("ambiguity");
+    expect(block).toContain("choosing between approaches");
+    expect(block).toMatch(/VC branch|checkpoint/);
+    expect(block).toMatch(/load-bearing/i);
+  });
+});
+

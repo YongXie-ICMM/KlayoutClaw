@@ -9,6 +9,7 @@ import { buildContextSection } from "./sections/context.js";
 import { buildSkillsSection } from "./sections/skills.js";
 import { buildDelegationSection } from "./sections/delegation.js";
 import { buildThinkingSection } from "./sections/thinking.js";
+import { buildVcDisciplineSection } from "./sections/vc-discipline.js";
 import type { SubagentConfig } from "../types/v04-contracts.js";
 
 export enum PromptMode {
@@ -57,6 +58,13 @@ export function buildSystemPrompt(ctx: PromptBuildContext): string {
         "The user can also type `/plan` to request plan mode.",
       ].join("\n"),
     );
+  }
+
+  // v0.4.4 §6 — cross-track VC discipline during plan execution. Emitted
+  // in Full mode only because §6 is plan-mode cross-track guidance, and
+  // subagents don't own plan_executing state.
+  if (ctx.mode === PromptMode.Full) {
+    sections.push(buildVcDisciplineSection());
   }
 
   // MCP
