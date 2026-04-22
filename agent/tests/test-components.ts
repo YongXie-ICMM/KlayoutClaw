@@ -7,7 +7,7 @@
  * Uses ink-testing-library for React/Ink component rendering.
  */
 
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import React from "react";
 import { render, cleanup } from "ink-testing-library";
 import stripAnsi from "strip-ansi";
@@ -15,6 +15,7 @@ import stripAnsi from "strip-ansi";
 // Component imports
 import { MarkdownText } from "../src/tui/components/MarkdownText.js";
 import { ThinkingIndicator } from "../src/tui/components/ThinkingIndicator.js";
+import { PlanApprovalMenu } from "../src/tui/components/PlanApprovalMenu.js";
 import { StreamingBar, formatTokens } from "../src/tui/components/StreamingBar.js";
 import { ErrorBanner } from "../src/tui/components/ErrorBanner.js";
 import { UserMessage } from "../src/tui/components/UserMessage.js";
@@ -39,6 +40,7 @@ import type {
   BackgroundTaskSummaryTUI,
 } from "../src/tui/types.js";
 import type { CommandMatch } from "../src/tui/commands.js";
+import { pressKey } from "./helpers/ink-helpers.js";
 
 // Helpers
 afterEach(() => { cleanup(); });
@@ -309,6 +311,126 @@ describe("ThinkingIndicator source prop (T38)", () => {
     expect(raw.length).toBeGreaterThan(0);
     const text = stripAnsi(raw);
     expect(text).toContain("inline-source probe");
+  });
+});
+
+describe("PlanApprovalMenu (T31)", () => {
+  it("maps 1 to approve_execute", () => {
+    const onAction = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction,
+      }),
+    );
+
+    stdin.write("1");
+    expect(onAction).toHaveBeenCalledWith({ action: "approve_execute" });
+    unmount();
+  });
+
+  it("maps 2 to approve_only", () => {
+    const onAction = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction,
+      }),
+    );
+
+    stdin.write("2");
+    expect(onAction).toHaveBeenCalledWith({ action: "approve_only" });
+    unmount();
+  });
+
+  it("maps 3 then feedback submit to reject with feedback", () => {
+    const onAction = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction,
+      }),
+    );
+
+    stdin.write("3");
+    stdin.write("not quite, missing pad spacing");
+    pressKey(stdin, "enter");
+    expect(onAction).toHaveBeenCalledWith({
+      action: "reject",
+      feedback: "not quite, missing pad spacing",
+    });
+    unmount();
+  });
+
+  it("maps 4 to abandon", () => {
+    const onAction = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction,
+      }),
+    );
+
+    stdin.write("4");
+    expect(onAction).toHaveBeenCalledWith({ action: "abandon" });
+    unmount();
+  });
+
+  it("treats non-affirmative free text at the root as reject feedback", () => {
+    const onAction = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction,
+      }),
+    );
+
+    stdin.write("needs wider spacing");
+    pressKey(stdin, "enter");
+    expect(onAction).toHaveBeenCalledWith({
+      action: "reject",
+      feedback: "needs wider spacing",
+    });
+    unmount();
+  });
+
+  it("treats affirmative tokens and bare Enter as approve_execute", () => {
+    const affirmative = [
+      "yes",
+      "y",
+      "go",
+      "/go",
+      "ok",
+      "okay",
+      "approved",
+      "approve",
+    ];
+
+    for (const token of affirmative) {
+      const onAction = vi.fn();
+      const { stdin, unmount } = render(
+        React.createElement(PlanApprovalMenu, {
+          planFilePath: "/tmp/test-plan.md",
+          onAction,
+        }),
+      );
+
+      stdin.write(token.toUpperCase());
+      pressKey(stdin, "enter");
+      expect(onAction).toHaveBeenCalledWith({ action: "approve_execute" });
+      unmount();
+    }
+
+    const bareEnter = vi.fn();
+    const { stdin, unmount } = render(
+      React.createElement(PlanApprovalMenu, {
+        planFilePath: "/tmp/test-plan.md",
+        onAction: bareEnter,
+      }),
+    );
+    pressKey(stdin, "enter");
+    expect(bareEnter).toHaveBeenCalledWith({ action: "approve_execute" });
+    unmount();
   });
 });
 

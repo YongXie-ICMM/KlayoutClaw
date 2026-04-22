@@ -15,7 +15,7 @@ import { WorkspaceBar } from "./WorkspaceBar.js";
 import { BackgroundBar } from "./BackgroundBar.js";
 import { ConfigPanel } from "./ConfigPanel.js";
 import { SubagentPanel } from "./SubagentPanel.js";
-import { PlanExitMenu } from "./PlanExitMenu.js";
+import { PlanApprovalMenu } from "./PlanApprovalMenu.js";
 import { subscribeToSession } from "../../events.js";
 import { shouldAutoCompact } from "../auto-compact.js";
 import type { QlayBotSession } from "../../agent.js";
@@ -740,7 +740,7 @@ export function App({ botSession }: AppProps) {
           verbose={botSession.config.verbose === true}
         />
       )}
-      {planExitMenu !== null && <PlanExitMenu planFilePath={planExitMenu} />}
+      {planExitMenu !== null && <PlanApprovalMenu planFilePath={planExitMenu} />}
       {state.error && <ErrorBanner error={state.error} />}
       <StreamingBar
         phase={state.phase}
