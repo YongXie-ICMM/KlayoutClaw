@@ -78,26 +78,13 @@ function renderSegment(
   switch (segment.type) {
     case "thinking": {
       const isActive = opts.isLastSegment && opts.isStreaming;
-      if (!opts.thinkingExpanded && !isActive) {
-        // Collapsed non-active thinking: show just the label
-        return (
-          <Box key={`thinking-${idx}`} marginLeft={2}>
-            <Text>{theme.thinking("thinking")}</Text>
-          </Box>
-        );
-      }
       if (!opts.thinkingExpanded) {
-        // Collapsed but active: show label only (no text)
         return (
           <Box key={`thinking-${idx}`} marginLeft={2}>
             <Text>{theme.thinking("thinking")}</Text>
           </Box>
         );
       }
-      // Expanded: delegate to ThinkingIndicator. Pass the segment's
-      // source so TH-6 / TH-9 visual distinction kicks in live (tool
-      // scratchpad vs. native streaming). `source` is optional on the
-      // segment; ThinkingIndicator defaults to "native" when undefined.
       return (
         <Box key={`thinking-${idx}`}>
           <ThinkingIndicator

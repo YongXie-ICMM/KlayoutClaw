@@ -36,17 +36,12 @@ export interface QlayBotEventCallbacks {
   onTranscriptMarker?: (marker: TranscriptMarker) => void;
 }
 
-export interface SubscribeOptions {
-  heartbeatIntervalMs?: number;
-}
-
 /**
  * Subscribe to an AgentSession with structured callbacks.
  */
 export function subscribeToSession(
   session: AgentSession,
   callbacks: QlayBotEventCallbacks,
-  _options: SubscribeOptions = {},
 ): () => void {
   const listener: AgentSessionEventListener = (event) => {
     switch (event.type) {
@@ -119,10 +114,7 @@ export function subscribeToSession(
   if (callbacks.onTranscriptMarker) {
     const emitter = getTranscriptMarkerEmitter(session);
     if (emitter) {
-      const onMarker = callbacks.onTranscriptMarker;
-      const markerListener = (m: unknown): void => {
-        onMarker(m as TranscriptMarker);
-      };
+      const markerListener = callbacks.onTranscriptMarker;
       emitter.on("marker", markerListener);
       markerUnsubscribe = () => emitter.off("marker", markerListener);
     }

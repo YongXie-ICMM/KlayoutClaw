@@ -422,8 +422,7 @@ export async function createDesignSession(
   // INDEPENDENT of the verbose writer's subscription (Task 0.5); neither
   // mirrors the other.
   const historyMarkerUnsub = ((): (() => void) => {
-    const listener = (m: unknown): void => {
-      const marker = m as TranscriptMarker;
+    const listener = (marker: TranscriptMarker): void => {
       history.appendTranscript({
         timestamp: marker.ts,
         type: "transcript_marker",
@@ -468,8 +467,7 @@ export async function createDesignSession(
     // Direct subscription — the verbose writer wraps each marker in
     // the same {timestamp, type, data} envelope that the history sink
     // uses. Same envelope across both sinks → T43(b) byte-equality.
-    const verboseListener = (m: unknown): void => {
-      const marker = m as TranscriptMarker;
+    const verboseListener = (marker: TranscriptMarker): void => {
       verboseWriter.write({
         timestamp: marker.ts,
         type: "transcript_marker",

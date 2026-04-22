@@ -13,8 +13,9 @@ import React, { useMemo } from "react";
 import { Text, Box } from "ink";
 import { Spinner } from "@inkjs/ui";
 import { theme } from "../theme.js";
+import type { ThinkRecordedSource } from "../../events/marker-types.js";
 
-export type ThinkingIndicatorSource = "tool" | "native" | "inline";
+export type ThinkingIndicatorSource = ThinkRecordedSource;
 
 interface ThinkingIndicatorProps {
   chunks: string[];

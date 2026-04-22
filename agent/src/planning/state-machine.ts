@@ -14,6 +14,7 @@ import type {
   PlanFileWrittenMarker,
   PlanRejectedMarker,
   PlanReplanMarker,
+  TranscriptMarker,
 } from "../events/marker-types.js";
 
 export type PlanState =
@@ -122,46 +123,16 @@ export class PlanStateMachine {
     planStates.set(session, to);
     const ts = new Date().toISOString();
 
-    switch (to) {
-      case "plan_drafted":
-        this.emitter.emit("marker", {
-          type: "plan_drafted",
-          ...(payload as Omit<PlanDraftedMarker, "type" | "ts">),
-          ts,
-        });
-        break;
-      case "plan_approved":
-        this.emitter.emit("marker", {
-          type: "plan_approved",
-          ...(payload as Omit<PlanApprovedMarker, "type" | "ts">),
-          ts,
-        });
-        break;
-      case "plan_rejected":
-        this.emitter.emit("marker", {
-          type: "plan_rejected",
-          ...(payload as Omit<PlanRejectedMarker, "type" | "ts">),
-          ts,
-        });
-        break;
-      case "plan_executing":
-        this.emitter.emit("marker", {
-          type: "plan_executing",
-          ...(payload as Omit<PlanExecutingMarker, "type" | "ts">),
-          ts,
-        });
-        break;
-      case "plan_done":
-        this.emitter.emit("marker", {
-          type: "plan_done",
-          ...(payload as Omit<PlanDoneMarker, "type" | "ts">),
-          ts,
-        });
-        break;
-      case "plan_drafting":
-        break;
-      default:
-        throw new PlanProtocolError(`unsupported plan state: ${to}`);
+    // plan_drafting is an internal-only state — no marker is emitted. All
+    // other legal targets emit a marker with `type: to` and the payload
+    // merged in; the (from, to) guard above + MarkerPayload union keep
+    // the shape honest at the type level.
+    if (to !== "plan_drafting") {
+      this.emitter.emit("marker", {
+        type: to,
+        ...payload,
+        ts,
+      } as TranscriptMarker);
     }
 
     if (to === "plan_done") {

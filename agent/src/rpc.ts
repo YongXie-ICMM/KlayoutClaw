@@ -55,15 +55,13 @@ export function subscribeMarkersToRPC(
       /* no-op — no emitter bound to the session */
     };
   }
-  const listener = (m: unknown): void => {
-    // §4.7 canonical-ts: params IS the marker. No wrapper-level `ts`.
-    // Cast through `Record<string, unknown>` — the JSON-RPC sendEvent
-    // contract accepts any serialisable object; the discriminated
-    // union keys are concrete string literals that TS refuses to
-    // auto-widen to the index signature, so we widen explicitly.
+  const listener = (marker: TranscriptMarker): void => {
+    // §4.7 canonical-ts: params IS the marker (no wrapper-level `ts`).
+    // Widen to the JSON-RPC index signature; the discriminated-union
+    // literal keys don't auto-widen.
     sendEvent(
       "transcript_marker",
-      m as unknown as Record<string, unknown>,
+      marker as unknown as Record<string, unknown>,
     );
   };
   emitter.on("marker", listener);
