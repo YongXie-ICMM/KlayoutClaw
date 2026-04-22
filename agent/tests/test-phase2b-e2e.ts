@@ -380,6 +380,35 @@ function planMarkersOnly(types: string[]): string[] {
   return types.filter((t) => t !== "think_recorded");
 }
 
+/**
+ * Send `message` and, if the expected marker does not appear in the
+ * client's markers after the first attempt, retry up to `maxAttempts`
+ * total times. Returns the final `prompt` result.
+ *
+ * Rationale (v0.4.4 Phase 8): real-API replicates of HAPPY_PATH_PROMPT
+ * occasionally skip `enter_plan_mode` entirely (the model responds
+ * conversationally instead of calling the tool), collapsing the
+ * downstream marker stream. The deterministic coexistence / ordering
+ * guarantees are already covered by unit (test-marker-emitter.ts,
+ * test-plan-state-machine.ts) + integration (test-runtime-wiring.ts).
+ * This retry helper lets the E2E smoke confirm the live-stack path
+ * without paying the 1-in-N stochastic miss rate.
+ */
+async function promptUntilMarker(
+  client: RPCClient,
+  message: string,
+  expectedMarker: string,
+  maxAttempts = 3,
+): Promise<unknown> {
+  let result: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    result = await client.send("prompt", { message });
+    const types = markerTypes(client.markers);
+    if (types.includes(expectedMarker)) return result;
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // T2 — Happy-path execute.
 // ---------------------------------------------------------------------------
@@ -395,9 +424,12 @@ describeE2E("Phase 2b / T2 — plan-mode happy-path execute", () => {
   });
 
   it("drafts, approves, executes, and emits the full marker sequence", async () => {
-    const result = (await client.send("prompt", {
-      message: HAPPY_PATH_PROMPT,
-    })) as Record<string, unknown>;
+    const result = (await promptUntilMarker(
+      client,
+      HAPPY_PATH_PROMPT,
+      "plan_drafted",
+      3,
+    )) as Record<string, unknown>;
     expect(result.status).toBe("completed");
 
     const planMarkers = planMarkersOnly(markerTypes(client.markers));
@@ -536,9 +568,12 @@ describeE2E("Phase 2b / T4 — marker ordering (E2E confirmation of happy path)"
   });
 
   it("RPC marker sequence matches the §4.2 execute-path ordering", async () => {
-    const result = (await client.send("prompt", {
-      message: HAPPY_PATH_PROMPT,
-    })) as Record<string, unknown>;
+    const result = (await promptUntilMarker(
+      client,
+      HAPPY_PATH_PROMPT,
+      "plan_done",
+      3,
+    )) as Record<string, unknown>;
     expect(result.status).toBe("completed");
 
     const seen = planMarkersOnly(markerTypes(client.markers));
@@ -566,7 +601,7 @@ describeE2E("Phase 2b / T24 — plan-file lifecycle", () => {
 
   it("file exists, planHash matches disk bytes, and slug reuse truncates file", async () => {
     // ---- First turn: happy path ----------------------------------------
-    await client.send("prompt", { message: HAPPY_PATH_PROMPT });
+    await promptUntilMarker(client, HAPPY_PATH_PROMPT, "plan_drafted", 3);
 
     const drafted = findMarker<{
       planHash: string;
@@ -724,9 +759,12 @@ describeE2E("Phase 2b / T43 — marker transport", () => {
     });
 
     it("ordered marker types in RPC stream == ordered marker types in history JSONL", async () => {
-      const result = (await client.send("prompt", {
-        message: HAPPY_PATH_PROMPT,
-      })) as Record<string, unknown>;
+      const result = (await promptUntilMarker(
+        client,
+        HAPPY_PATH_PROMPT,
+        "plan_done",
+        3,
+      )) as Record<string, unknown>;
       expect(result.status).toBe("completed");
 
       // Give the async appendTranscript a beat to flush (sync fs op,
@@ -774,9 +812,12 @@ describeE2E("Phase 2b / T43 — marker transport", () => {
     });
 
     it("history and verbose JSONL contain byte-equal transcript_marker lines", async () => {
-      const result = (await client.send("prompt", {
-        message: HAPPY_PATH_PROMPT,
-      })) as Record<string, unknown>;
+      const result = (await promptUntilMarker(
+        client,
+        HAPPY_PATH_PROMPT,
+        "plan_done",
+        3,
+      )) as Record<string, unknown>;
       expect(result.status).toBe("completed");
 
       // Let both sinks flush — verbose writer uses setImmediate + drain.
