@@ -44,3 +44,9 @@ paper/
 
 #opencode
 opencode.json
+
+# qlaybot v0.4.4 orchestration scratch + per-session artefacts
+.scratch/
+agent/plans/
+agent/workspace/plans/
+agent/qlaybot-transcripts/

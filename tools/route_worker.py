@@ -632,6 +632,49 @@ def route(config: dict) -> dict:
                 f"matched pairs ({len(pairs)}); ignoring per-pair obstacles.")
             per_pair_obs_layers = None
 
+    # Dry-run early-exit: return Hungarian assignments without running the
+    # (expensive) find_path loop. Lets the caller veto obviously bad pair
+    # assignments before committing routing cost. Output schema stays
+    # compatible with the success path (paths[] is empty, pairs[] carries
+    # the preview).
+    if dry_run:
+        preview = []
+        for i, j in pairs:
+            pa = pins_a[i]
+            pb = pins_b[j]
+            preview.append({
+                "pin_a_idx": int(i),
+                "pin_b_idx": int(j),
+                "pin_a_um": [round(pa[0] * dbu, 4), round(pa[1] * dbu, 4)],
+                "pin_b_um": [round(pb[0] * dbu, 4), round(pb[1] * dbu, 4)],
+                "distance_um": round(float(dist_matrix[i, j]) * dbu, 4),
+            })
+        dry_note = ["dry_run: Hungarian matching only, no routes inserted."]
+        if auto_map_note is not None:
+            dry_note.append(auto_map_note)
+        return {
+            "status": "dry_run",
+            "routed_pairs": 0,
+            "total_pins_a": n_a,
+            "total_pins_b": n_b,
+            "paths": [],
+            "pairs": preview,
+            "errors": dry_note,
+        }
+
+    # Validate per_pair_obstacle_layers length if provided. Must equal the
+    # number of matched pairs (post-Hungarian, post-sort).
+    if per_pair_obs_layers is not None:
+        if not isinstance(per_pair_obs_layers, list):
+            errors.append(
+                f"per_pair_obstacle_layers must be a list of lists; got {type(per_pair_obs_layers).__name__}")
+            per_pair_obs_layers = None
+        elif len(per_pair_obs_layers) != len(pairs):
+            errors.append(
+                f"per_pair_obstacle_layers length ({len(per_pair_obs_layers)}) != "
+                f"matched pairs ({len(pairs)}); ignoring per-pair obstacles.")
+            per_pair_obs_layers = None
+
     # Route each matched pair with per-pair pin recovery
     result_paths = []
     for pair_idx, (i, j) in enumerate(pairs):
