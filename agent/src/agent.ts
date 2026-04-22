@@ -46,6 +46,7 @@ import {
 import type { TranscriptMarker } from "./events/marker-types.js";
 import { CommandRegistry, createCommandRegistry } from "./commands/index.js";
 import { PlanManager } from "./planning/index.js";
+import { PlanStateMachine } from "./planning/state-machine.js";
 import { createToolResultPruner } from "./compaction/tool-result-pruner.js";
 import { createStateLoaderTransform } from "./compaction/state-loader.js";
 import { resolveCompactionConfig, type CompactionConfig } from "./compaction/index.js";
@@ -223,6 +224,8 @@ export async function createDesignSession(
   // assembly time. The single instance threaded through both paths
   // resolves the ordering without duplication.
   const transcriptMarkerEmitter = new TranscriptMarkerEmitter();
+  const planStateMachine = new PlanStateMachine(transcriptMarkerEmitter);
+  planManager.attachStateMachine(planStateMachine);
 
   // --- Assemble tools ---
   // Collect disabled tools from ALL servers
@@ -402,6 +405,7 @@ export async function createDesignSession(
   // consumers (RPC, history sink, verbose writer, TUI callback) can
   // reach the SAME emitter instance via getTranscriptMarkerEmitter.
   setTranscriptMarkerEmitter(session, transcriptMarkerEmitter);
+  planManager.bindSession(session);
 
   // --- Subscribe InteractionHistory to the emitter (§4.7 Persistence 1) ---
   // Direct subscription — the history sink wraps each marker in the

@@ -18,6 +18,21 @@ export interface PlanEnterError {
 export type EnterPlanModeResult = Plan | PlanEnterError | null;
 export type PlanPermissionMode = "default" | "plan";
 
+interface PlanStateMachineLike {
+  getState(session: object): string | undefined;
+  setState(session: object, state: string): void;
+  getReplanCount(session: object): number;
+  setInitialPlanHash(session: object, hash: string): void;
+  planHash(bytes: Buffer): string;
+  emitPlanFileWritten(planFilePath: string, planHash: string, bytes: number): void;
+  transition(
+    session: object,
+    from: string,
+    to: string,
+    payload: Record<string, unknown>,
+  ): void;
+}
+
 export class PlanManager {
   private _inPlanMode = false;
   private _currentPlan: Plan | null = null;
@@ -26,6 +41,7 @@ export class PlanManager {
   private _sessionKey: object = this;
   private _permissionMode: PlanPermissionMode = "default";
   private _prePlanMode: PlanPermissionMode | null = null;
+  private _stateMachine: PlanStateMachineLike | null = null;
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
@@ -51,8 +67,20 @@ export class PlanManager {
     return this._permissionMode;
   }
 
+  get stateMachine(): PlanStateMachineLike | null {
+    return this._stateMachine;
+  }
+
+  get planState(): string | undefined {
+    return this._stateMachine?.getState(this._sessionKey);
+  }
+
   bindSession(session: object): void {
     this._sessionKey = session;
+  }
+
+  attachStateMachine(stateMachine: PlanStateMachineLike): void {
+    this._stateMachine = stateMachine;
   }
 
   capturePrePlanMode(): void {
@@ -225,6 +253,7 @@ export class PlanManager {
 
     this._currentPlan = plan;
     this.capturePrePlanMode();
+    this._stateMachine?.setState(this._sessionKey, "plan_drafting");
     this._emit({
       type: "plan_mode_entered",
       planId: plan.id,

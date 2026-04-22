@@ -170,31 +170,62 @@ export function createExitPlanModeTool(
           ts: new Date().toISOString(),
         });
         planSlugCache.delete(planManager.sessionKey);
+        const plan = planManager.exitPlanMode(false);
+        if (!plan) {
+          return ok({ status: "error", message: "Failed to exit plan mode." });
+        }
+        return ok({
+          status: "plan_abandoned",
+          plan_id: plan.id,
+          message: "Plan abandoned. You may proceed without a formal plan.",
+        });
       }
 
-      const plan = planManager.exitPlanMode(approved);
-
+      const plan = planManager.currentPlan;
       if (!plan) {
         return ok({ status: "error", message: "Failed to exit plan mode." });
       }
 
-      if (approved) {
+      const planText = planManager.readPlanFile() ?? "";
+      if (planText.trim().length === 0) {
         return ok({
-          status: "plan_approved",
-          plan_id: plan.id,
-          plan_file: plan.filePath,
-          summary: p.summary || "Plan approved. You may now execute the plan.",
-          message:
-            "Plan mode exited. You now have full tool access. " +
-            "Execute the plan step-by-step. Reference the plan file if needed: " +
-            plan.filePath,
+          status: "error",
+          message: "Plan file is empty; abandon or continue drafting",
         });
       }
 
+      const stateMachine = planManager.stateMachine;
+      if (!stateMachine) {
+        return ok({
+          status: "error",
+          message: "Plan state machine is not configured.",
+        });
+      }
+
+      const planBytes = Buffer.from(planText, "utf-8");
+      const planHash = stateMachine.planHash(planBytes);
+      stateMachine.setInitialPlanHash(planManager.sessionKey, planHash);
+      stateMachine.transition(
+        planManager.sessionKey,
+        "plan_drafting",
+        "plan_drafted",
+        {
+          plan: planText,
+          planHash,
+          planLengthChars: planText.length,
+          planSlug: plan.id,
+          planFilePath: plan.filePath,
+          replan_count: stateMachine.getReplanCount(planManager.sessionKey),
+        },
+      );
+      stateMachine.emitPlanFileWritten(plan.filePath, planHash, planBytes.length);
+
       return ok({
-        status: "plan_abandoned",
+        status: "plan_drafted",
         plan_id: plan.id,
-        message: "Plan abandoned. You may proceed without a formal plan.",
+        plan_file: plan.filePath,
+        summary: p.summary || "Plan drafted and ready for approval.",
+        message: "Plan drafted. Awaiting approval.",
       });
     },
   };
