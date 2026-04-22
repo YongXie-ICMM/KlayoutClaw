@@ -39,4 +39,5 @@ export const integrationFiles = [
 export const e2eFiles = [
   "tests/test-e2e.ts",
   "tests/test-phase2b-e2e.ts",
+  "tests/test-phase7-vc-cross-track.ts",
 ];
