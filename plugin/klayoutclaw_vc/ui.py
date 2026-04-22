@@ -5,10 +5,13 @@ only usable inside KLayout's embedded Python where ``pya`` exposes Qt.
 """
 from __future__ import annotations
 
+import atexit
+import json
 import datetime
 import os
 import sys
 import types
+from collections import OrderedDict
 from typing import Any, Optional
 
 try:  # KLayout runtime
@@ -20,6 +23,9 @@ except ImportError:  # pragma: no cover - plain Python import path
 _STATE_MODULE = "_klayoutclaw"
 _DIRTY_TEXT = "⬤dirty"
 _BULLET = "•"
+_THUMBNAIL_CACHE_LIMIT = 50
+_THUMBNAIL_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_ATEXIT_REGISTERED = False
 
 
 def _require_qt() -> None:
@@ -130,6 +136,124 @@ def _format_status(status: dict) -> tuple[str, str]:
             f"mode: {mode}",
         )
     return (f"VC: mode: {mode}", f"mode: {mode}")
+
+
+def _relative_time_label(ts_text: Optional[str]) -> str:
+    minutes = _minutes_ago(ts_text)
+    if minutes is None:
+        return "unknown"
+    return f"{minutes} min ago"
+
+
+def _truncate_message(message: str, limit: int = 50) -> str:
+    message = str(message)
+    if len(message) <= limit:
+        return message
+    return message[: limit - 1].rstrip() + "…"
+
+
+def _snapshot_layout_thumbnail(snapshot: dict):
+    from plugin.klayoutclaw_vc import serializer
+
+    layout = serializer.deserialize(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    )
+    return _render_layout_thumbnail(layout)
+
+
+def _render_layout_thumbnail(layout, *, size: int = 128):
+    image = pya.QImage(size, size, pya.QImage.Format_ARGB32)
+    image.fill(pya.QColor("#f8fafc"))
+
+    boxes = []
+    bounds = None
+    for top in layout.each_top_cell():
+        if not hasattr(top, "begin_shapes_rec"):
+            try:
+                top = layout.cell(int(top))
+            except Exception:
+                continue
+        for li in layout.layer_indexes():
+            iterator = top.begin_shapes_rec(li)
+            while not iterator.at_end():
+                try:
+                    box = iterator.shape().bbox()
+                except Exception:
+                    iterator.next()
+                    continue
+                iterator.next()
+                if box.empty():
+                    continue
+                rect = (int(box.left), int(box.bottom), int(box.right), int(box.top))
+                boxes.append(rect)
+                if bounds is None:
+                    bounds = list(rect)
+                else:
+                    bounds[0] = min(bounds[0], rect[0])
+                    bounds[1] = min(bounds[1], rect[1])
+                    bounds[2] = max(bounds[2], rect[2])
+                    bounds[3] = max(bounds[3], rect[3])
+
+    painter = pya.QPainter(image)
+    try:
+        painter.setRenderHint(pya.QPainter.Antialiasing, True)
+    except Exception:
+        pass
+    pen = pya.QPen(pya.QColor("#0f172a"))
+    try:
+        pen.setWidth(2)
+    except Exception:
+        pass
+    painter.setPen(pen)
+    painter.setBrush(pya.QBrush(pya.QColor("#93c5fd")))
+
+    if bounds is not None:
+        min_x, min_y, max_x, max_y = bounds
+        width = max(1, max_x - min_x)
+        height = max(1, max_y - min_y)
+        pad = 8.0
+        scale = min((size - 2 * pad) / float(width), (size - 2 * pad) / float(height))
+        for left, bottom, right, top in boxes:
+            x1 = pad + (left - min_x) * scale
+            x2 = pad + (right - min_x) * scale
+            y1 = size - pad - (top - min_y) * scale
+            y2 = size - pad - (bottom - min_y) * scale
+            painter.drawRect(
+                int(round(x1)),
+                int(round(y1)),
+                max(1, int(round(x2 - x1))),
+                max(1, int(round(y2 - y1))),
+            )
+    painter.end()
+    return image
+
+
+def _cached_thumbnail_for_commit(handle, sha: str):
+    cached = _THUMBNAIL_CACHE.get(sha)
+    if cached is not None:
+        _THUMBNAIL_CACHE.move_to_end(sha)
+        return cached
+
+    snapshot = handle._load_snapshot(sha)
+    if not snapshot:
+        return None
+    pixmap = _snapshot_layout_thumbnail(snapshot)
+    _THUMBNAIL_CACHE[sha] = pixmap
+    while len(_THUMBNAIL_CACHE) > _THUMBNAIL_CACHE_LIMIT:
+        _THUMBNAIL_CACHE.popitem(last=False)
+    return pixmap
+
+
+def _safe_delete_qobject(obj) -> None:
+    if obj is None:
+        return
+    for name in ("hide", "close", "deleteLater"):
+        method = getattr(obj, name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
 
 
 class VCStatusChip:
@@ -315,15 +439,138 @@ class CheckpointDialog:
         self._error_label.setText(str(text))
         self._error_label.show()
 
+    def shutdown(self) -> None:
+        _safe_delete_qobject(self._dialog)
+
 
 class HistoryDockPanel:
-    """Task 6.3 implementation lands later; placeholder for composition."""
+    """Dockable VC history browser with lazy thumbnail loading."""
 
     def __init__(self, controller):
         self.controller = controller
+        self._dock = pya.QDockWidget("VC History", controller.main_window)
+        self._dock.setObjectName("klayoutclaw-vc-history-dock")
+        self._tree = pya.QTreeWidget()
+        self._tree.setColumnCount(4)
+        self._tree.setHeaderLabels(["When", "Message", "Tags", "Preview"])
+        self._tree.setRootIsDecorated(False)
+        self._tree.setUniformRowHeights(True)
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setColumnWidth(0, 90)
+        self._tree.setColumnWidth(1, 240)
+        self._tree.setColumnWidth(2, 120)
+        self._tree.setColumnWidth(3, 96)
+        self._dock.setWidget(self._tree)
+        self._rows: list[dict] = []
+        self._visible = False
+        try:
+            controller.main_window.addDockWidget(
+                pya.Qt.RightDockWidgetArea, self._dock,
+            )
+        except Exception:
+            self._dock.setFloating(True)
+        self._dock.hide()
+
+    @property
+    def dock(self):
+        return self._dock
 
     def refresh(self) -> None:
+        from tools import vc_mcp_handlers as vc_handlers
+
+        view = _current_view(self.controller.main_window)
+        if view is None:
+            self._tree.clear()
+            self._rows = []
+            return None
+
+        _ensure_vc_handle_for_view(view)
+        layout = _layout_for_view(view)
+        gds_path = _gds_path_for_view(view)
+        result = vc_handlers.vc_history({}, layout=layout, gds_path_hint=gds_path)
+        commits = result.get("commits", []) if isinstance(result, dict) else []
+
+        self._tree.clear()
+        self._rows = []
+        for commit in commits:
+            tags = list(commit.get("tags") or [])
+            item = pya.QTreeWidgetItem([
+                _relative_time_label(commit.get("ts")),
+                _truncate_message(commit.get("message", "")),
+                ", ".join(tags),
+                "",
+            ])
+            item.setToolTip(1, str(commit.get("message", "")))
+            item.setToolTip(2, ", ".join(tags))
+            self._tree.addTopLevelItem(item)
+            self._rows.append({
+                "item": item,
+                "commit": commit,
+                "thumbnail_loaded": False,
+            })
+
+        if self.is_visible():
+            self.load_visible_thumbnails()
         return None
+
+    def toggle(self) -> None:
+        if self.is_visible():
+            self._visible = False
+            self._dock.hide()
+            return
+        self.refresh()
+        self._visible = True
+        self._dock.show()
+        self._dock.raise_()
+        self.load_visible_thumbnails()
+
+    def is_visible(self) -> bool:
+        return bool(self._visible)
+
+    def row_count(self) -> int:
+        return len(self._rows)
+
+    def row_data(self, index: int) -> dict:
+        row = self._rows[index]
+        commit = row["commit"]
+        return {
+            "sha": commit.get("sha"),
+            "message": commit.get("message"),
+            "tags": list(commit.get("tags") or []),
+            "timestamp": _relative_time_label(commit.get("ts")),
+            "thumbnail_loaded": bool(row["thumbnail_loaded"]),
+        }
+
+    def load_visible_thumbnails(self) -> None:
+        if self._rows:
+            self.ensure_thumbnail_for_row(0)
+
+    def ensure_thumbnail_for_row(self, index: int) -> None:
+        from tools import vc_mcp_handlers as vc_handlers
+
+        if index < 0 or index >= len(self._rows):
+            return
+        row = self._rows[index]
+        if row["thumbnail_loaded"]:
+            return
+
+        view = _current_view(self.controller.main_window)
+        if view is None:
+            return
+        layout = _layout_for_view(view)
+        gds_path = _gds_path_for_view(view)
+        handle = vc_handlers._get_handle(layout, gds_path)
+        if handle is None:
+            return
+
+        image = _cached_thumbnail_for_commit(handle, row["commit"]["sha"])
+        if image is not None:
+            row["item"].setIcon(3, pya.QIcon(pya.QPixmap.fromImage(image)))
+        row["thumbnail_loaded"] = True
+
+    def shutdown(self) -> None:
+        self._rows = []
+        _safe_delete_qobject(self._dock)
 
 
 class ContextMenus:
@@ -357,6 +604,10 @@ class VCUIController:
             pya.QKeySequence("Ctrl+Shift+K"), main_window,
         )
         self.checkpoint_shortcut.activated(self.show_checkpoint_dialog)
+        self.history_shortcut = pya.QShortcut(
+            pya.QKeySequence("Ctrl+Shift+H"), main_window,
+        )
+        self.history_shortcut.activated(self.toggle_history_dock)
         self._connected_views: set[int] = set()
         self._connect_main_window()
         self._attach_current_view()
@@ -367,6 +618,22 @@ class VCUIController:
 
     def show_checkpoint_dialog(self) -> None:
         self.checkpoint_dialog.open()
+
+    def toggle_history_dock(self) -> None:
+        self.history_dock.toggle()
+
+    def shutdown(self) -> None:
+        _THUMBNAIL_CACHE.clear()
+        try:
+            self.status_chip._poll_timer.stop()
+        except Exception:
+            pass
+        self._connected_views.clear()
+        self.checkpoint_dialog.shutdown()
+        self.history_dock.shutdown()
+        _safe_delete_qobject(self.checkpoint_shortcut)
+        _safe_delete_qobject(self.history_shortcut)
+        _safe_delete_qobject(self.status_chip.widget)
 
     def _connect_main_window(self) -> None:
         try:
@@ -412,6 +679,16 @@ class VCUIController:
         self.refresh()
 
 
+def _shutdown_installed_controller() -> None:
+    state = sys.modules.get(_STATE_MODULE)
+    controller = getattr(state, "vc_ui_controller", None) if state is not None else None
+    if isinstance(controller, VCUIController):
+        try:
+            controller.shutdown()
+        except Exception:
+            pass
+
+
 def install_ui(*, main_window=None, poll_interval_ms: int = 5000) -> VCUIController:
     """Install or return the singleton VC UI controller for the session."""
     _require_qt()
@@ -431,4 +708,8 @@ def install_ui(*, main_window=None, poll_interval_ms: int = 5000) -> VCUIControl
 
     controller = VCUIController(main_window, poll_interval_ms=poll_interval_ms)
     state.vc_ui_controller = controller
+    global _ATEXIT_REGISTERED
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_shutdown_installed_controller)
+        _ATEXIT_REGISTERED = True
     return controller

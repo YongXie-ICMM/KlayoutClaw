@@ -51,6 +51,14 @@ def _create_disk_backed_repo(tmp_path: Path) -> Path:
     return gds_path
 
 
+def _append_checkpoint(gds_path: Path, message: str, *, extra_box: bool = False) -> None:
+    layout = _make_layout(extra_box=extra_box)
+    handle = vc_repo.init(str(gds_path))
+    result = handle.checkpoint(layout, message)
+    assert result.get("ok") is True, result
+    handle.invalidate()
+
+
 def _run_klayout_script(body: str) -> dict:
     if not KLAYOUT_BIN.exists():
         pytest.skip(f"KLayout binary not found at {KLAYOUT_BIN}")
@@ -66,7 +74,24 @@ def _run_klayout_script(body: str) -> dict:
 
         import pya
 
-        {textwrap.indent(textwrap.dedent(body), '        ')}
+        _SCRIPT_OK = False
+        try:
+        {textwrap.indent(textwrap.dedent(body), '            ')}
+            _SCRIPT_OK = True
+        finally:
+            _controller = globals().get("controller")
+            if _controller is not None:
+                try:
+                    _controller.shutdown()
+                    pya.QApplication.processEvents()
+                except Exception:
+                    pass
+            if _SCRIPT_OK:
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                finally:
+                    os._exit(0)
         """
     )
 
@@ -234,3 +259,53 @@ def test_checkpoint_dialog_hotkey_parses_tags_and_submits(tmp_path):
     assert result["latest_commit"]["message"] == "checkpoint from dialog"
     assert result["latest_commit"]["tags"] == ["alpha", "beta", "gamma"]
     assert "clean" in result["chip_text"]
+
+
+def test_history_dock_hotkey_populates_rows_and_defers_older_thumbnails(tmp_path):
+    gds_path = _create_disk_backed_repo(tmp_path)
+    _append_checkpoint(gds_path, "older checkpoint", extra_box=True)
+
+    result = _run_klayout_script(
+        f"""
+        from plugin.klayoutclaw_vc import ui as vc_ui
+
+        mw = pya.Application.instance().main_window()
+        controller = vc_ui.install_ui(main_window=mw, poll_interval_ms=25)
+        mw.load_layout({str(gds_path)!r}, pya.LoadLayoutOptions(), "", 1)
+        pya.QApplication.processEvents()
+        controller.refresh()
+
+        controller.checkpoint_shortcut.emit_activated()
+        pya.QApplication.processEvents()
+        controller.checkpoint_dialog.message_edit.setText("panel commit")
+        controller.checkpoint_dialog.tags_edit.setText("ui, latest")
+        controller.checkpoint_dialog.submit()
+        pya.QApplication.processEvents()
+
+        controller.history_shortcut.emit_activated()
+        pya.QApplication.processEvents()
+        panel = controller.history_dock
+
+        top_row = panel.row_data(0)
+        older_before = panel.row_data(1)
+        panel.ensure_thumbnail_for_row(1)
+        pya.QApplication.processEvents()
+        older_after = panel.row_data(1)
+
+        print("RESULT_JSON=" + json.dumps({{
+            "visible": panel.is_visible(),
+            "row_count": panel.row_count(),
+            "top_row": top_row,
+            "older_before": older_before,
+            "older_after": older_after,
+        }}))
+        """
+    )
+
+    assert result["visible"] is True
+    assert result["row_count"] >= 3
+    assert result["top_row"]["message"] == "panel commit"
+    assert sorted(result["top_row"]["tags"]) == ["latest", "ui"]
+    assert result["top_row"]["thumbnail_loaded"] is True
+    assert result["older_before"]["thumbnail_loaded"] is False
+    assert result["older_after"]["thumbnail_loaded"] is True
