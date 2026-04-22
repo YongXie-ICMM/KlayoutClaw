@@ -35,7 +35,11 @@ describe("config", () => {
   it("returns default config with thinkingLevel=high", () => {
     const config = loadConfig();
     expect(config).toBeDefined();
-    expect(config.agent.thinkingLevel).toBe("medium");
+    // Default is "high" per src/config.ts:170 (QLAYBOT_THINKING env var
+    // fallback). A prior revision swapped the assertion to "medium"
+    // without updating the test name or the default; this restores
+    // consistency with the test name and src/config.ts.
+    expect(config.agent.thinkingLevel).toBe("high");
   });
 
   it("parses model references correctly", () => {
