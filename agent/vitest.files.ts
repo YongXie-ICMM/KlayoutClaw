@@ -27,6 +27,7 @@ export const unitFiles = [
   "tests/test-blocker-classifier.ts",
   "tests/test-phase5-vc-mcp.ts",
   "tests/test-prompts.ts",
+  "tests/test-t16-graceful-degradation.ts",
 ];
 
 export const integrationFiles = [
