@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Type } from "@sinclair/typebox";
@@ -608,5 +608,94 @@ describe("terminal marker ordering (T4)", () => {
 
       expect(terminalCount).toBe(1);
     }
+  });
+});
+
+describe("planHash integrity chain (T6)", () => {
+  it("keeps the same hash across drafted, file_written, and executing markers", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    planManager.enterPlanMode("Integrity baseline");
+    planManager.writePlanContent("1. Keep hashes aligned");
+
+    const promise = createExitPlanModeTool(planManager).execute("tc-hash-ok", {
+      approved: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    await promise;
+
+    const drafted = markers.find((marker) => marker.type === "plan_drafted");
+    const fileWritten = markers.find((marker) => marker.type === "plan_file_written");
+    const executing = markers.find((marker) => marker.type === "plan_executing");
+
+    expect(drafted.planHash).toBe(fileWritten.planHash);
+    expect(fileWritten.planHash).toBe(executing.planHash);
+  });
+
+  it("abandons the turn when the plan bytes are tampered before execution starts", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const {
+      TranscriptMarkerEmitter,
+      setTranscriptMarkerEmitter,
+    } = await import("../src/events/marker-emitter.js");
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    planManager.setApprovalMode("interactive");
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+    setTranscriptMarkerEmitter(planManager.sessionKey, emitter);
+    planManager.attachStateMachine(new PlanStateMachine(emitter));
+    const plan = planManager.enterPlanMode("Integrity violation");
+    planManager.writePlanContent("1. Original plan bytes");
+
+    const promise = createExitPlanModeTool(planManager).execute("tc-hash-bad", {
+      approved: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    writeFileSync(plan!.filePath, "tampered plan bytes", "utf-8");
+    resolvePlanApproval(planManager.sessionKey, { action: "approve_execute" });
+    const result = await promise;
+    const body = parseTextPayload(result);
+
+    expect(body.status).toBe("plan_abandoned");
+    expect(markers.map((marker) => marker.type)).toEqual([
+      "plan_drafted",
+      "plan_file_written",
+      "plan_approved",
+      "plan_rejected",
+    ]);
+    expect(markers[3]).toMatchObject({
+      action: "abandon",
+      feedback: "plan integrity violation",
+    });
   });
 });

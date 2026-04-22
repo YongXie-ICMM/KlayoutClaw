@@ -12,6 +12,7 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import * as fs from "node:fs";
 import { getTranscriptMarkerEmitter } from "../events/marker-emitter.js";
 import type {
   EnterPlanModeResult,
@@ -219,7 +220,32 @@ export function createExitPlanModeTool(
           replan_count: stateMachine.getReplanCount(planManager.sessionKey),
         },
       );
-      stateMachine.emitPlanFileWritten(plan.filePath, planHash, planBytes.length);
+      const writtenBytes = fs.readFileSync(plan.filePath);
+      const writtenHash = stateMachine.planHash(writtenBytes);
+      stateMachine.emitPlanFileWritten(plan.filePath, writtenHash, writtenBytes.length);
+
+      const integrityViolation = (): AgentToolResult<unknown> => {
+        stateMachine.transition(
+          planManager.sessionKey,
+          "plan_drafted",
+          "plan_rejected",
+          {
+            action: "abandon",
+            feedback: "plan integrity violation",
+          },
+        );
+        planManager.closePlanMode("abandoned");
+        return ok({
+          status: "plan_abandoned",
+          plan_id: plan.id,
+          reason: "plan_integrity_violation",
+          message: "Plan abandoned due to a plan integrity violation.",
+        });
+      };
+
+      if (writtenHash !== planHash) {
+        return integrityViolation();
+      }
 
       if (planManager.approvalMode === "interactive") {
         try {
@@ -231,12 +257,17 @@ export function createExitPlanModeTool(
               "plan_approved",
               { auto: false, executeAfterApproval: true },
             );
+            const executingBytes = fs.readFileSync(plan.filePath);
+            const executingHash = stateMachine.planHash(executingBytes);
+            if (executingHash !== planHash) {
+              return integrityViolation();
+            }
             planManager.closePlanMode("approved");
             stateMachine.transition(
               planManager.sessionKey,
               "plan_approved",
               "plan_executing",
-              { planHash },
+              { planHash: executingHash },
             );
             stateMachine.transition(
               planManager.sessionKey,
@@ -337,12 +368,17 @@ export function createExitPlanModeTool(
           "plan_approved",
           { auto: true, executeAfterApproval: true },
         );
+        const executingBytes = fs.readFileSync(plan.filePath);
+        const executingHash = stateMachine.planHash(executingBytes);
+        if (executingHash !== planHash) {
+          return integrityViolation();
+        }
         planManager.closePlanMode("approved");
         stateMachine.transition(
           planManager.sessionKey,
           "plan_approved",
           "plan_executing",
-          { planHash },
+          { planHash: executingHash },
         );
         stateMachine.transition(
           planManager.sessionKey,
