@@ -203,10 +203,117 @@ class VCStatusChip:
 
 
 class CheckpointDialog:
-    """Task 6.2 implementation lands later; placeholder for composition."""
+    """Modal checkpoint dialog with required message and optional tags."""
 
     def __init__(self, controller):
         self.controller = controller
+        self._dialog = pya.QDialog(controller.main_window)
+        self._dialog.setWindowTitle("Create VC Checkpoint")
+        self._dialog.setModal(True)
+        self._dialog.resize(420, 150)
+
+        root = pya.QVBoxLayout(self._dialog)
+        form = pya.QFormLayout()
+        self.message_edit = pya.QLineEdit()
+        self.tags_edit = pya.QLineEdit()
+        form.addRow("Message", self.message_edit)
+        form.addRow("Tags", self.tags_edit)
+        root.addLayout(form)
+
+        self._error_label = pya.QLabel("")
+        self._error_label.setObjectName("klayoutclaw-vc-checkpoint-error")
+        self._error_label.setStyleSheet(
+            "QLabel#klayoutclaw-vc-checkpoint-error { color: #a61d24; padding-top: 4px; }"
+        )
+        self._error_label.hide()
+        root.addWidget(self._error_label)
+
+        button_row = pya.QHBoxLayout()
+        button_row.addStretch(1)
+        self.cancel_button = pya.QPushButton("Cancel")
+        self.submit_button = pya.QPushButton("Checkpoint")
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.submit_button)
+        root.addLayout(button_row)
+
+        self.cancel_button.clicked(self._dialog.reject)
+        self.submit_button.clicked(self.submit)
+        try:
+            self.message_edit.returnPressed(self.submit)
+        except Exception:
+            pass
+
+    @property
+    def dialog(self):
+        return self._dialog
+
+    def open(self) -> None:
+        self._clear_error()
+        self._dialog.show()
+        self._dialog.raise_()
+        self._dialog.activateWindow()
+        self.message_edit.setFocus()
+
+    def is_open(self) -> bool:
+        return bool(self._dialog.isVisible())
+
+    def error_text(self) -> str:
+        return str(_callable_or_value(self._error_label, "text"))
+
+    @staticmethod
+    def parse_tags(text: str) -> list[str]:
+        return [part.strip() for part in str(text).split(",") if part.strip()]
+
+    def submit(self) -> dict:
+        message = str(_callable_or_value(self.message_edit, "text")).strip()
+        tags_text = str(_callable_or_value(self.tags_edit, "text"))
+        tags = self.parse_tags(tags_text)
+
+        if not message:
+            self._show_error("Checkpoint message is required.")
+            return {"ok": False, "reason": "message required"}
+
+        view = _current_view(self.controller.main_window)
+        if view is None:
+            self._show_error("No active layout view.")
+            return {"ok": False, "reason": "no active view"}
+
+        _ensure_vc_handle_for_view(view)
+        layout = _layout_for_view(view)
+        gds_path = _gds_path_for_view(view)
+
+        from tools import vc_mcp_handlers as vc_handlers
+
+        result = vc_handlers.vc_checkpoint(
+            {"message": message, "tags": tags},
+            layout=layout,
+            gds_path_hint=gds_path,
+        )
+        if not isinstance(result, dict) or result.get("ok") is False:
+            reason = (
+                result.get("reason", "checkpoint failed")
+                if isinstance(result, dict) else
+                "checkpoint failed"
+            )
+            self._show_error(str(reason))
+            return result if isinstance(result, dict) else {"ok": False, "reason": reason}
+
+        self._clear_error()
+        self._dialog.accept()
+        self.controller.refresh()
+        try:
+            self.controller.history_dock.refresh()
+        except Exception:
+            pass
+        return result
+
+    def _clear_error(self) -> None:
+        self._error_label.setText("")
+        self._error_label.hide()
+
+    def _show_error(self, text: str) -> None:
+        self._error_label.setText(str(text))
+        self._error_label.show()
 
 
 class HistoryDockPanel:
@@ -214,6 +321,9 @@ class HistoryDockPanel:
 
     def __init__(self, controller):
         self.controller = controller
+
+    def refresh(self) -> None:
+        return None
 
 
 class ContextMenus:
@@ -243,6 +353,10 @@ class VCUIController:
         self.history_dock = HistoryDockPanel(self)
         self.context_menus = ContextMenus(self)
         self.save_integration = SaveIntegration(self)
+        self.checkpoint_shortcut = pya.QShortcut(
+            pya.QKeySequence("Ctrl+Shift+K"), main_window,
+        )
+        self.checkpoint_shortcut.activated(self.show_checkpoint_dialog)
         self._connected_views: set[int] = set()
         self._connect_main_window()
         self._attach_current_view()
@@ -250,6 +364,9 @@ class VCUIController:
 
     def refresh(self):
         return self.status_chip.refresh()
+
+    def show_checkpoint_dialog(self) -> None:
+        self.checkpoint_dialog.open()
 
     def _connect_main_window(self) -> None:
         try:

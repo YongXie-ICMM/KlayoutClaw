@@ -175,3 +175,62 @@ def test_status_chip_tracks_dirty_and_checkpoint_state(tmp_path):
     assert "clean" in result["clean_text"]
     assert result["checkpoint_result"]["ok"] is True
     assert result["registry_mode"] == "disk"
+
+
+def test_checkpoint_dialog_hotkey_parses_tags_and_submits(tmp_path):
+    gds_path = _create_disk_backed_repo(tmp_path)
+
+    result = _run_klayout_script(
+        f"""
+        from plugin.klayoutclaw_vc import ui as vc_ui
+        import tools.vc_mcp_handlers as vc_handlers
+
+        mw = pya.Application.instance().main_window()
+        controller = vc_ui.install_ui(main_window=mw, poll_interval_ms=25)
+        mw.load_layout({str(gds_path)!r}, pya.LoadLayoutOptions(), "", 1)
+        pya.QApplication.processEvents()
+        controller.refresh()
+
+        view = mw.current_view()
+        layout = view.active_cellview().layout()
+
+        controller.checkpoint_shortcut.emit_activated()
+        pya.QApplication.processEvents()
+        dialog = controller.checkpoint_dialog
+
+        opened = dialog.is_open()
+        dialog.message_edit.setText("")
+        dialog.tags_edit.setText("alpha, beta , , gamma")
+        dialog.submit()
+        pya.QApplication.processEvents()
+        blank_error = dialog.error_text()
+        still_open_after_blank = dialog.is_open()
+
+        dialog.message_edit.setText("checkpoint from dialog")
+        dialog.submit()
+        pya.QApplication.processEvents()
+
+        history = vc_handlers.vc_history(
+            {{}},
+            layout=layout,
+            gds_path_hint={str(gds_path)!r},
+        )
+
+        print("RESULT_JSON=" + json.dumps({{
+            "opened": opened,
+            "blank_error": blank_error,
+            "still_open_after_blank": still_open_after_blank,
+            "closed_after_submit": not dialog.is_open(),
+            "latest_commit": history["commits"][0],
+            "chip_text": controller.status_chip.text(),
+        }}))
+        """
+    )
+
+    assert result["opened"] is True
+    assert "required" in result["blank_error"].lower()
+    assert result["still_open_after_blank"] is True
+    assert result["closed_after_submit"] is True
+    assert result["latest_commit"]["message"] == "checkpoint from dialog"
+    assert result["latest_commit"]["tags"] == ["alpha", "beta", "gamma"]
+    assert "clean" in result["chip_text"]
