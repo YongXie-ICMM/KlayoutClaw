@@ -257,7 +257,7 @@ export function assembleTools(opts: any): any {
 
     // Filter out disabled tools (base tools are never filtered)
     if (opts.disabledTools && opts.disabledTools.length > 0) {
-      const baseNames = new Set(['read', 'bash', 'edit', 'write']);
+      const baseNames = new Set(['read', 'bash', 'edit', 'write', 'thinking']);
       for (const name of Object.keys(toolMap)) {
         if (!baseNames.has(name) && opts.disabledTools.includes(name)) {
           delete toolMap[name];
