@@ -148,6 +148,171 @@ describe("ThinkingIndicator", () => {
 });
 
 // ============================================================
+// Task 1.5 / T38 — ThinkingIndicator `source` prop
+// ============================================================
+//
+// Source of truth:
+//  - docs/superpowers/specs/2026-04-19-qlaybot-0.4.4-design.md §3.2 TH-6,
+//    TH-9 (source field distinguishable).
+//  - docs/superpowers/plans/2026-04-21-qlaybot-0.4.4.md Task 1.5 Step 1 (T38).
+//
+// Backwards-compat (v0.4.3): when `source` is omitted it MUST default to
+// "native" so existing call sites (and the "ThinkingIndicator" block above)
+// keep producing the same output.
+
+describe("ThinkingIndicator source prop (T38)", () => {
+  it("empty chunks + any source → null (no output)", () => {
+    const text = renderText(
+      React.createElement(ThinkingIndicator, {
+        chunks: [],
+        isActive: true,
+        source: "tool",
+      } as any),
+    );
+    expect(text.trim()).toBe("");
+  });
+
+  it("renders the same text content for source='tool' as for source='native'", () => {
+    // The content text is identical; only the theme color should change.
+    const tool = renderText(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["Deciding between A and B"],
+        isActive: false,
+        source: "tool",
+      } as any),
+    );
+    const native = renderText(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["Deciding between A and B"],
+        isActive: false,
+        source: "native",
+      } as any),
+    );
+    expect(tool).toContain("Deciding between A and B");
+    expect(native).toContain("Deciding between A and B");
+  });
+
+  it("source='tool' and source='native' produce DIFFERENT raw frames (theme-color swap, TH-6/TH-9)", () => {
+    // The ANSI-stripped text is equal; the raw (unstripped) frames differ
+    // because only the chalk theme color changes. This is a non-byte-equal
+    // assertion on the raw frame to avoid locking the test to a specific
+    // hex — any color swap satisfies it.
+    const tool = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["source swap probe"],
+        isActive: false,
+        source: "tool",
+      } as any),
+    );
+    const native = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["source swap probe"],
+        isActive: false,
+        source: "native",
+      } as any),
+    );
+    // Both render the same text content (sanity).
+    expect(tool.length).toBeGreaterThan(0);
+    expect(native.length).toBeGreaterThan(0);
+    // Raw bytes must differ — the only diff is the chalk color wrapper.
+    expect(tool).not.toBe(native);
+  });
+
+  it(">10 lines with source='tool' still shows `... N lines hidden ...` with correct N", () => {
+    const lines = Array.from({ length: 25 }, (_, i) =>
+      i < 15 ? `Early_${i + 1}` : `Late_${i + 1}`,
+    );
+    const text = renderText(
+      React.createElement(ThinkingIndicator, {
+        chunks: [lines.join("\n")],
+        isActive: false,
+        source: "tool",
+      } as any),
+    );
+    expect(text).toMatch(/15 lines? hidden/i);
+    expect(text).toContain("Late_25");
+    expect(text).not.toContain("Early_1\n");
+  });
+
+  it("isActive=true with source='tool' renders a spinner AND the thinking label", () => {
+    const text = renderText(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["active probe"],
+        isActive: true,
+        source: "tool",
+      } as any),
+    );
+    // The existing component's label is " thinking" (leading space from the
+    // current implementation) — we match the canonical substring "thinking".
+    expect(text).toContain("thinking");
+    expect(text).toContain("active probe");
+  });
+
+  it("isActive=false with source='tool' renders the content but the raw frame is smaller (no spinner characters)", () => {
+    const activeRaw = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["spinner-gate probe"],
+        isActive: true,
+        source: "tool",
+      } as any),
+    );
+    const idleRaw = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["spinner-gate probe"],
+        isActive: false,
+        source: "tool",
+      } as any),
+    );
+    // Both contain the content.
+    expect(stripAnsi(activeRaw)).toContain("spinner-gate probe");
+    expect(stripAnsi(idleRaw)).toContain("spinner-gate probe");
+    // Active frame is not byte-identical to idle — the Spinner adds at
+    // least one rendered glyph. We do NOT assert on the specific spinner
+    // character because @inkjs/ui may pick different ones; we only assert
+    // the two frames differ.
+    expect(activeRaw).not.toBe(idleRaw);
+  });
+
+  it("source prop defaults to 'native' when omitted (v0.4.3 backwards compat)", () => {
+    // Render with and without source — omitted must render identical to
+    // source:"native".
+    const omittedRaw = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["backcompat probe"],
+        isActive: false,
+      } as any),
+    );
+    const nativeRaw = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["backcompat probe"],
+        isActive: false,
+        source: "native",
+      } as any),
+    );
+    expect(omittedRaw).toBe(nativeRaw);
+  });
+
+  it("source='inline' renders cleanly without crashing (TH-9 reserves all three sources — review item #9)", () => {
+    // TH-9 reserves `source: "tool" | "native" | "inline"`. v0.4.4 does not
+    // ship a producer for "inline" but the prop must be accepted without
+    // throwing and render the content. We allow the theme color to match
+    // either "native" or "tool" — the Executor picks — we just assert
+    // no-crash + non-null frame + content visible.
+    const raw = renderRaw(
+      React.createElement(ThinkingIndicator, {
+        chunks: ["inline-source probe"],
+        isActive: false,
+        source: "inline",
+      } as any),
+    );
+    expect(raw).toBeDefined();
+    expect(raw.length).toBeGreaterThan(0);
+    const text = stripAnsi(raw);
+    expect(text).toContain("inline-source probe");
+  });
+});
+
+// ============================================================
 // StreamingBar
 // ============================================================
 

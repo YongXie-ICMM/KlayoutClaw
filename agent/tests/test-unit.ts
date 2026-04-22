@@ -1352,3 +1352,626 @@ describe("history — transcript_marker envelope", () => {
     }
   });
 });
+
+// ============================================================
+// Task 1.1 / 1.6 — createThinkingTool factory (TH-1/2/3/14, T29)
+// ============================================================
+//
+// Source of truth:
+//  - docs/superpowers/specs/2026-04-19-qlaybot-0.4.4-design.md §3.2 (TH-1,
+//    TH-2, TH-3, TH-8, TH-11, TH-14), §3.3 interface.
+//  - docs/superpowers/plans/2026-04-21-qlaybot-0.4.4.md Task 1.1 Step 1,
+//    Task 1.6 T29(a–e).
+//
+// All RED until the Executor lands `agent/src/tools/thinking.ts`.
+
+describe("thinking tool factory (Task 1.1 / TH-1/2/3/14)", () => {
+  it("exposes a tool whose name is exactly 'thinking' (lowercase, no prefix — TH-1)", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const tool = createThinkingTool(emitter);
+    expect(tool.name).toBe("thinking");
+  });
+
+  it("description is a non-empty string containing the §3.3 anchors 'side-effect-free' and 'scratchpad'", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const tool = createThinkingTool(emitter);
+    expect(typeof tool.description).toBe("string");
+    const desc = tool.description as string;
+    expect(desc.length).toBeGreaterThan(0);
+    expect(desc).toContain("side-effect-free");
+    expect(desc).toContain("scratchpad");
+  });
+
+  it("schema is a TypeBox object with exactly one required string property `thought` (minLength 1), additionalProperties:false (TH-2, TH-14)", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const tool = createThinkingTool(emitter);
+    const schema: any = tool.parameters;
+    expect(schema).toBeDefined();
+    expect(schema.type).toBe("object");
+    expect(schema.additionalProperties).toBe(false);
+    expect(Array.isArray(schema.required)).toBe(true);
+    expect(schema.required).toEqual(["thought"]);
+
+    // Properties: exactly {thought} — nothing else.
+    const props = schema.properties;
+    expect(props).toBeDefined();
+    expect(Object.keys(props).sort()).toEqual(["thought"]);
+
+    expect(props.thought.type).toBe("string");
+    expect(props.thought.minLength).toBe(1);
+  });
+
+  it("execute synchronously emits exactly ONE think_recorded marker with the required shape (TH-8)", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const received: unknown[] = [];
+    emitter.on("marker", (m) => received.push(m));
+    const tool = createThinkingTool(emitter);
+
+    await tool.execute("tcid-1", { thought: "hello" });
+
+    expect(received.length).toBe(1);
+    const m = received[0] as any;
+    expect(m.type).toBe("think_recorded");
+    expect(m.source).toBe("tool");
+    expect(m.thought).toBe("hello");
+    expect(typeof m.ts).toBe("string");
+    expect(m.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("execute returns the §3.3 echo contract: content[{type:'text', text:JSON.stringify({ok:true,thought})}] (TH-3)", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const tool = createThinkingTool(emitter);
+    const result = await tool.execute("tcid-2", { thought: "hello" });
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(result.content.length).toBe(1);
+    const first = result.content[0] as { type: string; text: string };
+    expect(first.type).toBe("text");
+    const parsed = JSON.parse(first.text) as {
+      ok: boolean;
+      thought: string;
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.thought).toBe("hello");
+    // details is present (AgentToolResult shape); we don't enforce its
+    // exact shape beyond "non-throwing access".
+    expect(result.details).toBeDefined();
+  });
+
+  it("TH-11 byte-equality: a `thought` containing literal `<think>…</think>` is echoed verbatim", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const tool = createThinkingTool(emitter);
+    const thought = "<think>reasoning</think>";
+    const result = await tool.execute("tcid-3", { thought });
+    const first = result.content[0] as { type: string; text: string };
+    const parsed = JSON.parse(first.text) as { thought: string };
+    expect(parsed.thought).toBe(thought);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TH-3 side-effect-free coverage (review item #5 + #7)
+//
+// TH-3 says the tool MUST NOT write files, call MCP tools, spawn subagents,
+// mutate session state, or produce any UI beyond the transcript marker.
+// These tests cover that explicitly — not by peeking at locked emitter
+// internals (G1 surface) but by observing side-effect surfaces directly.
+// ---------------------------------------------------------------------------
+
+describe("thinking tool side-effect-free contract (TH-3 — review item #5)", () => {
+  it("TH-3 / fs: tool.execute does not write files (static source probe + runtime sandbox dir snapshot)", async () => {
+    // ESM limitation: `vi.spyOn(fs, "writeFileSync")` fails with
+    // "Cannot spy on export …; Module namespace is not configurable in ESM."
+    // The ESM module namespace bindings are read-only, so we cannot spy
+    // on them at runtime.
+    //
+    // Round-4 fix (Option A): two independent checks that don't need
+    // module-namespace spies.
+    //   (a) Static: read src/tools/thinking.ts and assert it does not
+    //       import any fs module. A tool that statically has no fs
+    //       binding cannot call one.
+    //   (b) Runtime: snapshot a sandbox tmpdir before/after execute()
+    //       (with process.cwd() redirected into it so any relative-path
+    //       fs write would land there). Nothing new must appear.
+    const { mkdtempSync, readdirSync } = await import("fs");
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    // (a) Static source probe — the impl must not import fs at all.
+    const thinkingSrcPath = resolve(
+      __dirname,
+      "..",
+      "src",
+      "tools",
+      "thinking.ts",
+    );
+    const src = readFileSync(thinkingSrcPath, "utf-8");
+    expect(
+      src,
+      "TH-3 / fs static: src/tools/thinking.ts must not import 'fs'",
+    ).not.toMatch(/from\s+["']fs["']/);
+    expect(
+      src,
+      "TH-3 / fs static: src/tools/thinking.ts must not import 'fs/promises'",
+    ).not.toMatch(/from\s+["']fs\/promises["']/);
+    expect(
+      src,
+      "TH-3 / fs static: src/tools/thinking.ts must not `require('fs')`",
+    ).not.toMatch(/require\s*\(\s*["']fs["']\s*\)/);
+    expect(
+      src,
+      "TH-3 / fs static: src/tools/thinking.ts must not `require('fs/promises')`",
+    ).not.toMatch(/require\s*\(\s*["']fs\/promises["']\s*\)/);
+
+    // (b) Runtime sandbox — redirect cwd into an empty tmpdir, run
+    // execute(), and verify the tmpdir is still empty afterwards.
+    const sandbox = mkdtempSync(join(tmpdir(), "qlaybot-th3-fs-"));
+    const before = readdirSync(sandbox);
+    const origCwd = process.cwd();
+    try {
+      const emitter = new TranscriptMarkerEmitter();
+      const tool = createThinkingTool(emitter);
+      process.chdir(sandbox);
+      try {
+        await tool.execute("tcid-fs-1", { thought: "side-effect probe" });
+      } finally {
+        process.chdir(origCwd);
+      }
+      const after = readdirSync(sandbox);
+      expect(
+        after,
+        "TH-3 / fs runtime: tool.execute must not create files in cwd",
+      ).toEqual(before);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("TH-3 / structural: createThinkingTool factory signature takes ONLY an emitter — no MCP manager, no subagent runner reachable", async () => {
+    // Structural proof: the factory parameter is a single TranscriptMarkerEmitter.
+    // Function arity MUST be 1 — any additional params would indicate the
+    // tool can reach an MCPManager or SubagentRunner.
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    // Reflect the declared arity. `Function.length` excludes rest params
+    // and params with default values, but asserting <= 1 catches the
+    // "oops, a 2nd required param snuck in" regression.
+    expect(createThinkingTool.length).toBeLessThanOrEqual(1);
+  });
+
+  it("TH-3 / no hidden listener subscription: execute does not accumulate subscribers on the emitter (review item #7 rewrite)", async () => {
+    // Rewritten from the old internals-peeking test. We register ONE
+    // listener, execute the tool N times, and assert our listener saw
+    // exactly N deliveries — no more, no fewer. If the tool internally
+    // subscribed a phantom listener that swallowed markers, our count
+    // would drop. If the tool subscribed a phantom emitting listener,
+    // our count could stay right but duplicates would appear — we check
+    // each marker payload's thought to catch that too.
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const captured: any[] = [];
+    emitter.on("marker", (m) => captured.push(m));
+
+    const tool = createThinkingTool(emitter);
+    await tool.execute("tcid-a", { thought: "first" });
+    expect(captured.length).toBe(1);
+    expect(captured[0].thought).toBe("first");
+
+    await tool.execute("tcid-b", { thought: "second" });
+    expect(captured.length).toBe(2);
+    expect(captured[1].thought).toBe("second");
+
+    await tool.execute("tcid-c", { thought: "third" });
+    // No duplicates — if execute secretly subscribed another listener that
+    // re-emits, captured would be > 3.
+    expect(captured.length).toBe(3);
+    // And the payloads are the ones we sent, in order, each exactly once.
+    expect(captured.map((m) => m.thought)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 1.6 — T29 schema probe (TH-1/2/4/14)
+// ---------------------------------------------------------------------------
+
+describe("thinking tool schema probe (Task 1.6 / T29 TH-1/2/4/14)", () => {
+  it("T29(a): additionalProperties === false", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const tool = createThinkingTool(new TranscriptMarkerEmitter());
+    const schema: any = tool.parameters;
+    expect(schema.additionalProperties).toBe(false);
+  });
+
+  it("T29(b): exactly one property key: ['thought']", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const tool = createThinkingTool(new TranscriptMarkerEmitter());
+    const schema: any = tool.parameters;
+    expect(Object.keys(schema.properties).sort()).toEqual(["thought"]);
+  });
+
+  it("T29(c): Value.Check rejects empty string and accepts non-empty", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { Value } = await import("@sinclair/typebox/value");
+    const tool = createThinkingTool(new TranscriptMarkerEmitter());
+    const schema: any = tool.parameters;
+    expect(Value.Check(schema, { thought: "" })).toBe(false);
+    expect(Value.Check(schema, { thought: "x" })).toBe(true);
+    // And missing `thought` must fail too — TH-2 says required.
+    expect(Value.Check(schema, {})).toBe(false);
+    // Extra fields must fail — TH-14 (no effort dial).
+    expect(Value.Check(schema, { thought: "x", effort: "high" })).toBe(false);
+  });
+
+  it("T29(c) runtime: invalid input MUST report a validation error (throw | details.error | ok:false) AND emit zero markers — never a silent {ok:true, thought:''} echo (review item #8, round-4 Concern A)", async () => {
+    // Plan / spec §3.7 edge cases: "`thought` is the empty string | Schema
+    // validation fails (TH-2 `minLength: 1`); tool returns a **validation
+    // error** and no `think_recorded` marker is emitted."
+    //
+    // Round-4 tightening (Concern A): the previous revision only rejected
+    // the literal `{ok:true, thought:""}` echo shape. Codex flagged this
+    // as still too loose — a malformed result (e.g. `{content:[], details:{}}`
+    // with thought missing entirely) would pass. Round-4 requires the
+    // impl to REPORT an error one of three documented ways:
+    //
+    //   (a) `execute()` throws, OR
+    //   (b) returned `AgentToolResult.details.error` is defined, OR
+    //   (c) returned `content[0].text` is JSON with `ok: false` (or an
+    //       `error` field).
+    //
+    // AND simultaneously the impl MUST NOT:
+    //   (x) return `{ok:true, thought:""}` (silent success echo), OR
+    //   (y) emit ANY marker for the invalid input.
+    //
+    // A malformed return (e.g. thought missing without an error signal)
+    // fails the "reportedError" clause below.
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { Value } = await import("@sinclair/typebox/value");
+
+    const emitter = new TranscriptMarkerEmitter();
+    const received: any[] = [];
+    emitter.on("marker", (m) => received.push(m));
+    const tool = createThinkingTool(emitter);
+    const schema: any = tool.parameters;
+
+    // (i) Schema-surface check — independent of runtime execute path.
+    expect(Value.Check(schema, { thought: "" })).toBe(false);
+    expect(Value.Check(schema, {})).toBe(false);
+    expect(Value.Check(schema, { thought: "x", extra: 1 })).toBe(false);
+
+    // (ii) Direct-execute binding — the tool implementation MUST report
+    //      an error one of three ways. We probe each invalid input and
+    //      check both the reported-error clause AND the anti-cheat
+    //      clause (no silent success echo).
+    async function assertInvalidReportsError(
+      label: string,
+      tcid: string,
+      input: any,
+    ): Promise<void> {
+      let threw = false;
+      let result: any = undefined;
+      try {
+        result = await tool.execute(tcid, input);
+      } catch {
+        threw = true;
+      }
+
+      // Parse the returned result's first content block as JSON (if any).
+      // Used by both the reported-error clause and the anti-cheat clause.
+      let parsed: any = undefined;
+      if (result) {
+        const first = result.content?.[0];
+        if (first?.type === "text" && typeof first.text === "string") {
+          try {
+            parsed = JSON.parse(first.text);
+          } catch {
+            parsed = undefined;
+          }
+        }
+      }
+
+      // --- REPORTED-ERROR CLAUSE ---------------------------------------
+      // One of these three MUST be true:
+      //   (a) execute threw
+      //   (b) result.details.error is defined
+      //   (c) parsed.ok === false OR parsed.error is truthy
+      const reportedError =
+        threw ||
+        result?.details?.error !== undefined ||
+        (parsed !== undefined &&
+          (parsed.ok === false || parsed.error !== undefined));
+      expect(
+        reportedError,
+        `T29(c) runtime / ${label}: impl MUST report a validation error — execute() must throw, set details.error, or return ok:false/error. threw=${threw} result=${JSON.stringify(result)?.slice(0, 200)}`,
+      ).toBe(true);
+
+      // --- ANTI-CHEAT CLAUSE -------------------------------------------
+      // The SPECIFIC failure mode spec §3.7 names is "silent success
+      // echo". Forbid it directly.
+      if (result && parsed !== undefined) {
+        // (x) Never the literal {ok:true, thought:""} (or missing thought)
+        //     for the empty/missing-input cases.
+        if (label === "empty") {
+          expect(parsed).not.toEqual({ ok: true, thought: "" });
+        }
+        if (label === "missing") {
+          // For missing field, thought is undefined — forbid
+          //   {ok:true} with no thought AND {ok:true, thought: anything}
+          //   for the missing-input case.
+          expect(parsed.ok === true && parsed.thought !== undefined).toBe(
+            false,
+          );
+          // Also forbid ok:true with thought === "" (degenerate case).
+          expect(parsed).not.toEqual({ ok: true, thought: "" });
+        }
+        if (label === "extra") {
+          // For additionalProperties, forbid ok:true echo that ignores
+          // the extra field (silent acceptance of schema-violating input).
+          if (parsed.ok === true) {
+            expect(
+              reportedError,
+              `T29(c) runtime / extra: impl returned ok:true for input with extra fields — must reject via one of the three error channels`,
+            ).toBe(true);
+          }
+        }
+      }
+    }
+
+    await assertInvalidReportsError("empty", "tcid-empty", { thought: "" });
+    await assertInvalidReportsError("missing", "tcid-missing", {} as any);
+    await assertInvalidReportsError("extra", "tcid-extra", {
+      thought: "x",
+      extra: 1,
+    } as any);
+
+    // CRITICAL: zero markers across ALL invalid invocations (clause y).
+    expect(
+      received.length,
+      "T29(c) runtime: no think_recorded marker should fire for any invalid input (empty, missing, extra)",
+    ).toBe(0);
+
+    // Positive path: valid input DOES produce exactly one marker,
+    // demonstrating the gate's pass/reject symmetry on the SAME tool
+    // instance and SAME emitter that were probed above. This also
+    // catches a degenerate impl that disables emission entirely.
+    await tool.execute("tcid-ok", { thought: "runtime valid" });
+    expect(received.length).toBe(1);
+    expect(received[0].thought).toBe("runtime valid");
+  });
+
+  it("T29(d): no effort / budget / level / mode / depth / thinking fields present in the schema", async () => {
+    const { createThinkingTool } = await import("../src/tools/thinking.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const tool = createThinkingTool(new TranscriptMarkerEmitter());
+    const schema: any = tool.parameters;
+    const keys = Object.keys(schema.properties);
+    for (const banned of ["effort", "budget", "level", "mode", "depth", "thinking"]) {
+      expect(keys).not.toContain(banned);
+    }
+    expect(keys).toEqual(["thought"]);
+  });
+
+  it("T29(e): assembleTools extended signature returns toolMap with a `thinking` entry (identity-stable across calls)", async () => {
+    const { assembleTools } = await import("../src/tools/index.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+
+    const mockMcpManager = {
+      allTools: () => [],
+      getServerKeys: () => [],
+      isConnected: () => false,
+      callTool: async () => ({ content: [{ type: "text" as const, text: "" }] }),
+    } as any;
+    const mockMemoryManager = {
+      save: async () => {},
+      search: async () => [],
+      close: () => {},
+    } as any;
+    const cwd = join(tmpdir(), `qlaybot-t29e-${process.pid}-${Date.now()}`);
+
+    const callAssemble = () =>
+      assembleTools({
+        config: { subagent: { enabled: false, roles: {} } } as any,
+        mcpManager: mockMcpManager,
+        memoryManager: mockMemoryManager,
+        cwd,
+        workspaceDir: cwd,
+        annotations: [],
+        getApiKey: async () => undefined,
+        defaultModel: "test-model",
+        defaultThinkingLevel: "medium",
+        modelRegistry: {} as any,
+        transcriptMarkerEmitter: emitter,
+      });
+
+    const r1 = callAssemble();
+    const r2 = callAssemble();
+    expect(r1.toolMap["thinking"]).toBeDefined();
+    expect(r1.toolMap["thinking"].name).toBe("thinking");
+    // Idempotent: both calls produce a `thinking` entry with the same name.
+    expect(r2.toolMap["thinking"]).toBeDefined();
+    expect(r2.toolMap["thinking"].name).toBe("thinking");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 1.2 — assembleTools wires thinking + allowlist (TH-4)
+//
+// Narrowed per review item #7: only test the surface that's NEW in Task 1.2.
+// Emitter param threading was already locked by G1 (test-runtime-wiring.ts),
+// so we DO NOT re-test that here. We test:
+//   (i)  toolMap["thinking"] exists with name === "thinking" (new surface).
+//   (ii) assembleTools does NOT throw the "escaped the plan-mode sandbox"
+//        error when a PlanManager is present — this exercises the new
+//        NON_MCP + ALLOWED_BASE additions required for `thinking` to pass
+//        the deny-by-default allowlist at tools/index.ts:286-319.
+// ---------------------------------------------------------------------------
+
+describe("assembleTools thinking registration (Task 1.2 / TH-4 — narrowed per review #7)", () => {
+  it("(i) toolMap['thinking'] exists with name 'thinking' — new surface", async () => {
+    const { assembleTools } = await import("../src/tools/index.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const emitter = new TranscriptMarkerEmitter();
+    const mockMcpManager = {
+      allTools: () => [],
+      getServerKeys: () => [],
+      isConnected: () => false,
+      callTool: async () => ({ content: [] }),
+    } as any;
+    const mockMemoryManager = {
+      save: async () => {},
+      search: async () => [],
+      close: () => {},
+    } as any;
+    const cwd = join(tmpdir(), `qlaybot-t12-a-${process.pid}-${Date.now()}`);
+    const { toolMap } = assembleTools({
+      config: { subagent: { enabled: false, roles: {} } } as any,
+      mcpManager: mockMcpManager,
+      memoryManager: mockMemoryManager,
+      cwd,
+      workspaceDir: cwd,
+      annotations: [],
+      getApiKey: async () => undefined,
+      defaultModel: "test-model",
+      defaultThinkingLevel: "medium",
+      modelRegistry: {} as any,
+      transcriptMarkerEmitter: emitter,
+    });
+    expect(toolMap["thinking"]).toBeDefined();
+    expect(toolMap["thinking"].name).toBe("thinking");
+  });
+
+  it("(ii) allowlist: assembleTools with a PlanManager (non-subagent) does NOT throw 'escaped the plan-mode sandbox'", async () => {
+    // This exercises the tools/index.ts:286-319 deny-by-default allowlist —
+    // if the Executor forgets to add "thinking" to NON_MCP + ALLOWED_BASE,
+    // the throw below will fire. We assert NO throw.
+    const { assembleTools } = await import("../src/tools/index.js");
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { PlanManager } = await import("../src/planning/index.js");
+
+    const emitter = new TranscriptMarkerEmitter();
+    const mockMcpManager = {
+      allTools: () => [],
+      getServerKeys: () => [],
+      isConnected: () => false,
+      callTool: async () => ({ content: [] }),
+    } as any;
+    const mockMemoryManager = {
+      save: async () => {},
+      search: async () => [],
+      close: () => {},
+    } as any;
+    const workspaceDir = join(
+      tmpdir(),
+      `qlaybot-t12-c-${process.pid}-${Date.now()}`,
+    );
+    mkdirSync(workspaceDir, { recursive: true });
+    const pm = new PlanManager(workspaceDir);
+
+    const call = () =>
+      assembleTools({
+        config: { subagent: { enabled: false, roles: {} } } as any,
+        mcpManager: mockMcpManager,
+        memoryManager: mockMemoryManager,
+        cwd: workspaceDir,
+        workspaceDir,
+        annotations: [],
+        getApiKey: async () => undefined,
+        defaultModel: "test-model",
+        defaultThinkingLevel: "medium",
+        modelRegistry: {} as any,
+        planManager: pm,
+        isSubagent: false,
+        transcriptMarkerEmitter: emitter,
+      });
+
+    // If Executor forgot to add "thinking" to ALLOWED_BASE + NON_MCP, this
+    // call would throw "…escaped the plan-mode sandbox…".
+    expect(() => call()).not.toThrow();
+
+    // And `thinking` must still be in the resulting toolMap under its bare
+    // name — confirming it wasn't wrapped/renamed by the MCP wrapper.
+    const { toolMap } = call();
+    expect(toolMap["thinking"]).toBeDefined();
+    expect(toolMap["thinking"].name).toBe("thinking");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 1.3 — annotations TH-7 (thinking readonly + plan-mode allowed)
+// ---------------------------------------------------------------------------
+
+describe("annotations thinking (Task 1.3 / TH-7)", () => {
+  it("TOOL_ANNOTATIONS contains a 'thinking' entry with readonly:true", async () => {
+    const { TOOL_ANNOTATIONS } = await import("../src/tools/annotations.js");
+    const entry = TOOL_ANNOTATIONS.find((a) => a.name === "thinking");
+    expect(entry, "annotations.ts must list 'thinking'").toBeDefined();
+    expect(entry!.readonly).toBe(true);
+    // And NOT classified as readwrite (would block it in plan mode).
+    expect((entry as any).readwrite).not.toBe(true);
+  });
+
+  it("getReadOnlyForPlanMode('thinking') returns {allowed:true, reasons:[]}", async () => {
+    const { getReadOnlyForPlanMode } = await import(
+      "../src/tools/annotations.js"
+    );
+    const result = getReadOnlyForPlanMode("thinking");
+    expect(result.allowed).toBe(true);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("canonicalToolName('thinking') is 'thinking' (no prefix stripping)", async () => {
+    const { canonicalToolName } = await import("../src/tools/annotations.js");
+    expect(canonicalToolName("thinking")).toBe("thinking");
+  });
+});

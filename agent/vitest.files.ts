@@ -23,12 +23,14 @@ export const unitFiles = [
   "tests/test-plan-mode-v043-group6b.ts",
   "tests/test-marker-emitter.ts",
   "tests/test-phase5-vc-mcp.ts",
+  "tests/test-prompts.ts",
 ];
 
 export const integrationFiles = [
   "tests/test-search-integration.ts",
   "tests/test-runtime-wiring.ts",
   "tests/test-subagent-e2e.ts",
+  "tests/test-thinking-e2e.ts",
 ];
 
 export const e2eFiles = [
