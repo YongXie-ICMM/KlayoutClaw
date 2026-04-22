@@ -20,3 +20,24 @@ describe("PlanSlugCache", () => {
     expect(cache.get(session)).toBeUndefined();
   });
 });
+
+describe("slugCacheState", () => {
+  it("tracks active vs terminal state and clears with delete", async () => {
+    const { PlanSlugCache, slugCacheState } = await import(
+      "../src/planning/slug-cache.js"
+    );
+
+    const cache = new PlanSlugCache();
+    const session = {};
+
+    cache.set(session, "ember-bridge");
+    slugCacheState.markTerminal(session);
+    expect(slugCacheState.getState(session)).toBe("terminal");
+
+    slugCacheState.markActive(session);
+    expect(slugCacheState.getState(session)).toBe("active");
+
+    cache.delete(session);
+    expect(slugCacheState.getState(session)).toBeUndefined();
+  });
+});
