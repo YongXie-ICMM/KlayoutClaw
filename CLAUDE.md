@@ -74,7 +74,7 @@ KlayoutClaw/
 │   └── e2e_judge/
 │       ├── SKILL.md              # Agentic E2E test harness with LLM judge
 │       └── scripts/              # conftest, harness, judge, verifier, run_tests
-├── agent/                          # qlaybot v0.4.2 — Pi-Agent SDK wrapper
+├── agent/                          # qlaybot v0.4.4 — Pi-Agent SDK wrapper
 │   ├── src/                        # TypeScript source (see agent/CLAUDE.md)
 │   ├── tests/                      # 697 tests: unit / integration / e2e
 │   ├── workspace/                  # Domain knowledge (SOUL, TOOLS, RULES)

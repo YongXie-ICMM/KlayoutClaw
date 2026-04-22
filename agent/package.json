@@ -1,6 +1,6 @@
 {
   "name": "qlaybot",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Device design agent wrapping Pi-Agent SDK for KLayout MCP orchestration",
   "type": "module",
   "main": "dist/index.js",

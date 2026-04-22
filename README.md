@@ -32,7 +32,7 @@ KlayoutClaw has four layers:
 |-------|-------------|
 | **MCP Server** | KLayout autorun macro — JSON-RPC 2.0 server on `127.0.0.1:8765`. 10 tools: create layouts, run pya scripts, save GDS/OASIS, capture screenshots, autoroute pin pairs, inspect route metadata, evaluate designs, validate pixel size, close layout tabs. Zero external dependencies. |
 | **Skills** | Claude Code plugin with 9 skills — geometry, display, visual, image, klayout_gds_import, and 4 nanodevice skills (flakedetect, gdsalign, routing, e2e_design). Claude loads them automatically when relevant. |
-| **Qlaybot Agent** | Standalone TypeScript AI agent (`agent/`, v0.4.2) wrapping Pi-Agent SDK with its own KLayout MCP client (auto-launches KLayout on macOS/Linux/Windows). Interactive Ink/React TUI, 10 slash commands + interactive Config Panel, planning sandbox, role-based subagent delegation, categorized memory with FTS5 + optional vector search & reranker (4 search modes), 3-phase context compaction, background task support, and a JSON-RPC mode for integration / E2E testing. |
+| **Qlaybot Agent** | Standalone TypeScript AI agent (`agent/`, v0.4.4) wrapping Pi-Agent SDK with its own KLayout MCP client (auto-launches KLayout on macOS/Linux/Windows). Interactive Ink/React TUI, 10 slash commands + interactive Config Panel, planning sandbox, role-based subagent delegation, categorized memory with FTS5 + optional vector search & reranker (4 search modes), 3-phase context compaction, background task support, and a JSON-RPC mode for integration / E2E testing. |
 | **Tools** | Standalone utilities — GDS-to-PNG converter, subprocess routing engine. Used by the MCP server and skills internally. |
 
 ```
@@ -170,7 +170,7 @@ Then just ask Claude to create layouts:
 
 ## Qlaybot Agent
 
-Qlaybot (`agent/`, v0.4.2) is a self-contained TypeScript AI agent that wraps the Pi-Agent SDK and ships its own KLayout MCP client (HTTP JSON-RPC on `127.0.0.1:8765`). It's the "batteries-included" way to drive KLayout — no external MCP client setup required.
+Qlaybot (`agent/`, v0.4.4) is a self-contained TypeScript AI agent that wraps the Pi-Agent SDK and ships its own KLayout MCP client (HTTP JSON-RPC on `127.0.0.1:8765`). It's the "batteries-included" way to drive KLayout — no external MCP client setup required.
 
 ```bash
 cd agent
@@ -352,7 +352,7 @@ KlayoutClaw/
 ├── plugin/
 │   ├── klayoutclaw_server.lym    # MCP server (v0.6)
 │   └── klayoutclaw_ui.lym        # UI panel + status bar
-├── agent/                        # qlaybot v0.4.2 — standalone TypeScript agent
+├── agent/                        # qlaybot v0.4.4 — standalone TypeScript agent
 │   ├── src/
 │   │   ├── cli.ts                # Entry point (interactive / json / rpc / slash)
 │   │   ├── agent.ts              # createDesignSession(), 3-phase transformContext pipeline
