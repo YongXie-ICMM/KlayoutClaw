@@ -49,6 +49,26 @@ function blocked(reason: string): AgentToolResult<any> {
   };
 }
 
+function frozen(): AgentToolResult<any> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          error: "plan_state_frozen",
+          state: "plan_drafted",
+          message: "tool calls suspended awaiting approval",
+        }),
+      },
+    ],
+    details: {},
+  };
+}
+
+function isPlanDrafted(planManager: PlanManager): boolean {
+  return planManager.planState === "plan_drafted";
+}
+
 /**
  * Resolve `p` to its realpath by walking up to the first ancestor that exists,
  * realpath'ing THAT, then re-appending the unresolved tail. This closes the
@@ -125,6 +145,9 @@ export function wrapWriteForPlanMode(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       onUpdate?: AgentToolUpdateCallback<any>,
     ) => {
+      if (isPlanDrafted(planManager)) {
+        return frozen();
+      }
       if (planManager.inPlanMode) {
         const filePath: string = params?.path || params?.file_path || "";
         if (!isInsidePlansDir(filePath, planManager.plansDir, cwd)) {
@@ -159,6 +182,9 @@ export function wrapEditForPlanMode(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       onUpdate?: AgentToolUpdateCallback<any>,
     ) => {
+      if (isPlanDrafted(planManager)) {
+        return frozen();
+      }
       if (planManager.inPlanMode) {
         const filePath: string = params?.path || params?.file_path || "";
         if (!isInsidePlansDir(filePath, planManager.plansDir, cwd)) {
@@ -197,6 +223,9 @@ export function wrapBashForPlanMode(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       onUpdate?: AgentToolUpdateCallback<any>,
     ) => {
+      if (isPlanDrafted(planManager)) {
+        return frozen();
+      }
       if (planManager.inPlanMode) {
         return blocked(
           "Bash is not available during plan mode. " +
@@ -261,11 +290,40 @@ export function wrapMCPToolForPlanMode(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       onUpdate?: AgentToolUpdateCallback<any>,
     ) => {
+      if (isPlanDrafted(planManager)) {
+        return frozen();
+      }
       if (planManager.inPlanMode) {
         const { allowed, reasons } = getReadOnlyForPlanMode(tool.name);
         if (!allowed) {
           return planModeBlockedTool(tool.name, reasons);
         }
+      }
+      return originalExecute(toolCallId, params, signal, onUpdate);
+    },
+  };
+}
+
+export function wrapToolForPlanDraftedFreeze(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tool: AgentTool<any, any>,
+  planManager: PlanManager,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): AgentTool<any, any> {
+  const originalExecute = tool.execute.bind(tool);
+
+  return {
+    ...tool,
+    execute: async (
+      toolCallId: string,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      params: any,
+      signal?: AbortSignal,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      onUpdate?: AgentToolUpdateCallback<any>,
+    ) => {
+      if (isPlanDrafted(planManager)) {
+        return frozen();
       }
       return originalExecute(toolCallId, params, signal, onUpdate);
     },

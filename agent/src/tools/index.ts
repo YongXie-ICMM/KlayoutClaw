@@ -41,6 +41,7 @@ import {
   wrapEditForPlanMode,
   wrapBashForPlanMode,
   wrapMCPToolForPlanMode,
+  wrapToolForPlanDraftedFreeze,
 } from "../planning/sandbox.js";
 import { createEnterPlanModeTool, createExitPlanModeTool } from "./plan.js";
 
@@ -294,12 +295,19 @@ export function assembleTools(opts: any): any {
       if (toolMap.write) toolMap.write = wrapWriteForPlanMode(toolMap.write, planManager, opts.cwd);
       if (toolMap.edit) toolMap.edit = wrapEditForPlanMode(toolMap.edit, planManager, opts.cwd);
       if (toolMap.bash) toolMap.bash = wrapBashForPlanMode(toolMap.bash, planManager);
+      if (toolMap.read) toolMap.read = wrapToolForPlanDraftedFreeze(toolMap.read, planManager);
 
       // Register plan tools.
       const enterTool = createEnterPlanModeTool(planManager);
       const exitTool = createExitPlanModeTool(planManager);
       toolMap[enterTool.name] = enterTool;
       toolMap[exitTool.name] = exitTool;
+      if (toolMap.memory_save) toolMap.memory_save = wrapToolForPlanDraftedFreeze(toolMap.memory_save, planManager);
+      if (toolMap.memory_search) toolMap.memory_search = wrapToolForPlanDraftedFreeze(toolMap.memory_search, planManager);
+      if (toolMap.delegate) toolMap.delegate = wrapToolForPlanDraftedFreeze(toolMap.delegate, planManager);
+      if (toolMap.thinking) toolMap.thinking = wrapToolForPlanDraftedFreeze(toolMap.thinking, planManager);
+      toolMap[enterTool.name] = wrapToolForPlanDraftedFreeze(toolMap[enterTool.name], planManager);
+      toolMap[exitTool.name] = wrapToolForPlanDraftedFreeze(toolMap[exitTool.name], planManager);
 
       // Wrap every MCP-backed tool (exclude base/memory/plan/delegate/thinking).
       const NON_MCP = new Set([
