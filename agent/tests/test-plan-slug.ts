@@ -41,3 +41,17 @@ describe("slugCacheState", () => {
     expect(slugCacheState.getState(session)).toBeUndefined();
   });
 });
+
+describe("generateWordSlug", () => {
+  it("returns two-word lowercase slugs with basic entropy", async () => {
+    const { generateWordSlug } = await import(
+      "../src/planning/word-slug.js"
+    );
+
+    const slugs = Array.from({ length: 1000 }, () => generateWordSlug());
+
+    expect(slugs.every((slug) => /^[a-z]+-[a-z]+$/.test(slug))).toBe(true);
+    expect(slugs.every((slug) => !slug.startsWith("plan-"))).toBe(true);
+    expect(new Set(slugs).size).toBeGreaterThanOrEqual(500);
+  });
+});
