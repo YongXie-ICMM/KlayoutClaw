@@ -581,10 +581,97 @@ class ContextMenus:
 
 
 class SaveIntegration:
-    """Task 6.4 implementation lands later; placeholder for composition."""
+    """Post-save VC integration for manual and native save flows."""
 
     def __init__(self, controller):
         self.controller = controller
+        self._connect_native_actions()
+
+    def save_layout(self, filepath: Optional[str] = None, *, format: str = "GDS2") -> dict:
+        view = _current_view(self.controller.main_window)
+        layout = _layout_for_view(view)
+        if layout is None:
+            return {"ok": False, "reason": "no active layout"}
+
+        target = filepath or _gds_path_for_view(view)
+        if not target:
+            return {"ok": False, "reason": "filepath required"}
+        abs_path = os.path.abspath(str(target))
+
+        save_opts = pya.SaveLayoutOptions()
+        save_opts.format = "OASIS" if str(format).upper() == "OASIS" else "GDS2"
+        layout.write(abs_path, save_opts)
+        return self._post_save(abs_path, layout=layout)
+
+    def _connect_native_actions(self) -> None:
+        try:
+            menu = self.controller.main_window.menu()
+        except Exception:
+            return
+        for path in ("file_menu.save", "file_menu.save_as"):
+            try:
+                action = menu.action(path)
+            except Exception:
+                action = None
+            if action is not None:
+                try:
+                    action.on_triggered(self._schedule_post_save)
+                except Exception:
+                    pass
+
+    def _schedule_post_save(self) -> None:
+        try:
+            pya.QTimer.singleShot(0, self._post_save_from_current_view)
+        except Exception:
+            self._post_save_from_current_view()
+
+    def _post_save_from_current_view(self) -> None:
+        view = _current_view(self.controller.main_window)
+        path = _gds_path_for_view(view)
+        if path:
+            self._post_save(path)
+
+    def _post_save(self, filepath: str, *, layout=None) -> dict:
+        from plugin.klayoutclaw_vc import repo as vc_repo
+        from tools import vc_mcp_handlers as vc_handlers
+
+        if layout is None:
+            view = _current_view(self.controller.main_window)
+            layout = _layout_for_view(view)
+        if layout is None:
+            return {"ok": False, "reason": "no active layout"}
+
+        abs_path = os.path.abspath(filepath)
+        entry = vc_handlers.REGISTRY.get(id(layout))
+        if entry is None:
+            handle = vc_repo.init(abs_path)
+            vc_handlers.REGISTRY[id(layout)] = {
+                "handle": handle,
+                "gds_path": abs_path,
+            }
+        vc_handlers.migrate_on_save(layout, abs_path)
+
+        settings = _session_state().settings
+        auto_checkpoint = bool(settings.get("autoCheckpointOnSave", True))
+        checkpoint_result = None
+        if auto_checkpoint:
+            checkpoint_result = vc_handlers.vc_checkpoint(
+                {"message": "auto-checkpoint on save"},
+                layout=layout,
+                gds_path_hint=abs_path,
+            )
+
+        self.controller.refresh()
+        try:
+            self.controller.history_dock.refresh()
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "filepath": abs_path,
+            "auto_checkpoint": auto_checkpoint,
+            "checkpoint": checkpoint_result,
+        }
 
 
 class VCUIController:

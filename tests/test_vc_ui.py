@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -309,3 +310,64 @@ def test_history_dock_hotkey_populates_rows_and_defers_older_thumbnails(tmp_path
     assert result["top_row"]["thumbnail_loaded"] is True
     assert result["older_before"]["thumbnail_loaded"] is False
     assert result["older_after"]["thumbnail_loaded"] is True
+
+
+def test_save_integration_auto_checkpoint_respects_setting_and_still_writes_gds(tmp_path):
+    gds_path = _create_disk_backed_repo(tmp_path)
+
+    result = _run_klayout_script(
+        f"""
+        from plugin.klayoutclaw_vc import ui as vc_ui
+        import tools.vc_mcp_handlers as vc_handlers
+
+        mw = pya.Application.instance().main_window()
+        controller = vc_ui.install_ui(main_window=mw, poll_interval_ms=25)
+        mw.load_layout({str(gds_path)!r}, pya.LoadLayoutOptions(), "", 1)
+        pya.QApplication.processEvents()
+        controller.refresh()
+
+        view = mw.current_view()
+        layout = view.active_cellview().layout()
+        top = layout.top_cell()
+        li = layout.layer(1, 0)
+
+        top.shapes(li).insert(pya.Box(5000, 0, 5600, 600))
+        save_one = controller.save_integration.save_layout({str(gds_path)!r})
+        pya.QApplication.processEvents()
+        history_one = vc_handlers.vc_history(
+            {{}},
+            layout=layout,
+            gds_path_hint={str(gds_path)!r},
+        )
+        with open({str(gds_path)!r}, "rb") as _fh:
+            hash_one = __import__("hashlib").sha256(_fh.read()).hexdigest()
+
+        vc_ui._session_state().settings["autoCheckpointOnSave"] = False
+        top.shapes(li).insert(pya.Box(6500, 0, 7100, 600))
+        save_two = controller.save_integration.save_layout({str(gds_path)!r})
+        pya.QApplication.processEvents()
+        history_two = vc_handlers.vc_history(
+            {{}},
+            layout=layout,
+            gds_path_hint={str(gds_path)!r},
+        )
+        with open({str(gds_path)!r}, "rb") as _fh:
+            hash_two = __import__("hashlib").sha256(_fh.read()).hexdigest()
+
+        print("RESULT_JSON=" + json.dumps({{
+            "save_one": save_one,
+            "save_two": save_two,
+            "history_one_count": len(history_one["commits"]),
+            "history_two_count": len(history_two["commits"]),
+            "latest_after_first_save": history_one["commits"][0]["message"],
+            "hash_one": hash_one,
+            "hash_two": hash_two,
+        }}))
+        """
+    )
+
+    assert result["save_one"]["ok"] is True
+    assert result["save_two"]["ok"] is True
+    assert result["latest_after_first_save"] == "auto-checkpoint on save"
+    assert result["history_one_count"] == result["history_two_count"]
+    assert result["hash_one"] != result["hash_two"]
