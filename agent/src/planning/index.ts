@@ -32,6 +32,9 @@ interface PlanStateMachineLike {
     to: string,
     payload: Record<string, unknown>,
   ): void;
+  /** PM-6 step 2 (Task 2.15): reset per-turn replan counter. Optional to
+   *  preserve compatibility with legacy state-machine stubs used in tests. */
+  resetReplanCount?(session: object): void;
 }
 
 export class PlanManager {

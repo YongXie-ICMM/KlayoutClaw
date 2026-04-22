@@ -237,6 +237,11 @@ export async function startRPCServer(opts: {
             return;
           }
 
+          // PM-6 step 2: reset per-turn replan counter at user-turn boundary.
+          botSession.planManager?.stateMachine?.resetReplanCount?.(
+            botSession.planManager.sessionKey,
+          );
+
           // Route slash commands
           const parsed = parseCommand(message);
           if (parsed && botSession.commandRegistry) {

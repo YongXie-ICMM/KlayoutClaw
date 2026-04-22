@@ -723,3 +723,329 @@ describe("planHash integrity chain (T6)", () => {
     });
   });
 });
+
+/**
+ * Task 2.15 — T5 & T42 behavioural tests.
+ *
+ * API shape the Executor must implement (documented here so test-contracts
+ * assertions of marker SHAPE don't duplicate the state-machine BEHAVIOUR
+ * assertions below):
+ *
+ *   class PlanStateMachine {
+ *     // existing methods... plus:
+ *
+ *     // Called by the harness on every tool-result while in plan_executing.
+ *     // Returns { aborted, terminal } so callers can short-circuit execution
+ *     // after an unrecoverable blocker.
+ *     //
+ *     //   - recoverable / not-in-scope → no side effects, returns
+ *     //     { aborted: false, terminal: false }.
+ *     //   - unrecoverable AND replan_count+1 <= 3 → increments replan_count,
+ *     //     emits plan_execution_aborted{reason, tool, pattern, replan_count},
+ *     //     emits plan_replan{replan_count, prev_reason}, transitions state
+ *     //     to "plan_drafting", returns { aborted: true, terminal: false }.
+ *     //   - unrecoverable AND replan_count+1 > 3 (i.e. the 4th unrecoverable
+ *     //     blocker in one user turn) → increments replan_count to 4, emits
+ *     //     plan_execution_aborted{replan_count: 4}, emits terminal
+ *     //     plan_done{status:"failed", reason: <cumulative trail>},
+ *     //     transitions state to "plan_done", returns { aborted: true,
+ *     //     terminal: true }.
+ *     handleToolResult(
+ *       session: object,
+ *       toolName: string,
+ *       result: { content: [{ type: "text"; text: string }]; isError?: boolean },
+ *     ): { aborted: boolean; terminal: boolean };
+ *
+ *     // Called at the start of each user prompt (PM-6 step 2: "reset to 0 at
+ *     // the start of each new user turn"). Clears the WeakMap entry for this
+ *     // session so the next unrecoverable blocker counts as replan_count=1.
+ *     resetReplanCount(session: object): void;
+ *   }
+ *
+ * Design notes:
+ *   - `pattern` on plan_execution_aborted is drawn from the normative set
+ *     defined in spec §4.5: "isError:true", "auto_route:failed",
+ *     "auto_route:partial_with_errors", "evaluate_design:low_overall".
+ *   - `reason` on plan_execution_aborted is a short human string; we don't pin
+ *     the exact text — we assert it's non-empty so the executor can't silently
+ *     pass an empty string.
+ *   - `reason` on the terminal plan_done carries the cumulative blocker trail.
+ *     We assert it mentions the tool name at minimum so the trail is non-trivial.
+ *   - State at end of T5 is "plan_done" (the machine has entered its terminal
+ *     state; subsequent transitions are outside PM-6's contract — §4.2 guards
+ *     them via T41's PlanProtocolError work, not this task).
+ */
+describe("replan cap exhaustion (T5)", () => {
+  it("emits 3 abort→replan cycles then a terminal plan_done{failed} on the 4th unrecoverable blocker", async () => {
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+
+    // Seed: start from the plan_executing state that PM-6 governs.
+    stateMachine.setState(session, "plan_executing");
+    stateMachine.setReplanCount(session, 0);
+
+    // Unrecoverable auto_route result — classifier row: auto_route:failed.
+    const failedPayload = {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ status: "failed", errors: ["routing blocked"] }) },
+      ],
+    };
+
+    // --- Attempt 1 ---
+    const r1 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      failedPayload,
+    );
+    expect(r1).toMatchObject({ aborted: true, terminal: false });
+
+    // --- Attempt 2 ---
+    // After a replan, the harness would drive back through plan_drafted and
+    // plan_executing; we simulate that externally to isolate PM-6's contract.
+    stateMachine.setState(session, "plan_executing");
+    const r2 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      failedPayload,
+    );
+    expect(r2).toMatchObject({ aborted: true, terminal: false });
+
+    // --- Attempt 3 ---
+    stateMachine.setState(session, "plan_executing");
+    const r3 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      failedPayload,
+    );
+    expect(r3).toMatchObject({ aborted: true, terminal: false });
+
+    // --- Attempt 4 → terminal plan_done{failed} ---
+    stateMachine.setState(session, "plan_executing");
+    const r4 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      failedPayload,
+    );
+    expect(r4).toMatchObject({ aborted: true, terminal: true });
+
+    // Marker ordering: 3x (aborted → replan), then aborted(4) → plan_done.
+    const types = markers.map((m) => m.type);
+    expect(types).toEqual([
+      "plan_execution_aborted",
+      "plan_replan",
+      "plan_execution_aborted",
+      "plan_replan",
+      "plan_execution_aborted",
+      "plan_replan",
+      "plan_execution_aborted",
+      "plan_done",
+    ]);
+
+    // replan_count increments on every aborted marker (post-increment, so the
+    // FIRST aborted sees replan_count=1, not 0).
+    expect(markers[0]).toMatchObject({
+      type: "plan_execution_aborted",
+      replan_count: 1,
+      tool: "klayout_native_auto_route",
+      pattern: "auto_route:failed",
+    });
+    expect((markers[0] as any).reason).toEqual(expect.any(String));
+    expect((markers[0] as any).reason.length).toBeGreaterThan(0);
+
+    expect(markers[1]).toMatchObject({
+      type: "plan_replan",
+      replan_count: 1,
+    });
+    expect((markers[1] as any).prev_reason).toEqual(expect.any(String));
+    expect((markers[1] as any).prev_reason.length).toBeGreaterThan(0);
+
+    expect(markers[2]).toMatchObject({
+      type: "plan_execution_aborted",
+      replan_count: 2,
+      tool: "klayout_native_auto_route",
+      pattern: "auto_route:failed",
+    });
+    expect(markers[3]).toMatchObject({
+      type: "plan_replan",
+      replan_count: 2,
+    });
+
+    expect(markers[4]).toMatchObject({
+      type: "plan_execution_aborted",
+      replan_count: 3,
+      tool: "klayout_native_auto_route",
+      pattern: "auto_route:failed",
+    });
+    expect(markers[5]).toMatchObject({
+      type: "plan_replan",
+      replan_count: 3,
+    });
+
+    // Attempt 4: aborted marker shows replan_count=4, and the terminal
+    // plan_done carries the cumulative failure reason.
+    expect(markers[6]).toMatchObject({
+      type: "plan_execution_aborted",
+      replan_count: 4,
+      tool: "klayout_native_auto_route",
+      pattern: "auto_route:failed",
+    });
+
+    const terminal = markers[7];
+    expect(terminal.type).toBe("plan_done");
+    expect(terminal.status).toBe("failed");
+    expect(typeof terminal.reason).toBe("string");
+    expect(terminal.reason.length).toBeGreaterThan(0);
+    // The cumulative trail must reference the tool so the agent's context has
+    // a hint at what failed; empty or generic reasons fail this assertion.
+    expect(terminal.reason).toContain("klayout_native_auto_route");
+
+    // Exactly one terminal marker (no second plan_done, no stray plan_replan
+    // after exhaustion).
+    expect(markers.filter((m) => m.type === "plan_done")).toHaveLength(1);
+    const replanAfterTerminal = markers
+      .slice(markers.findIndex((m) => m.type === "plan_done"))
+      .filter((m) => m.type === "plan_replan");
+    expect(replanAfterTerminal).toHaveLength(0);
+
+    // State ends in plan_done (terminal).
+    expect(stateMachine.getState(session)).toBe("plan_done");
+
+    // Internal counter reflects the 4 aborts.
+    expect(stateMachine.getReplanCount(session)).toBe(4);
+  });
+
+  it("is a no-op on recoverable and not-in-scope results (no markers, no state change, no counter change)", async () => {
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+    stateMachine.setState(session, "plan_executing");
+    stateMachine.setReplanCount(session, 0);
+
+    // Recoverable: auto_route success
+    const successResult = {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ status: "success", routed_pairs: 3 }) },
+      ],
+    };
+    const r1 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      successResult,
+    );
+    expect(r1).toMatchObject({ aborted: false, terminal: false });
+
+    // Not-in-scope: vc_checkpoint error payload
+    const vcErr = {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ status: "error", error: "x" }) },
+      ],
+    };
+    const r2 = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_vc_checkpoint",
+      vcErr,
+    );
+    expect(r2).toMatchObject({ aborted: false, terminal: false });
+
+    // No markers emitted, state unchanged, counter still zero.
+    expect(markers).toHaveLength(0);
+    expect(stateMachine.getState(session)).toBe("plan_executing");
+    expect(stateMachine.getReplanCount(session)).toBe(0);
+  });
+});
+
+describe("replan counter user-turn boundary reset (T42)", () => {
+  it("resets replan_count to 0 at the start of a new user turn, so the next abort reports replan_count=1", async () => {
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+
+    const emitter = new TranscriptMarkerEmitter();
+    const markers: any[] = [];
+    emitter.on("marker", (marker) => markers.push(marker));
+
+    const stateMachine = new PlanStateMachine(emitter);
+    const session = {} as object;
+
+    // ========== Turn 1: exhaust the replan cap ==========
+    stateMachine.setState(session, "plan_executing");
+    stateMachine.setReplanCount(session, 0);
+
+    const failedPayload = {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ status: "failed", errors: ["boom"] }) },
+      ],
+    };
+
+    // Drive 4 unrecoverable aborts to exhaust Turn 1.
+    for (let i = 0; i < 4; i++) {
+      stateMachine.setState(session, "plan_executing");
+      (stateMachine as any).handleToolResult(
+        session,
+        "klayout_native_auto_route",
+        failedPayload,
+      );
+    }
+    expect(stateMachine.getReplanCount(session)).toBe(4);
+    expect(markers.at(-1)?.type).toBe("plan_done");
+
+    const turn1MarkerCount = markers.length;
+
+    // ========== Turn 2 boundary: new user prompt arrives ==========
+    // This is the prompt_start hook: reset the per-turn counter.
+    (stateMachine as any).resetReplanCount(session);
+    expect(stateMachine.getReplanCount(session)).toBe(0);
+
+    // Fresh turn: put machine back into plan_executing and induce ONE blocker.
+    stateMachine.setState(session, "plan_executing");
+    const r = (stateMachine as any).handleToolResult(
+      session,
+      "klayout_native_auto_route",
+      failedPayload,
+    );
+
+    // Must still be a non-terminal abort (replan_count=1, not 5, not terminal).
+    expect(r).toMatchObject({ aborted: true, terminal: false });
+
+    const turn2Markers = markers.slice(turn1MarkerCount);
+    expect(turn2Markers.map((m) => m.type)).toEqual([
+      "plan_execution_aborted",
+      "plan_replan",
+    ]);
+    // The critical assertion: counter started fresh at 0, so the first abort
+    // in Turn 2 reports replan_count=1 (not 4, not 5).
+    expect(turn2Markers[0]).toMatchObject({
+      type: "plan_execution_aborted",
+      replan_count: 1,
+    });
+    expect(turn2Markers[1]).toMatchObject({
+      type: "plan_replan",
+      replan_count: 1,
+    });
+    expect(stateMachine.getReplanCount(session)).toBe(1);
+  });
+});
