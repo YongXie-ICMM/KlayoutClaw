@@ -556,12 +556,14 @@ export function App({ botSession }: AppProps) {
           // we queue our own state changes.
           await new Promise<void>((r) => setImmediate(r));
           const plan = pm.enterPlanMode(plannedTask);
-          if (!plan) {
+          if (!plan || ("status" in plan && plan.status === "error")) {
             // D1 FS-failure surface: enterPlanMode returned null.
             dispatch({
               type: "SYSTEM_MESSAGE",
               text:
-                "Failed to enter plan mode. The plans directory may not be writable.",
+                plan && "message" in plan
+                  ? plan.message
+                  : "Failed to enter plan mode. The plans directory may not be writable.",
             });
             return;
           }

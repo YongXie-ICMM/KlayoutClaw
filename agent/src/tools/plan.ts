@@ -12,7 +12,10 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { PlanManager } from "../planning/index.js";
+import type {
+  EnterPlanModeResult,
+  PlanManager,
+} from "../planning/index.js";
 
 /**
  * KLayout-adapted plan-mode instructions. Tests assert every substring in
@@ -82,17 +85,6 @@ export function createEnterPlanModeTool(
       _toolCallId: string,
       p: Static<typeof EnterParams>,
     ): Promise<AgentToolResult<unknown>> {
-      if (planManager.inPlanMode) {
-        const current = planManager.currentPlan;
-        return ok({
-          status: "already_in_plan_mode",
-          plan_id: current?.id,
-          plan_file: current?.filePath,
-          message:
-            "Already in plan mode. Continue working on the current plan or call exit_plan_mode first.",
-        });
-      }
-
       const plan = planManager.enterPlanMode(p.task, undefined);
 
       if (plan === null) {
@@ -105,6 +97,10 @@ export function createEnterPlanModeTool(
         });
       }
 
+      if (isPlanEnterError(plan)) {
+        return ok(plan);
+      }
+
       return ok({
         status: "plan_mode_active",
         plan_id: plan.id,
@@ -115,6 +111,13 @@ export function createEnterPlanModeTool(
       });
     },
   };
+}
+
+function isPlanEnterError(plan: EnterPlanModeResult): plan is {
+  status: "error";
+  message: string;
+} {
+  return plan !== null && "status" in plan && plan.status === "error";
 }
 
 const ExitParams = Type.Object({

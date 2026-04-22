@@ -1,4 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+const tmpDirs: string[] = [];
+
+function makeWorkspace(): string {
+  const dir = mkdtempSync(join(tmpdir(), "qlaybot-plan-slug-"));
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const dir of tmpDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe("PlanSlugCache", () => {
   it("stores, retrieves, isolates, and deletes per-session slugs", async () => {
@@ -53,5 +78,74 @@ describe("generateWordSlug", () => {
     expect(slugs.every((slug) => /^[a-z]+-[a-z]+$/.test(slug))).toBe(true);
     expect(slugs.every((slug) => !slug.startsWith("plan-"))).toBe(true);
     expect(new Set(slugs).size).toBeGreaterThanOrEqual(500);
+  });
+});
+
+describe("PlanManager enterPlanMode (T24 a/b/c/f)", () => {
+  it("creates a word-slug plan file immediately on a fresh session", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("brave-lantern");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const plan = planManager.enterPlanMode("Draft a routing plan");
+
+    expect(plan).not.toBeNull();
+    expect(plan).toMatchObject({
+      id: "brave-lantern",
+      filePath: join(workspaceDir, "plans", "brave-lantern.md"),
+    });
+    expect(existsSync(join(workspaceDir, "plans", "brave-lantern.md"))).toBe(
+      true,
+    );
+  });
+
+  it("reuses the cached active slug within the same session and preserves file contents", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("river-gate");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { planSlugCache } = await import("../src/planning/slug-cache.js");
+
+    const workspaceDir = makeWorkspace();
+    const planManager = new PlanManager(workspaceDir);
+    const firstPlan = planManager.enterPlanMode("Initial draft");
+    expect(firstPlan).not.toBeNull();
+
+    writeFileSync(firstPlan!.filePath, "plan draft v1", "utf-8");
+
+    const secondPlan = planManager.enterPlanMode("Replan with feedback");
+
+    expect(secondPlan).not.toBeNull();
+    expect(secondPlan!.id).toBe(firstPlan!.id);
+    expect(secondPlan!.filePath).toBe(firstPlan!.filePath);
+    expect(readFileSync(firstPlan!.filePath, "utf-8")).toBe("plan draft v1");
+    expect(planSlugCache.get(planManager.sessionKey)).toBe("river-gate");
+  });
+
+  it("returns a structured collision error after 10 slug retries", async () => {
+    const wordSlug = await import("../src/planning/word-slug.js");
+    vi.spyOn(wordSlug, "generateWordSlug").mockReturnValue("aaa-bbb");
+
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { createEnterPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    mkdirSync(join(workspaceDir, "plans"), { recursive: true });
+    writeFileSync(join(workspaceDir, "plans", "aaa-bbb.md"), "taken", "utf-8");
+
+    const planManager = new PlanManager(workspaceDir);
+    const tool = createEnterPlanModeTool(planManager);
+    const result = await tool.execute("tool-call-1", {
+      task: "Collision probe",
+      reason: "Verify structured exhaustion handling",
+    });
+
+    const body = JSON.parse(result.content[0]!.text as string);
+
+    expect(body.status).toBe("error");
+    expect(body.message).toContain("slug collision after 10 retries");
   });
 });

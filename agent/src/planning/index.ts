@@ -1,143 +1,128 @@
-/**
- * PlanManager — qdevbot-parity plan mode (v0.4.3).
- *
- * Ports `qdevbot/src/planning/manager.ts` (behavioral parity, spec §1.2).
- *
- * Divergence D1: enterPlanMode catches FS errors internally and returns null
- * (rather than throwing) so the tool wrapper can surface `{status:"error"}`.
- */
-
 import * as fs from "fs";
 import { join } from "path";
+import { planSlugCache, slugCacheState } from "./slug-cache.js";
 import type {
   Plan,
   PlanEvent,
   PlanEventListener,
+  PlanStatus,
   PlanTask,
 } from "./types.js";
+import { generateWordSlug, MAX_SLUG_RETRIES } from "./word-slug.js";
+
+export interface PlanEnterError {
+  status: "error";
+  message: string;
+}
+
+export type EnterPlanModeResult = Plan | PlanEnterError | null;
+export type PlanPermissionMode = "default" | "plan";
 
 export class PlanManager {
   private _inPlanMode = false;
   private _currentPlan: Plan | null = null;
   private _plansDir: string;
   private _listeners: PlanEventListener[] = [];
+  private _sessionKey: object = this;
+  private _permissionMode: PlanPermissionMode = "default";
+  private _prePlanMode: PlanPermissionMode | null = null;
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
   }
 
-  // ---- getters -----------------------------------------------------------
-
-  /** Whether the agent is currently in plan mode. */
   get inPlanMode(): boolean {
     return this._inPlanMode;
   }
 
-  /** The current active plan, if any. */
   get currentPlan(): Plan | null {
     return this._currentPlan;
   }
 
-  /** Directory where plan files are stored. */
   get plansDir(): string {
     return this._plansDir;
   }
 
-  // ---- new API (qdevbot-parity) -----------------------------------------
+  get sessionKey(): object {
+    return this._sessionKey;
+  }
 
-  /**
-   * Enter plan mode. Creates a new plan file on disk.
-   * Returns the created plan, or null on FS failure (divergence D1).
-   *
-   * Plan-ID collision resolution: tries `plan-<ts>.md`, then `-1` through `-9`
-   * if pre-existing. If all 10 slots collide → throw (spec §1.2; this throw is
-   * INTENTIONALLY outside the D1 try/catch so the caller sees a hard error for
-   * genuinely pathological scenarios).
-   */
-  enterPlanMode(task: string, title?: string): Plan | null {
-    const baseId = `plan-${Date.now()}`;
+  get permissionMode(): PlanPermissionMode {
+    return this._permissionMode;
+  }
 
-    // Resolve a free planId — probe up to 10 suffix slots. Collision
-    // exhaustion propagates as a thrown Error by design.
-    let planId: string | null = null;
-    let candidatePath: string | null = null;
-    const primaryPath = join(this._plansDir, `${baseId}.md`);
-    if (!fs.existsSync(primaryPath)) {
-      planId = baseId;
-      candidatePath = primaryPath;
-    } else {
-      for (let i = 1; i <= 9; i++) {
-        const suffixed = `${baseId}-${i}`;
-        const suffixedPath = join(this._plansDir, `${suffixed}.md`);
-        if (!fs.existsSync(suffixedPath)) {
-          planId = suffixed;
-          candidatePath = suffixedPath;
-          break;
-        }
-      }
+  bindSession(session: object): void {
+    this._sessionKey = session;
+  }
+
+  capturePrePlanMode(): void {
+    if (this._permissionMode !== "plan") {
+      this._prePlanMode = this._permissionMode;
     }
-    if (planId === null || candidatePath === null) {
-      throw new Error(
-        `PlanManager.enterPlanMode: all 10 plan-id slots are occupied for base "${baseId}" — this should be unreachable outside pathological test scenarios.`,
-      );
-    }
+    this._permissionMode = "plan";
+    this._inPlanMode = true;
+  }
 
+  restorePrePlanMode(): void {
+    this._permissionMode = this._prePlanMode ?? "default";
+    this._prePlanMode = null;
+    this._inPlanMode = this._permissionMode === "plan";
+  }
+
+  enterPlanMode(task: string, title?: string): EnterPlanModeResult {
     const planTitle = title || this._deriveTitle(task);
 
-    const plan: Plan = {
-      id: planId,
-      title: planTitle,
-      task,
-      status: "active",
-      tasks: [],
-      filePath: candidatePath,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    const content = this._buildPlanFileContent(plan);
-
-    // Divergence D1: wrap ONLY the mkdirSync + writeFileSync in try/catch so
-    // genuine FS errors (EACCES, disk full) surface as null without mutating
-    // state. The collision-exhaustion throw above MUST propagate — that path
-    // is outside this try/catch by design.
     try {
-      if (!fs.existsSync(this._plansDir)) {
-        fs.mkdirSync(this._plansDir, { recursive: true });
-      }
-      fs.writeFileSync(candidatePath, content, "utf-8");
+      fs.mkdirSync(this._plansDir, { recursive: true });
     } catch {
-      // Swallow: no state mutation, no event emission, caller receives null.
       return null;
     }
 
-    // Emit `plan_created` BEFORE `plan_mode_entered` so subscribers can
-    // distinguish a first-time plan creation (here) from a re-entry of an
-    // existing plan (handled by `reenterPlanMode`, which only emits
-    // `plan_mode_entered` — matching qdevbot manager.ts:111).
-    // Placed inside the D1 success path: on FS failure above, neither event
-    // fires, preserving the "no partial mutation" invariant.
-    this._emit({
-      type: "plan_created",
-      planId: plan.id,
-      timestamp: Date.now(),
-    });
+    const session = this._sessionKey;
+    const cached = planSlugCache.get(session);
+    if (cached) {
+      const filePath = join(this._plansDir, `${cached}.md`);
+      try {
+        const state = slugCacheState.getState(session);
+        if (!fs.existsSync(filePath) || state === "terminal") {
+          fs.writeFileSync(filePath, "", "utf-8");
+        }
+      } catch {
+        return null;
+      }
 
-    this._currentPlan = plan;
-    this._inPlanMode = true;
-    this._emit({
-      type: "plan_mode_entered",
-      planId: plan.id,
-      timestamp: Date.now(),
-    });
+      slugCacheState.markActive(session);
+      return this._activatePlan(
+        this._buildPlan(cached, filePath, task, planTitle),
+        false,
+      );
+    }
 
-    return plan;
+    for (let attempt = 0; attempt < MAX_SLUG_RETRIES; attempt++) {
+      const slug = generateWordSlug();
+      const filePath = join(this._plansDir, `${slug}.md`);
+      if (fs.existsSync(filePath)) continue;
+
+      try {
+        fs.writeFileSync(filePath, "", "utf-8");
+      } catch {
+        return null;
+      }
+
+      planSlugCache.set(session, slug);
+      slugCacheState.markActive(session);
+      return this._activatePlan(
+        this._buildPlan(slug, filePath, task, planTitle),
+        true,
+      );
+    }
+
+    return {
+      status: "error",
+      message: "Failed to create plan file: slug collision after 10 retries",
+    };
   }
 
-  /**
-   * Exit plan mode. Optionally marks the plan as approved or abandoned.
-   * Returns null when not currently in plan mode or no current plan.
-   */
   exitPlanMode(approved: boolean = true): Plan | null {
     if (!this._inPlanMode || !this._currentPlan) return null;
 
@@ -148,6 +133,8 @@ export class PlanManager {
     this._writePlanFile(plan);
 
     this._inPlanMode = false;
+    this._permissionMode = "default";
+    this._prePlanMode = null;
     this._emit({
       type: "plan_mode_exited",
       planId: plan.id,
@@ -157,17 +144,29 @@ export class PlanManager {
     return plan;
   }
 
-  /**
-   * Re-enter plan mode with the most recent plan (for revision).
-   * Strips the `> Status: ...` marker from the on-disk file.
-   */
+  closePlanMode(status: PlanStatus = "approved"): Plan | null {
+    if (!this._currentPlan) return null;
+
+    this._currentPlan.status = status;
+    this._currentPlan.updatedAt = Date.now();
+    this._inPlanMode = false;
+    this._permissionMode = this._prePlanMode ?? "default";
+    this._prePlanMode = null;
+    this._emit({
+      type: "plan_mode_exited",
+      planId: this._currentPlan.id,
+      timestamp: Date.now(),
+    });
+    return this._currentPlan;
+  }
+
   reenterPlanMode(): Plan | null {
     if (this._inPlanMode) return this._currentPlan;
     if (!this._currentPlan) return null;
 
     this._currentPlan.status = "active";
     this._currentPlan.updatedAt = Date.now();
-    this._inPlanMode = true;
+    this.capturePrePlanMode();
 
     this._writePlanFile(this._currentPlan);
 
@@ -179,7 +178,6 @@ export class PlanManager {
     return this._currentPlan;
   }
 
-  /** Update the current plan's tasks. No-op when no current plan. */
   updatePlanTasks(tasks: PlanTask[]): void {
     if (!this._currentPlan) return;
     this._currentPlan.tasks = tasks;
@@ -192,17 +190,12 @@ export class PlanManager {
     });
   }
 
-  /** Read the current plan file; null when no plan or file absent (D4). */
   readPlanFile(): string | null {
     if (!this._currentPlan) return null;
     if (!fs.existsSync(this._currentPlan.filePath)) return null;
     return fs.readFileSync(this._currentPlan.filePath, "utf-8");
   }
 
-  /**
-   * Write arbitrary content to the current plan file.
-   * No-op when no current plan (D4 — caller must re-enter to recreate).
-   */
   writePlanContent(content: string): void {
     if (!this._currentPlan) return;
     fs.writeFileSync(this._currentPlan.filePath, content, "utf-8");
@@ -214,7 +207,6 @@ export class PlanManager {
     });
   }
 
-  /** Subscribe to plan events. Returns an unsubscribe function. */
   subscribe(listener: PlanEventListener): () => void {
     this._listeners.push(listener);
     return () => {
@@ -222,7 +214,44 @@ export class PlanManager {
     };
   }
 
-  // ---- private helpers ---------------------------------------------------
+  private _activatePlan(plan: Plan, emitCreated: boolean): Plan {
+    if (emitCreated) {
+      this._emit({
+        type: "plan_created",
+        planId: plan.id,
+        timestamp: Date.now(),
+      });
+    }
+
+    this._currentPlan = plan;
+    this.capturePrePlanMode();
+    this._emit({
+      type: "plan_mode_entered",
+      planId: plan.id,
+      timestamp: Date.now(),
+    });
+
+    return plan;
+  }
+
+  private _buildPlan(
+    id: string,
+    filePath: string,
+    task: string,
+    title: string,
+  ): Plan {
+    const now = Date.now();
+    return {
+      id,
+      title,
+      task,
+      status: "active",
+      tasks: [],
+      filePath,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
 
   private _emit(event: PlanEvent): void {
     for (const listener of this._listeners) {
@@ -262,7 +291,6 @@ export class PlanManager {
 
   private _writePlanFile(plan: Plan): void {
     if (!fs.existsSync(plan.filePath)) {
-      // File vanished — recreate from template.
       const content = this._buildPlanFileContent(plan);
       fs.writeFileSync(plan.filePath, content, "utf-8");
       return;
@@ -279,7 +307,6 @@ export class PlanManager {
       }
       fs.writeFileSync(plan.filePath, content, "utf-8");
     } else if (content.startsWith("> Status:")) {
-      // Re-entering active mode — strip the marker + optional blank line.
       content = content.replace(/^> Status:.*\n\n?/, "");
       fs.writeFileSync(plan.filePath, content, "utf-8");
     }
