@@ -1351,6 +1351,98 @@ describe("history — transcript_marker envelope", () => {
       );
     }
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Dangling-symlink regression (G4 flag, 2026-04-22).
+  //
+  // The previous InteractionHistory.updateLatestSymlink used existsSync,
+  // which follows symlinks. If the `latest` symlink pointed to a deleted
+  // session dir, existsSync returned false, unlinkSync was never called,
+  // symlinkSync failed with EEXIST, and the catch silenced the error —
+  // so `latest` stayed dangling indefinitely. Fix uses lstatSync to
+  // detect the symlink-regardless-of-target-validity case.
+  // ─────────────────────────────────────────────────────────────────────
+  it("updateLatestSymlink replaces a dangling `latest` symlink (G4 regression)", async () => {
+    const { InteractionHistory } = await import("../src/history.js");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fsMod = require("node:fs") as typeof import("node:fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pathMod = require("node:path") as typeof import("node:path");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const osMod = require("node:os") as typeof import("node:os");
+
+    const historyRoot = pathMod.join(osMod.homedir(), ".qlaybot", "history");
+    fsMod.mkdirSync(historyRoot, { recursive: true });
+    const latestPath = pathMod.join(historyRoot, "latest");
+
+    // Save current latest (if any) so we restore it after the test.
+    let originalTarget: string | null = null;
+    let originalKind: "symlink" | "dir" | null = null;
+    try {
+      const st = fsMod.lstatSync(latestPath);
+      if (st.isSymbolicLink()) {
+        originalTarget = fsMod.readlinkSync(latestPath);
+        originalKind = "symlink";
+      } else {
+        originalKind = "dir";
+      }
+    } catch {
+      /* latest does not currently exist — nothing to save */
+    }
+
+    try {
+      // Prepare a dangling symlink: point latest at a path that does not
+      // exist. existsSync(latestPath) would return false, reproducing the
+      // pre-fix behaviour.
+      if (originalKind !== null) fsMod.unlinkSync(latestPath);
+      const bogusTarget = pathMod.join(
+        historyRoot,
+        `dangling-target-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      );
+      fsMod.symlinkSync(bogusTarget, latestPath);
+
+      // Sanity — lstat returns a symlink; existsSync follows it and reports false.
+      expect(fsMod.lstatSync(latestPath).isSymbolicLink()).toBe(true);
+      expect(fsMod.existsSync(latestPath)).toBe(false);
+
+      // Act: constructing an InteractionHistory triggers updateLatestSymlink.
+      const sessionId = `symlink-regression-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
+      const history = new InteractionHistory(sessionId);
+
+      // Assert: symlink now points to the new session dir (not dangling).
+      expect(fsMod.existsSync(latestPath)).toBe(true);
+      expect(fsMod.lstatSync(latestPath).isSymbolicLink()).toBe(true);
+      const resolved = fsMod.readlinkSync(latestPath);
+      expect(resolved).toContain(sessionId);
+
+      // Clean up the test's session dir to avoid polluting .qlaybot/history.
+      try {
+        // history.sessionDir isn't public; derive from readlink.
+        if (fsMod.existsSync(resolved)) {
+          fsMod.rmSync(resolved, { recursive: true, force: true });
+        }
+      } catch {
+        /* */
+      }
+      void history; // silence unused-var warning
+    } finally {
+      // Restore original latest (if we saved one).
+      try {
+        if (fsMod.lstatSync(latestPath)) fsMod.unlinkSync(latestPath);
+      } catch {
+        /* */
+      }
+      if (originalKind === "symlink" && originalTarget) {
+        try {
+          fsMod.symlinkSync(originalTarget, latestPath);
+        } catch {
+          /* */
+        }
+      }
+    }
+  });
 });
 
 // ============================================================

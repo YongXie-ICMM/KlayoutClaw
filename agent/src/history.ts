@@ -3,7 +3,7 @@
  * Persists all interactions to ~/.qlaybot/history/YYYY-MM-DD/ for debugging and replay.
  */
 
-import { existsSync, mkdirSync, appendFileSync, writeFileSync, symlinkSync, unlinkSync } from "fs";
+import { mkdirSync, appendFileSync, writeFileSync, symlinkSync, unlinkSync, lstatSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import {
@@ -84,8 +84,17 @@ export class InteractionHistory {
   private updateLatestSymlink(): void {
     const latestPath = join(HISTORY_DIR, "latest");
     try {
-      if (existsSync(latestPath)) {
+      // Use lstatSync (not existsSync) so we detect dangling symlinks.
+      // existsSync follows symlinks, so a symlink whose target has been
+      // deleted evaluates to false — the old unlink branch never fired,
+      // the subsequent symlinkSync failed with EEXIST, and the catch
+      // silenced it indefinitely. lstatSync throws iff the path truly
+      // does not exist on disk (including as a symlink).
+      try {
+        lstatSync(latestPath);
         unlinkSync(latestPath);
+      } catch {
+        // Path does not exist at all — nothing to unlink.
       }
       symlinkSync(this.sessionDir, latestPath);
     } catch {
