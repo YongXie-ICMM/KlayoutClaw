@@ -118,7 +118,7 @@ KlayoutClaw/
 └── TODO.md                       # Task tracking
 ```
 
-## MCP Tools (10 total)
+## MCP Tools (19 total)
 
 | Tool | Description |
 |------|-------------|
@@ -132,6 +132,15 @@ KlayoutClaw/
 | `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess); includes `bulk_containment` + `arm_material_class` + `material_overlap_report` + `next_step_suggestion` |
 | `validate_pixel_size` | Validate pixel_size against known objectives |
 | `close_layout_view` | Close one or more layout tabs to keep the server healthy (modes: current/others/all, or by index) |
+| `vc_init` | Initialise version control for current layout (mode: auto/memory/disk). Wraps G5 `RepoHandle`. |
+| `vc_checkpoint` | Create a checkpoint (git commit) of the current layout with message + optional tags. |
+| `vc_history` | List checkpoint history `{commits:[{sha, message, ts, tags, branch, stats}, ...]}`. |
+| `vc_checkout` | Restore layout + sidecar HEAD to a prior checkpoint (agent-first, no dirty dialog). |
+| `vc_diff` | Structured polygon-level diff between two checkpoints. |
+| `vc_branch` | Branch ops: list / create / switch / merge. Merge conflicts return `{ok:false, conflicts:[...]}` atomically. |
+| `vc_tag` | Create an annotated tag at a ref. Duplicate names rejected. |
+| `vc_export` | Export a checkpoint as GDS bytes (base64) or pya code. Payloads over 256 KiB truncated to tempfile with `path`. |
+| `vc_status` | Report VC status `{branch, dirty, last_checkpoint_ts, pending, mode}`. Uninit returns `{ok:false, reason:"vc not initialized"}`. |
 
 See `docs/tools.md` for full parameter schemas.
 
