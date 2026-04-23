@@ -1106,3 +1106,94 @@ describe("Group 9: Inspect Window Key Routing", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Finding 1 (code-review-issue-23) — delegate placeholder parses both new and
+// legacy args. The reducer's SUBAGENT_PLACEHOLDER is idempotent, so the
+// fields written on the first tool_execution_start must be correct; if they
+// aren't, the panel shows "unknown / empty" forever.
+// ---------------------------------------------------------------------------
+import { parseDelegatePlaceholder } from "../src/tui/delegate-placeholder.js";
+
+describe("Finding 1: parseDelegatePlaceholder", () => {
+  it("new schema: {subagent_type, prompt} → role=subagent_type, task=prompt", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "general-purpose", prompt: "read README" }),
+    );
+    expect(fields).not.toBeNull();
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("read README");
+  });
+
+  it("legacy schema: {role, task} → role=role, task=task", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "designer", task: "design a Hall bar" }),
+    );
+    expect(fields).not.toBeNull();
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design a Hall bar");
+  });
+
+  it("new schema preferred over legacy when both present", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({
+        subagent_type: "scout",
+        prompt: "scout task",
+        role: "designer",
+        task: "designer task",
+      }),
+    );
+    expect(fields!.role).toBe("scout");
+    expect(fields!.task).toBe("scout task");
+  });
+
+  it("neither field present → falls back to general-purpose / empty", () => {
+    const fields = parseDelegatePlaceholder(JSON.stringify({ description: "oops" }));
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("");
+  });
+
+  it("already-object args (not a JSON string) are accepted", () => {
+    const fields = parseDelegatePlaceholder({ subagent_type: "analyst", prompt: "analyze" });
+    expect(fields!.role).toBe("analyst");
+    expect(fields!.task).toBe("analyze");
+  });
+
+  it("malformed JSON string returns null (caller falls back to 'started' event)", () => {
+    expect(parseDelegatePlaceholder("{not json")).toBeNull();
+  });
+
+  it("dispatching placeholder built from new-schema args yields correct panel entry", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "general-purpose", prompt: "read README" }),
+    )!;
+    let state = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-new",
+      role: fields.role,
+      task: fields.task,
+    } as TUIAction);
+    const subs = (state as any).subagents as SubagentTUIEntry[];
+    expect(subs).toHaveLength(1);
+    expect(subs[0].role).toBe("general-purpose");
+    expect(subs[0].task).toBe("read README");
+    expect(subs[0].status).toBe("running");
+  });
+
+  it("legacy placeholder remains correct end-to-end (regression)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "designer", task: "legacy task" }),
+    )!;
+    let state = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-legacy",
+      role: fields.role,
+      task: fields.task,
+    } as TUIAction);
+    const subs = (state as any).subagents as SubagentTUIEntry[];
+    expect(subs[0].role).toBe("designer");
+    expect(subs[0].task).toBe("legacy task");
+  });
+});

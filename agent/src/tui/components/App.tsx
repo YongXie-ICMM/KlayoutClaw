@@ -27,6 +27,7 @@ import { getConfigDir, getAllMCPServers } from "../../config.js";
 import { formatTurnMessage } from "../../verbose-helpers.js";
 import { TOOL_ANNOTATIONS } from "../../tools/annotations.js";
 import { resolvePlanApproval } from "../../planning/approval-gate.js";
+import { parseDelegatePlaceholder } from "../delegate-placeholder.js";
 import type { MCPServerData } from "./ConfigPanel.js";
 
 function isCurrentlyThinking(msg: import("../types.js").AssistantMessageData | null): boolean {
@@ -130,19 +131,22 @@ export function App({ botSession }: AppProps) {
         dispatch({ type: "THINKING_DELTA", delta }),
       onToolStartWithId: (toolCallId, toolName, args) => {
         dispatch({ type: "TOOL_START", toolCallId, toolName, args });
-        // Two-phase ID mapping: create placeholder entry for delegate tool
+        // Two-phase ID mapping: create placeholder entry for delegate tool.
+        // The reducer's SUBAGENT_PLACEHOLDER is idempotent — once an entry
+        // exists for this toolCallId it is NOT overwritten, so the fields
+        // must be correct on the first dispatch. Field-name translation is
+        // done in parseDelegatePlaceholder (see delegate-placeholder.ts).
         if (toolName === "delegate") {
-          try {
-            const parsed = typeof args === "string" ? JSON.parse(args) : (args ?? {}) as any;
+          const fields = parseDelegatePlaceholder(args);
+          if (fields) {
             dispatch({
               type: "SUBAGENT_PLACEHOLDER",
               toolCallId,
-              role: parsed.role ?? "unknown",
-              task: parsed.task ?? "",
+              role: fields.role,
+              task: fields.task,
             });
-          } catch {
-            // Malformed args — placeholder will be created by runner "started" fallback
           }
+          // Malformed args → placeholder will be created by runner "started" fallback
         }
       },
       onToolUpdate: (toolCallId, _toolName, partialResult) =>
