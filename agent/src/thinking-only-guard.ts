@@ -73,11 +73,40 @@ export function isThinkingOnlyTerminationByMessages(
 
   const last = msgs[lastAssistantIdx];
 
-  // Rate limits, upstream disconnects, aborts — always want a retry.
-  // pi-coding-agent's _autoRetry only handles some of these internally;
-  // when it exhausts, the error turn is what `prompt()` resolves on.
-  if (last.stopReason === "error" || last.stopReason === "aborted") {
+  // Aborted: upstream disconnect or signal. pi-coding-agent's
+  // _autoRetry only handles some of these internally; when it exhausts,
+  // the error turn is what `prompt()` resolves on.
+  if (last.stopReason === "aborted") {
     return true;
+  }
+
+  // stopReason="error" collapses two very different situations in
+  // pi-ai's provider normalization:
+  //
+  //   - Transport / rate-limit / catch-block errors: anthropic.js:318
+  //     and openai-completions.js:257 set `errorMessage` and leave
+  //     `content: []` (the ml09/ml11 shape — 429 rate-limits).
+  //   - Deliberate provider refusals / safety filters: anthropic.js:689
+  //     ("refusal"), :695 ("sensitive"), openai-completions.js:646
+  //     ("content_filter"). These pass through the normal stream path
+  //     so any refusal text emitted before the stop is preserved in
+  //     `content`, and `errorMessage` is NOT set.
+  //
+  // Retrying a refusal up to 5 times wastes requests and can replace a
+  // clean refusal with nonsensical follow-up text. Only retry when the
+  // error has no preserved content — that is the transport-error
+  // signature.
+  if (last.stopReason === "error") {
+    const content = Array.isArray(last.content) ? last.content : [];
+    const hasAnyText = content.some(
+      (c: any) =>
+        c?.type === "text" &&
+        typeof c.text === "string" &&
+        c.text.trim().length > 0,
+    );
+    // No text content → transport/rate-limit pattern → retry.
+    // Has text content → refusal-like → do NOT retry, preserve the stop.
+    return !hasAnyText;
   }
 
   // Stalled tool-use: the model emitted a tool call but the loop never

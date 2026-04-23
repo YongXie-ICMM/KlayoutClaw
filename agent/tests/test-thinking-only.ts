@@ -202,6 +202,39 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
     expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
   });
 
+  it("refusal with content text (stopReason=error + 'I can't help') → false", () => {
+    // Finding #3 (2026-04-23). pi-ai collapses anthropic "refusal"/
+    // "sensitive" and openai "content_filter" into stopReason="error".
+    // Transport errors leave content=[] and set errorMessage; refusals
+    // preserve the refusal text in content. Only retry when content
+    // has no text.
+    const msgs = [
+      makeUser("do something policy-violating"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [{ type: "text", text: "I can't help with that." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("content-filter (stopReason=error + refusal + thinking) → false", () => {
+    // openai-completions content_filter: thinking block may still be
+    // present alongside the refusal text. The refusal text is the
+    // signal we should honour.
+    const msgs = [
+      makeUser("banned request"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [
+          { type: "thinking", thinking: "Considering policy..." },
+          { type: "text", text: "I won't do that." },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
   it("aborted mid-stream (stopReason=aborted) → true", () => {
     const msgs = [
       makeUser("go"),
