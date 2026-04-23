@@ -169,6 +169,21 @@ export function isThinkingOnlyTermination(
 ): boolean {
   if (isThinkingOnlyTerminationByMessages(session)) return true;
   const a = tracker.current();
+  // Fallback: no text, no tool execution → treat as early-exit.
+  //
+  // GOTCHA for future callers: `AgentSession.prompt()` has three
+  // early-return-without-assistant-event paths (agent-session.js:500-538):
+  //   1. extension command handled (`/foo` routed to _tryExecuteExtensionCommand)
+  //   2. input handler returned action="handled" (_extensionRunner.emitInput)
+  //   3. already-streaming followUp/steer queue
+  // qlaybot does NOT pass `extensionRunnerRef` to AgentSession (see
+  // agent.ts:397) and slash commands are routed BEFORE `prompt()` by
+  // the CommandRegistry, so paths 1 and 2 are unreachable. Path 3
+  // throws without `streamingBehavior` — also unreachable silently.
+  // If qlaybot ever wires up pi extensions or concurrent prompts,
+  // narrow this fallback to require a terminal assistant message with
+  // `stopReason` present (proof the agent loop actually ran).
+  // See docs/code-review-issue-22-finding2-investigation.md.
   return !a.sawText && !a.sawToolCall;
 }
 
