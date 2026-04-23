@@ -8,6 +8,10 @@ import { subscribeToSession } from "./events.js";
 import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
 import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
+import {
+  createTurnActivityTracker,
+  runPromptWithThinkingOnlyGuard,
+} from "./thinking-only-guard.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
@@ -285,8 +289,21 @@ export async function startRPCServer(opts: {
             },
           });
 
+          const tracker = createTurnActivityTracker(botSession.session);
           try {
-            await botSession.session.prompt(message);
+            // Defense in depth against thinking-only terminations. Same guard
+            // as cli.ts runJSON — see thinking-only-guard.ts and issue #22.
+            await runPromptWithThinkingOnlyGuard(
+              botSession.session,
+              message,
+              tracker,
+              {
+                onRetry: (attempt, max) => {
+                  sendEvent("thinking_only_reprompt", { attempt, max });
+                },
+              },
+            );
+
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
             sendResult(req.id, { status: "completed", response: responseText });
@@ -297,6 +314,7 @@ export async function startRPCServer(opts: {
             sendError(req.id, -32000, `Prompt failed: ${msg}`);
           } finally {
             unsubscribe();
+            tracker.unsubscribe();
           }
           break;
         }

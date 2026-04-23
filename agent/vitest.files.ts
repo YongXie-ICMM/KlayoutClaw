@@ -28,6 +28,7 @@ export const unitFiles = [
   "tests/test-phase5-vc-mcp.ts",
   "tests/test-prompts.ts",
   "tests/test-t16-graceful-degradation.ts",
+  "tests/test-thinking-only.ts",
 ];
 
 export const integrationFiles = [
@@ -35,6 +36,7 @@ export const integrationFiles = [
   "tests/test-runtime-wiring.ts",
   "tests/test-subagent-e2e.ts",
   "tests/test-thinking-e2e.ts",
+  "tests/test-thinking-only-rpc.ts",
 ];
 
 export const e2eFiles = [
