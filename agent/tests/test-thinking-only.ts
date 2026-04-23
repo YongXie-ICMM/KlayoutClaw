@@ -1,14 +1,30 @@
 /**
- * Unit tests for the thinking-only termination guard (issue #22).
+ * Unit tests for the early-exit / thinking-only termination guard
+ * (issue #22).
  *
- * These test the POST-fix behavior of `isThinkingOnlyTerminationByMessages`,
- * `createTurnActivityTracker`, and the combined `isThinkingOnlyTermination`.
+ * Critical design note: `@mariozechner/pi-ai` normalises all provider
+ * outputs to canonical {text, thinking, toolCall} blocks before they
+ * land in `session.messages` (see pi-ai/dist/types.d.ts:114). So these
+ * tests use the canonical shape for every provider path. What actually
+ * differs across providers (anthropic / kimi-coding / openai-completions)
+ * is the FAILURE MODE, not the block types:
  *
- * The original single-file detector in `cli.ts` only recognised the finalized
- * `{type:"thinking"}` block and assumed `msgs[msgs.length-1]` was always an
- * assistant turn with an array `content`. The failures documented in
- * `docs/early_exit_report_2026_04_23_k2p6.md` prove that is not always the
- * case. See the plan doc for the 4 hypotheses this suite covers.
+ *   - kimi-coding (anthropic-messages API): 429 overload → stopReason
+ *     "error", content=[]. Auto-retry may exhaust, or a toolUse turn
+ *     may be left with an un-executed tool call.
+ *   - custom-anthropic (anthropic-messages API): same canonical shape;
+ *     the historical issue-#22 hypothesis was a clean thinking-only
+ *     stop with a finalized `thinking` block.
+ *   - custom-openai (openai-completions API): same canonical shape via
+ *     pi-ai's openai-completions provider. `reasoning`-typed content
+ *     would only appear if pi-ai broke its normalization; we assert
+ *     the guard still catches it as a defensive measure.
+ *
+ * The real ml09/ml11 shapes were captured from
+ *   ~/.qlaybot/sessions/2026-04-23T06-53-* .jsonl
+ *   ~/.qlaybot/sessions/2026-04-23T06-58-* .jsonl
+ * and are reproduced verbatim (truncated) in the provider-specific
+ * fixtures below.
  */
 
 import { describe, it, expect } from "vitest";
@@ -18,159 +34,320 @@ import {
   isThinkingOnlyTerminationByMessages,
 } from "../src/thinking-only-guard.js";
 
-describe("isThinkingOnlyTerminationByMessages — healthy cases", () => {
-  it("healthy turn with text content returns false", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "let me think..." },
-            { type: "text", text: "Here is the answer." },
-          ],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+// ---------------------------------------------------------------------------
+// Canonical SDK message-shape helpers (matches pi-ai types.d.ts:114)
+// ---------------------------------------------------------------------------
+
+interface CanonicalAssistant {
+  role: "assistant";
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "thinking"; thinking: string; thinkingSignature?: string }
+    | { type: "toolCall"; id: string; name: string; arguments: any }
+  >;
+  api: string;
+  provider: string;
+  model: string;
+  usage: any;
+  stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+  errorMessage?: string;
+  timestamp: number;
+}
+
+function makeAssistant(
+  provider: "kimi-coding" | "custom-anthropic" | "custom-openai",
+  opts: {
+    stopReason: CanonicalAssistant["stopReason"];
+    content: CanonicalAssistant["content"];
+    errorMessage?: string;
+  },
+): CanonicalAssistant {
+  return {
+    role: "assistant",
+    content: opts.content,
+    api:
+      provider === "custom-openai" ? "openai-completions" : "anthropic-messages",
+    provider,
+    model: provider === "kimi-coding" ? "k2p6" : provider === "custom-anthropic" ? "claude-opus-4-6" : "gpt-5",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: opts.stopReason,
+    errorMessage: opts.errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
+function makeUser(text: string): any {
+  return {
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp: Date.now(),
+  };
+}
+
+function makeToolResult(toolCallId: string, text: string): any {
+  return {
+    role: "toolResult",
+    toolCallId,
+    toolName: "read",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Healthy terminations — MUST return false (no re-prompt)
+// ---------------------------------------------------------------------------
+
+describe("healthy terminations (no retry)", () => {
+  it("stopReason=stop with text content → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "Here is my answer." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("tool-call-only turn (toolCall) returns false", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "..." },
-            { type: "toolCall", name: "x", args: {} },
-          ],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+  it("stopReason=stop with text + thinking → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "let me think..." },
+          { type: "text", text: "Here is my answer." },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("tool-call-only turn (tool_use variant) returns false", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "..." },
-            { type: "tool_use", name: "x", input: {} },
-          ],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+  it("stopReason=toolUse FOLLOWED BY toolResult (mid-convo) → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "need to read" },
+          { type: "toolCall", id: "t1", name: "read", arguments: { path: "x" } },
+        ],
+      }),
+      makeToolResult("t1", "file content..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "done" }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Early-exit patterns observed in the ml09/ml11 evidence
+// ---------------------------------------------------------------------------
+
+describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
+  it("rate-limit error (stopReason=error, content=[]) — auto-retry exhausted → true", () => {
+    // Shape observed at
+    //   ~/.qlaybot/sessions/2026-04-23T06-53-24-810Z_...jsonl entry 4
+    // Historical: the original detector returned FALSE here because
+    // content=[] satisfied neither hasThinking nor any other condition.
+    const msgs = [
+      makeUser("start work"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"The engine is currently overloaded..."},"type":"error"}',
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
   });
 
-  it("empty messages array returns false", () => {
+  it("stalled toolUse — toolCall emitted but no trailing toolResult → true", () => {
+    // Shape observed at
+    //   ~/.qlaybot/sessions/2026-04-23T06-58-19-676Z_...jsonl LAST entry.
+    // After the SDK's auto-retry shuffled state, `prompt()` resolved
+    // leaving the tool call un-executed. The original detector returned
+    // FALSE here because hasToolCall=true.
+    const msgs = [
+      makeUser("start work"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          {
+            type: "thinking",
+            thinking:
+              "This is a complex multi-step task. Let me save the checklist.",
+          },
+          {
+            type: "toolCall",
+            id: "t1",
+            name: "write",
+            arguments: { path: "/tmp/checklist.md", content: "..." },
+          },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("aborted mid-stream (stopReason=aborted) → true", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "aborted",
+        content: [],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+describe("custom-anthropic — issue-#22 original hypothesis", () => {
+  it("clean thinking-only stop (stopReason=stop, content=[thinking]) → true", () => {
+    // The plan-doc's canonical thinking-only shape. This is what the
+    // ORIGINAL detector was designed to catch, and it still does.
+    const msgs = [
+      makeUser("solve this"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          {
+            type: "thinking",
+            thinking:
+              "Let me work through this step by step...",
+            thinkingSignature: "SIG...",
+          },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("thinking + empty text (only whitespace) → true", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "thinking body" },
+          { type: "text", text: "   \n\t  " },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+describe("custom-openai — openai-completions API", () => {
+  it("clean thinking-only (canonical shape still used post-normalization) → true", () => {
+    // pi-ai/providers/openai-completions.js normalizes reasoning output
+    // into canonical {type:"thinking", thinking:"..."} blocks. Test the
+    // canonical shape for this provider.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-openai", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "o1-style reasoning text..." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("defensive: legacy-shaped 'reasoning' block still detected → true", () => {
+    // Should pi-ai ever surface a non-canonical `reasoning` type directly
+    // (e.g., a new openai provider variant), the guard still catches it.
+    const msgs = [
+      makeUser("go"),
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", text: "non-canonical reasoning body" }],
+      } as any,
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Edge / defensive cases
+// ---------------------------------------------------------------------------
+
+describe("edge cases", () => {
+  it("empty messages array → false", () => {
     expect(isThinkingOnlyTerminationByMessages({ messages: [] })).toBe(false);
   });
 
-  it("missing messages field returns false", () => {
+  it("missing messages field → false", () => {
     expect(isThinkingOnlyTerminationByMessages({})).toBe(false);
   });
-});
 
-describe("isThinkingOnlyTerminationByMessages — finalized thinking shapes", () => {
-  it("finalized 'thinking' block is detected (original happy path)", () => {
-    const session = {
-      messages: [
-        { role: "user", content: [{ type: "text", text: "go" }] },
-        {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "reasoning body" }],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(true);
+  it("no assistant turn anywhere → false (shape abstains, fallback decides)", () => {
+    const msgs = [makeUser("hi")];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("hypothesis 2a: 'thinking_block' variant is detected", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "thinking_block", text: "reasoning body" }],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(true);
+  it("trailing user message does not defeat walk-back to assistant", () => {
+    // e.g. a pending-next-turn message injected after the assistant.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "body" }],
+      }),
+      makeUser("ping"),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
   });
 
-  it("hypothesis 2b: 'reasoning' variant is detected", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "reasoning", text: "reasoning body" }],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(true);
+  it("empty-body thinking ('  ') with stopReason=stop → false", () => {
+    const msgs = [
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "   " }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("empty thinking body returns false (no actual reasoning content)", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "" }],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
-  });
-});
-
-describe("isThinkingOnlyTerminationByMessages — walk-back to last assistant", () => {
-  it("skips a trailing user message to inspect the preceding assistant turn", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "..." }],
-        },
-        { role: "user", content: [{ type: "text", text: "continue" }] },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(true);
-  });
-});
-
-describe("isThinkingOnlyTerminationByMessages — malformed / edge shapes", () => {
-  it("hypothesis 4a: content undefined returns false (shape detector abstains)", () => {
-    const session = {
-      messages: [{ role: "assistant", content: undefined }],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+  it("tool-call-only turn followed by toolResult → false", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "toolCall", id: "t1", name: "read", arguments: {} },
+        ],
+      }),
+      makeToolResult("t1", "..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "ok" }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("hypothesis 4b: content is a string returns false (shape detector abstains)", () => {
-    const session = {
-      messages: [{ role: "assistant", content: "just a string" as unknown as any[] }],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+  it("malformed: content is a string → false (can't decide from shape)", () => {
+    const msgs = [
+      { role: "assistant", content: "some raw string" as any } as any,
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
-  it("hypothesis 3: no assistant message (only user) returns false", () => {
-    const session = {
-      messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
-  });
-
-  it("hypothesis 1: only a streaming thinking_delta returns false (not finalized)", () => {
-    const session = {
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "thinking_delta", delta: "..." }],
-        },
-      ],
-    };
-    expect(isThinkingOnlyTerminationByMessages(session)).toBe(false);
+  it("malformed: content is undefined → false (can't decide from shape)", () => {
+    const msgs = [{ role: "assistant", content: undefined } as any];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 });
 
@@ -200,103 +377,134 @@ function mockSession(messages: any[] = []): {
 }
 
 describe("createTurnActivityTracker", () => {
-  it("records sawText when a text_delta message_update fires", () => {
+  it("records sawText on a text_delta message_update", () => {
     const s = mockSession();
     const tracker = createTurnActivityTracker(s);
     s.emit({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "hi" },
     });
-    expect(tracker.current().sawText).toBe(true);
+    expect(tracker.current()).toEqual({ sawText: true, sawToolCall: false });
+    tracker.unsubscribe();
+  });
+
+  it("records sawToolCall on tool_execution_start", () => {
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({ type: "tool_execution_start", toolName: "x", args: {} });
+    expect(tracker.current()).toEqual({ sawText: false, sawToolCall: true });
+    tracker.unsubscribe();
+  });
+
+  it("does NOT set sawToolCall on a toolcall_start content block (pre-execution)", () => {
+    // Critical distinction: toolcall_start is a content_block event from
+    // the model stream; tool_execution_start is a top-level agent-loop
+    // event that fires only when the tool handler is actually invoked.
+    // The stalled-toolUse case (issue #22) is exactly: toolcall_start
+    // fires but tool_execution_start does not.
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_end", contentIndex: 0 },
+    });
     expect(tracker.current().sawToolCall).toBe(false);
     tracker.unsubscribe();
   });
 
-  it("records sawToolCall when tool_execution_start fires", () => {
-    const s = mockSession();
-    const tracker = createTurnActivityTracker(s);
-    s.emit({ type: "tool_execution_start", toolName: "x", args: {} });
-    expect(tracker.current().sawToolCall).toBe(true);
-    tracker.unsubscribe();
-  });
-
-  it("ignores thinking_delta and other unrelated events", () => {
+  it("ignores thinking_delta", () => {
     const s = mockSession();
     const tracker = createTurnActivityTracker(s);
     s.emit({
       type: "message_update",
       assistantMessageEvent: { type: "thinking_delta", delta: "..." },
     });
-    s.emit({ type: "turn_start" });
-    s.emit({ type: "turn_end" });
     expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
     tracker.unsubscribe();
   });
 
-  it("reset() clears activity for the next turn", () => {
+  it("reset() clears between turns", () => {
     const s = mockSession();
     const tracker = createTurnActivityTracker(s);
     s.emit({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "hi" },
     });
-    expect(tracker.current().sawText).toBe(true);
     tracker.reset();
     expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
     tracker.unsubscribe();
   });
 
-  it("tolerates a session without a subscribe method", () => {
+  it("tolerates session with no subscribe method", () => {
     const tracker = createTurnActivityTracker({} as any);
     expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
     expect(() => tracker.unsubscribe()).not.toThrow();
   });
 });
 
-describe("isThinkingOnlyTermination — combined detector", () => {
-  it("hypothesis 1 fallback: streaming-only thinking_delta with no activity → true", () => {
-    // The message shape has only a thinking_delta (not a finalized block),
-    // so the shape detector returns false. No text/tool events fired, so
-    // the activity fallback catches it.
+describe("isThinkingOnlyTermination (combined)", () => {
+  it("shape catches the kimi stalled-toolUse regardless of tracker state", () => {
     const s = mockSession([
-      {
-        role: "assistant",
-        content: [{ type: "thinking_delta", delta: "..." }],
-      },
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "..." },
+          { type: "toolCall", id: "t1", name: "write", arguments: {} },
+        ],
+      }),
     ]);
     const tracker = createTurnActivityTracker(s);
-    expect(isThinkingOnlyTerminationByMessages(s)).toBe(false);
+    // Simulate the "toolcall emitted but not executed" event stream —
+    // toolcall_start/end but no tool_execution_start.
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "..." },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_end", contentIndex: 1 },
+    });
     expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
     tracker.unsubscribe();
   });
 
-  it("hypothesis 3 fallback: no terminal assistant message + no activity → true", () => {
+  it("shape catches kimi rate-limit (stopReason=error, content=[])", () => {
     const s = mockSession([
-      { role: "user", content: [{ type: "text", text: "go" }] },
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "429 rate_limit_error",
+      }),
     ]);
     const tracker = createTurnActivityTracker(s);
     expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
     tracker.unsubscribe();
   });
 
-  it("shape detector still wins for finalized thinking blocks", () => {
-    const s = mockSession([
-      {
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "body" }],
-      },
-    ]);
+  it("fallback catches 'no terminal assistant + no activity'", () => {
+    const s = mockSession([makeUser("go")]);
     const tracker = createTurnActivityTracker(s);
     expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
     tracker.unsubscribe();
   });
 
-  it("healthy turn: text_delta fired → false", () => {
+  it("healthy: text_delta fired → false", () => {
     const s = mockSession([
-      {
-        role: "assistant",
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
         content: [{ type: "text", text: "hello" }],
-      },
+      }),
     ]);
     const tracker = createTurnActivityTracker(s);
     s.emit({
@@ -307,15 +515,25 @@ describe("isThinkingOnlyTermination — combined detector", () => {
     tracker.unsubscribe();
   });
 
-  it("tool-only turn: tool_execution_start fired → false", () => {
+  it("healthy: tool was actually executed (tool_execution_start fired) → false", () => {
     const s = mockSession([
-      {
-        role: "assistant",
-        content: [{ type: "toolCall", name: "x", args: {} }],
-      },
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }],
+      }),
+      makeToolResult("t1", "data"),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "done" }],
+      }),
     ]);
     const tracker = createTurnActivityTracker(s);
-    s.emit({ type: "tool_execution_start", toolName: "x", args: {} });
+    s.emit({ type: "tool_execution_start", toolName: "read", args: {} });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "done" },
+    });
     expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
   });

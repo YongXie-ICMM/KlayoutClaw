@@ -1,10 +1,24 @@
 /**
- * Thinking-only termination detector + activity-stream fallback.
+ * Early-exit termination detector + activity-stream fallback.
  *
- * Guards qlaybot's `-m` JSON and RPC modes against runs where the model
- * emits only reasoning, stops with no text / no tool call, and the SDK
- * reports completion. See issue #22 and
- * `docs/early_exit_report_2026_04_23_k2p6.md`.
+ * Despite the "thinking-only" naming (kept for issue-#22 continuity), this
+ * guard catches several modes of `session.prompt()` returning before the
+ * agent actually finished:
+ *
+ *   1. Pure thinking-only turn (stop after a reasoning block, no text /
+ *      no tool call) — the original plan-doc hypothesis.
+ *   2. Terminal `stopReason: "error"` or `"aborted"` — e.g. k2p6 429
+ *      rate-limit where pi-coding-agent's auto-retry exhausted. Content
+ *      is typically `[]`, making the message-shape detector useless.
+ *   3. Terminal `stopReason: "toolUse"` with a pending tool call that
+ *      was never executed (no trailing `toolResult`) — observed in
+ *      ml09/ml11 after the SDK's retry path short-circuited.
+ *
+ * The message-shape detector covers (1) and (3) and as much of (2) as is
+ * possible to see (content: []). The activity-stream fallback is a
+ * belt-and-suspenders guard for malformed shapes and "no terminal
+ * assistant message at all" cases. See
+ * `docs/early_exit_report_2026_04_23_k2p6.md` and issue #22.
  */
 
 export const THINKING_ONLY_MAX_RETRIES = 5;
@@ -25,47 +39,93 @@ export interface TurnActivityTracker {
 
 /**
  * Message-shape detector. Walks back from the end of `session.messages`
- * to the most recent assistant turn and classifies it. Returns true only
- * when that turn has reasoning content but no text and no tool call.
+ * to the most recent assistant turn and classifies it as an early-exit
+ * termination. Returns true when any of these holds:
  *
- * Handles multiple finalized reasoning-block shapes the SDK may use:
- * `thinking`, `thinking_block`, and `reasoning`. Streaming-delta content
- * (e.g. bare `thinking_delta`) is NOT detectable here — callers must
- * rely on the activity-stream fallback for that case.
+ *   - stopReason is "error" or "aborted" (rate-limits, upstream disconnect)
+ *   - stopReason is "toolUse" but no `toolResult` follows (pi-coding-agent
+ *     retry path left the tool call dangling)
+ *   - Content is reasoning-only with no text and no tool call
+ *
+ * Also matches legacy / hypothetical shapes (thinking_block, reasoning,
+ * tool_use, tool_call) as a defensive measure against future SDK changes —
+ * the canonical pi-ai types are toolCall / thinking / text.
  */
 export function isThinkingOnlyTerminationByMessages(
   session: { messages?: unknown[] },
 ): boolean {
   const msgs = (session.messages ?? []) as any[];
+
+  let lastAssistantIdx = -1;
+  let sawToolResultAfterAssistant = false;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
-    if (!m || m.role !== "assistant") continue;
-    if (!Array.isArray(m.content)) return false;
-
-    const hasText = m.content.some(
-      (c: any) =>
-        c?.type === "text" &&
-        typeof c.text === "string" &&
-        c.text.trim().length > 0,
-    );
-    const hasToolCall = m.content.some(
-      (c: any) =>
-        c?.type === "toolCall" ||
-        c?.type === "tool_use" ||
-        c?.type === "tool_call",
-    );
-    if (hasText || hasToolCall) return false;
-
-    const hasThinking = m.content.some((c: any) => {
-      if (!c) return false;
-      if (c.type === "thinking" && typeof c.thinking === "string" && c.thinking.trim().length > 0) return true;
-      if (c.type === "thinking_block" && typeof c.text === "string" && c.text.trim().length > 0) return true;
-      if (c.type === "reasoning" && typeof c.text === "string" && c.text.trim().length > 0) return true;
-      return false;
-    });
-    return hasThinking;
+    if (!m) continue;
+    if (m.role === "assistant") {
+      lastAssistantIdx = i;
+      break;
+    }
+    if (m.role === "toolResult") {
+      sawToolResultAfterAssistant = true;
+    }
   }
-  return false;
+  if (lastAssistantIdx === -1) return false;
+
+  const last = msgs[lastAssistantIdx];
+
+  // Rate limits, upstream disconnects, aborts — always want a retry.
+  // pi-coding-agent's _autoRetry only handles some of these internally;
+  // when it exhausts, the error turn is what `prompt()` resolves on.
+  if (last.stopReason === "error" || last.stopReason === "aborted") {
+    return true;
+  }
+
+  // Stalled tool-use: the model emitted a tool call but the loop never
+  // ran executeToolCalls on it (no trailing toolResult), so `prompt()`
+  // resolved mid-turn.
+  if (last.stopReason === "toolUse" && !sawToolResultAfterAssistant) {
+    return true;
+  }
+
+  if (!Array.isArray(last.content)) return false;
+
+  const hasText = last.content.some(
+    (c: any) =>
+      c?.type === "text" &&
+      typeof c.text === "string" &&
+      c.text.trim().length > 0,
+  );
+  const hasToolCall = last.content.some(
+    (c: any) =>
+      c?.type === "toolCall" ||
+      c?.type === "tool_use" ||
+      c?.type === "tool_call",
+  );
+  if (hasText || hasToolCall) return false;
+
+  const hasThinking = last.content.some((c: any) => {
+    if (!c) return false;
+    if (
+      c.type === "thinking" &&
+      typeof c.thinking === "string" &&
+      c.thinking.trim().length > 0
+    )
+      return true;
+    if (
+      c.type === "thinking_block" &&
+      typeof c.text === "string" &&
+      c.text.trim().length > 0
+    )
+      return true;
+    if (
+      c.type === "reasoning" &&
+      typeof c.text === "string" &&
+      c.text.trim().length > 0
+    )
+      return true;
+    return false;
+  });
+  return hasThinking;
 }
 
 /**

@@ -144,6 +144,112 @@ describe("RPC-mode thinking-only retry integration", () => {
     tracker.unsubscribe();
   });
 
+  it("kimi-coding ml09 pattern: stalled toolUse (no toolResult) triggers re-prompt", async () => {
+    // Mirrors the real ml09 failure: the final assistant turn has
+    // stopReason=toolUse + a toolCall, but the tool was never executed
+    // (no toolResult appended). The original detector returned false
+    // because hasToolCall=true. The new stopReason-aware detector
+    // catches it.
+    const sentEvents: Array<{ name: string; params: any }> = [];
+    const sendEvent = (name: string, params: any) =>
+      sentEvents.push({ name, params });
+
+    const session = createMockSession([
+      // Turn 1: the real ml09 shape — stopReason=toolUse, has toolCall,
+      // but the mock never appends a toolResult afterwards.
+      (emit, messages) => {
+        // tool content-block events fire (toolcall_start/end), but
+        // tool_execution_start does NOT — the loop short-circuited.
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+        });
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "toolcall_end", contentIndex: 1 },
+        });
+        messages.push({
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Let me save the checklist." },
+            {
+              type: "toolCall",
+              id: "t1",
+              name: "write",
+              arguments: { path: "/tmp/checklist.md" },
+            },
+          ],
+          stopReason: "toolUse",
+        });
+      },
+      // Turn 2: after the continue-prompt, the model produces text.
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "recovered" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "recovered" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "design the device",
+      tracker,
+      {
+        onRetry: (attempt, max) =>
+          sendEvent("thinking_only_reprompt", { attempt, max }),
+      },
+    );
+
+    expect(result.retries).toBe(1);
+    expect(result.stillThinkingOnly).toBe(false);
+    expect(sentEvents).toEqual([
+      { name: "thinking_only_reprompt", params: { attempt: 1, max: 5 } },
+    ]);
+    tracker.unsubscribe();
+  });
+
+  it("kimi-coding rate-limit pattern: stopReason=error + content=[] triggers re-prompt", async () => {
+    const session = createMockSession([
+      // Turn 1: the 429 rate-limit shape.
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "429 rate_limit_error",
+        });
+      },
+      // Turn 2: recovery.
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "ok" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "go",
+      tracker,
+    );
+    expect(result.retries).toBe(1);
+    expect(result.stillThinkingOnly).toBe(false);
+    tracker.unsubscribe();
+  });
+
   it("keeps re-prompting and gives up at maxRetries when stuck", async () => {
     // All 6 turns stay thinking-only — the loop should stop at
     // maxRetries=2 (1 initial + 2 retries = 3 total prompts) and signal
