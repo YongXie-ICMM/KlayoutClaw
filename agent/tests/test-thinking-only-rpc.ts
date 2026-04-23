@@ -278,4 +278,142 @@ describe("RPC-mode thinking-only retry integration", () => {
     expect(session.promptCalls.length).toBe(3);
     tracker.unsubscribe();
   });
+
+  // ---------------------------------------------------------------------------
+  // Finding #1 (2026-04-23): partial-text-then-error must not contaminate retry
+  // ---------------------------------------------------------------------------
+
+  it("partial text from failed turn is discarded before retry (cli-mode contract)", async () => {
+    // Mirrors cli.ts runJSON: caller owns `chunks`, resets it in onRetry.
+    const chunks: string[] = [];
+
+    const session = createMockSession([
+      // Turn 1: model streams "partial " then terminates with stopReason=error
+      // (the ml09-style shape: rate-limit after some tokens have made it
+      // through the stream).
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "partial " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "429 rate_limit_error",
+        });
+      },
+      // Turn 2: clean recovery.
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "retry text" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "retry text" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "go",
+      tracker,
+      {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      },
+    );
+    expect(result.retries).toBe(1);
+    // If the guard did not reset chunks, this would be "partial retry text".
+    expect(chunks.join("")).toBe("retry text");
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("RPC mode emits thinking_only_reset between partial-text-then-error turns", async () => {
+    // Mirrors rpc.ts: chunks reset + client-visible `thinking_only_reset`
+    // event emitted before `thinking_only_reprompt`.
+    const sentEvents: Array<{ name: string; params: any }> = [];
+    const sendEvent = (name: string, params: any) =>
+      sentEvents.push({ name, params });
+
+    const chunks: string[] = [];
+    const session = createMockSession([
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "half-written " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "500 upstream_disconnected",
+        });
+      },
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "final" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "final" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        const text = ev.assistantMessageEvent.delta;
+        chunks.push(text);
+        sendEvent("content_delta", { delta: { type: "text_delta", text } });
+      }
+    });
+
+    const tracker = createTurnActivityTracker(session);
+    await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+      onRetry: (attempt, max) => {
+        chunks.length = 0;
+        sendEvent("thinking_only_reset", { attempt, max });
+        sendEvent("thinking_only_reprompt", { attempt, max });
+      },
+    });
+
+    // Final chunks contain only the retry output.
+    expect(chunks.join("")).toBe("final");
+
+    // Event ordering: partial content_delta, then reset+reprompt, then
+    // the retry's content_delta.
+    const names = sentEvents.map((e) => e.name);
+    expect(names).toEqual([
+      "content_delta",
+      "thinking_only_reset",
+      "thinking_only_reprompt",
+      "content_delta",
+    ]);
+    expect(sentEvents[1].params).toEqual({ attempt: 1, max: 5 });
+    expect(sentEvents[2].params).toEqual({ attempt: 1, max: 5 });
+
+    tracker.unsubscribe();
+    unsub();
+  });
 });

@@ -363,6 +363,11 @@ async function runJSON(args: CLIArgs): Promise<void> {
       tracker,
       {
         onRetry: (attempt, max) => {
+          // Drop any partial text the failed turn streamed before the
+          // error stopReason arrived — otherwise the final JSON response
+          // would be `partial_failed_text + retry_text`. See code-review
+          // finding #1 (2026-04-23).
+          chunks.length = 0;
           console.error(
             `[qlaybot] thinking-only termination detected (attempt ${attempt}/${max}), re-prompting...`,
           );

@@ -299,6 +299,18 @@ export async function startRPCServer(opts: {
               tracker,
               {
                 onRetry: (attempt, max) => {
+                  // Drop any partial text the failed turn streamed
+                  // before the error stopReason arrived. The client has
+                  // ALREADY received `content_delta` events for those
+                  // chunks, so also emit `thinking_only_reset` to tell
+                  // IDE clients to discard what they displayed for the
+                  // failed attempt. Event contract: `{ attempt, max }`
+                  // — same shape as `thinking_only_reprompt`; fires
+                  // immediately before the reprompt event so clients
+                  // can clear display state, then show a retry banner.
+                  // See code-review finding #1 (2026-04-23).
+                  chunks.length = 0;
+                  sendEvent("thinking_only_reset", { attempt, max });
                   sendEvent("thinking_only_reprompt", { attempt, max });
                 },
               },
