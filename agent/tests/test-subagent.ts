@@ -353,6 +353,87 @@ describe("role-resolver", () => {
     expect(roles.map((r) => r.name)).toEqual(["alpha", "beta"]);
     expect(resolveRole("scout", config)).toBeNull();
   });
+
+  // Finding 2 (code-review-issue-23): config override for "general-purpose"
+  // must win over the built-in role. Option A: config precedence over
+  // built-in. The built-in is a safety net for configs that don't define one.
+  describe("Finding 2: 'general-purpose' name is overridable by config", () => {
+    let resolveRoleWithFallback: typeof import("../src/subagent/role-resolver.js").resolveRoleWithFallback;
+    beforeEach(async () => {
+      const mod = await import("../src/subagent/role-resolver.js");
+      resolveRoleWithFallback = mod.resolveRoleWithFallback;
+    });
+
+    it("resolveRole: config.roles['general-purpose'] overrides built-in", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({
+            label: "Custom GP",
+            baseTools: ["read"],
+            mcpAccess: "shared-readonly",
+            maxTurns: 5,
+            maxTokens: 1000,
+          }),
+        },
+      });
+      const role = resolveRole("general-purpose", config);
+      expect(role).not.toBeNull();
+      expect(role!.label).toBe("Custom GP");
+      expect(role!.maxTurns).toBe(5);
+      expect(role!.mcpAccess).toBe("shared-readonly");
+    });
+
+    it("resolveRole: built-in returned when no config override", () => {
+      const config = makeSubagentConfig({ roles: {} });
+      const role = resolveRole("general-purpose", config);
+      expect(role).not.toBeNull();
+      expect(role!.label).toBe("General-purpose");     // from built-in
+      expect(role!.mcpAccess).toBe("full");            // built-in default
+    });
+
+    it("resolveRoleWithFallback: config override wins, no warning", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({ label: "Custom GP", maxTurns: 7 }),
+        },
+      });
+      const resolved = resolveRoleWithFallback("general-purpose", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("Custom GP");
+      expect(resolved.role.maxTurns).toBe(7);
+      expect(resolved.warning).toBeUndefined();
+    });
+
+    it("resolveRoleWithFallback: built-in when no override, no warning", () => {
+      const config = makeSubagentConfig({ roles: {} });
+      const resolved = resolveRoleWithFallback("general-purpose", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("General-purpose");
+      expect(resolved.warning).toBeUndefined();
+    });
+
+    it("resolveRoleWithFallback: unknown name still falls back to built-in with warning", () => {
+      const config = makeSubagentConfig({ roles: { scout: makeScoutRole() } });
+      const resolved = resolveRoleWithFallback("does-not-exist", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("General-purpose");
+      expect(resolved.warning).toBeDefined();
+      expect(resolved.warning!).toContain("does-not-exist");
+    });
+
+    it("resolveRoleWithFallback: unknown name + custom general-purpose → falls back to CUSTOM", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({ label: "Custom GP", maxTurns: 3 }),
+        },
+      });
+      const resolved = resolveRoleWithFallback("nonexistent", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("Custom GP");   // NOT the built-in
+      expect(resolved.role.maxTurns).toBe(3);
+      expect(resolved.warning).toBeDefined();
+    });
+  });
 });
 
 // ============================================================
