@@ -3,6 +3,7 @@
  */
 
 import type { SubagentConfig, RoleConfig } from "../types/v04-contracts.js";
+import { GENERAL_PURPOSE_ROLE, GENERAL_PURPOSE_ROLE_NAME } from "./built-in/generalPurposeRole.js";
 
 const VALID_MCP_ACCESS = new Set(["shared-readonly", "full", "none"]);
 
@@ -15,7 +16,32 @@ export function resolveRole(
   config: SubagentConfig,
 ): RoleConfig | null {
   if (!roleName) return null;
+  if (roleName === GENERAL_PURPOSE_ROLE_NAME) return GENERAL_PURPOSE_ROLE;
   return config.roles[roleName] ?? null;
+}
+
+/**
+ * Resolve a role with general-purpose fallback. Used by the delegate tool:
+ * if the requested role does not exist in config.roles, fall back to the
+ * built-in general-purpose role and emit a warning (carried in `warning`).
+ */
+export function resolveRoleWithFallback(
+  roleName: string,
+  config: SubagentConfig,
+): { role: RoleConfig; effectiveName: string; warning?: string } {
+  if (!roleName || roleName === GENERAL_PURPOSE_ROLE_NAME) {
+    return { role: GENERAL_PURPOSE_ROLE, effectiveName: GENERAL_PURPOSE_ROLE_NAME };
+  }
+  const configured = config.roles[roleName];
+  if (configured) {
+    return { role: configured, effectiveName: roleName };
+  }
+  const known = Object.keys(config.roles).concat(GENERAL_PURPOSE_ROLE_NAME).join(", ");
+  return {
+    role: GENERAL_PURPOSE_ROLE,
+    effectiveName: GENERAL_PURPOSE_ROLE_NAME,
+    warning: `Unknown subagent_type '${roleName}', falling back to 'general-purpose'. Known roles: ${known}.`,
+  };
 }
 
 /**

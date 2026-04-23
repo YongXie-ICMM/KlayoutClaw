@@ -63,14 +63,28 @@ import { SubagentRunner } from "../../src/subagent/runner.js";
 
 This test is the REPRO — it runs green against the current bug.
 
-- [ ] **Record the finding** (edit this file with the actual values):
-  - `modelId` =
-  - `provider` =
-  - `bareModelId` =
-  - `resolvedModel` present / null / undefined?
-  - Full TypeError stack trace (first 10 frames)
+- [x] **Record the finding** (actual root cause — hypothesis was WRONG):
 
-**You MUST NOT move to Phase 2 until you've named which field is undefined AND which pi-agent-core code path reads it with `.startsWith`.** Top hypothesis: `modelRegistry.find(provider, bareModelId)` returns `null` for subagent default model format, `Agent` gets `model: undefined`, pi-agent-core's `convertToLlm` or request builder calls `.startsWith` on `model.id` or `model.provider`.
+**Finding (2026-04-23):** The TypeError is NOT from model resolution. It's from `AgentSession.prompt(text)` being called with `text=undefined`.
+
+- Crash site: `node_modules/@mariozechner/pi-coding-agent/dist/core/agent-session.js:500`:
+  ```js
+  if (expandPromptTemplates && text.startsWith("/")) { ... }
+  ```
+- Caller: `runner.ts:308-314`:
+  ```ts
+  if (promptArg !== undefined) {
+    await session.prompt(promptArg);
+  } else if (turns === 0) {
+    await session.prompt(taskMessage);
+  } else {
+    await session.prompt();   // ← text=undefined → crash at startsWith
+  }
+  ```
+- Transcript signature fits: `turns: 1` + 0 tokens means turn 0 completed (prompt(taskMessage) returned), loop iterated, `turns !== 0` and no injected `promptArg` → else branch → `prompt()` with no args → crash before any LLM call.
+- Rules out the plan's model-resolution hypothesis: if `model` were undefined, pi-agent-core would throw `"No model configured"` (`agent.js:275-276`) or `AgentSession.prompt` would throw `"No model selected"` (`agent-session.js:548-551`), neither matches.
+
+**Architectural implication:** `AgentSession.prompt(text)` runs a FULL agentic turn internally (tool calls and all) — you don't re-call `prompt()` to "continue". Subsequent calls need a new user message. The runner's turn loop is structurally wrong: it re-enters `prompt()` each iteration, which is only valid with a new injected message or a new task.
 
 ---
 

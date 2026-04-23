@@ -1,5 +1,9 @@
 /**
  * Delegate tool — allows the parent agent to dispatch work to subagents.
+ *
+ * The tool schema mirrors Claude Code's Agent tool (description/prompt/
+ * subagent_type/model). Legacy `role`/`task` parameters are still accepted
+ * for one-release backward compatibility and emit a deprecation warning.
  */
 
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
@@ -7,14 +11,41 @@ import type { SubagentConfig } from "../types/v04-contracts.js";
 import type { SubagentRunner } from "../subagent/runner.js";
 import type { PlanManager } from "../planning/index.js";
 import { Type } from "@sinclair/typebox";
+import { resolveRoleWithFallback } from "../subagent/role-resolver.js";
+import { GENERAL_PURPOSE_ROLE_NAME } from "../subagent/built-in/generalPurposeRole.js";
 
-/**
- * Create the delegate tool that dispatches tasks to subagent roles.
- *
- * When `parentPlanManager` is provided and the parent is in plan mode, the
- * delegate tool short-circuits with a `plan_mode_restricted` envelope BEFORE
- * role validation — subagents would otherwise bypass the plan-mode sandbox.
- */
+const DELEGATE_GUIDANCE = `Delegate a task to a subagent. Brief it like a smart colleague who just walked in — it hasn't seen this conversation, doesn't know what you've tried. Explain what you're trying to accomplish, what you've learned, and what specifically to do. Include file paths and line numbers. Never delegate understanding — don't write "based on your findings, implement it." Write prompts that prove you understood.`;
+
+function buildDelegateDescription(config: SubagentConfig): string {
+  const entries: string[] = [
+    `- general-purpose — broad research/implementation; full tool surface (read+bash+edit+write, full MCP). Use when no specialist fits.`,
+  ];
+  for (const [name, r] of Object.entries(config.roles)) {
+    const tools = r.baseTools.length > 0 ? r.baseTools.join("+") : "none";
+    entries.push(`- ${name} — ${r.label} (tools: ${tools} · mcp: ${r.mcpAccess} · maxTurns: ${r.maxTurns})`);
+  }
+  return `${DELEGATE_GUIDANCE}
+
+Available subagent_type values:
+${entries.join("\n")}
+
+Parameters:
+- description: 3-5 word task summary
+- prompt: full briefing for the subagent
+- subagent_type: (optional) one of the values above; omit for "general-purpose"
+- model: (optional) model override, e.g. "custom-anthropic/claude-sonnet-4-6"`;
+}
+
+interface DelegateParams {
+  description?: string;
+  prompt?: string;
+  subagent_type?: string;
+  model?: string;
+  role?: string;   // legacy
+  task?: string;   // legacy
+  context?: string;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function createDelegateTool(
   runner: SubagentRunner,
@@ -24,15 +55,19 @@ export function createDelegateTool(
   return {
     name: "delegate",
     label: "delegate",
-    description: "Delegate a task to a specialized subagent role.",
+    description: buildDelegateDescription(config),
     parameters: Type.Object({
-      role: Type.String({ description: "The subagent role to delegate to" }),
-      task: Type.String({ description: "The task description for the subagent" }),
-      context: Type.Optional(Type.String({ description: "Optional context to provide to the subagent" })),
+      description: Type.Optional(Type.String({ description: "A short (3-5 word) description of the task" })),
+      prompt: Type.Optional(Type.String({ description: "The task briefing for the subagent. Brief it like a smart colleague who just walked in — include file paths, line numbers, what specifically to do." })),
+      subagent_type: Type.Optional(Type.String({ description: "Specialized subagent role. Omit for 'general-purpose'." })),
+      model: Type.Optional(Type.String({ description: "Optional model override. Format: provider/model-id." })),
+      role: Type.Optional(Type.String({ description: "(Deprecated) Use subagent_type." })),
+      task: Type.Optional(Type.String({ description: "(Deprecated) Use prompt." })),
+      context: Type.Optional(Type.String({ description: "Optional extra context" })),
     }),
     async execute(
       toolCallId: string,
-      params: { role: string; task: string; context?: string },
+      params: DelegateParams,
     ): Promise<AgentToolResult<any>> {
       // Plan-mode gate (spec §9 step 8): block subagent dispatch when the
       // parent is in plan mode so subagents cannot escape the sandbox.
@@ -50,32 +85,48 @@ export function createDelegateTool(
         };
       }
 
-      // Validate role exists
-      const availableRoles = Object.keys(config.roles);
-      if (!config.roles[params.role]) {
+      // Resolve effective prompt / role with legacy compat.
+      const effectivePrompt = params.prompt ?? params.task;
+      const effectiveRole = params.subagent_type ?? params.role ?? GENERAL_PURPOSE_ROLE_NAME;
+      const legacyTaskUsed = params.prompt === undefined && params.task !== undefined;
+      const legacyRoleUsed = params.subagent_type === undefined && params.role !== undefined;
+
+      if (!effectivePrompt || typeof effectivePrompt !== "string" || effectivePrompt.trim().length === 0) {
         return {
           content: [{
             type: "text" as const,
-            text: `Error: Unknown role '${params.role}'. Available roles: ${availableRoles.join(", ")}`,
+            text: "Error: missing required parameter 'prompt' (a non-empty task briefing for the subagent).",
           }],
-          details: { error: true },
+          details: { error: true, reason: "missing_prompt" },
         };
       }
 
+      const resolved = resolveRoleWithFallback(effectiveRole, config);
+
       // Run the subagent
       const result = await runner.run({
-        role: params.role,
-        task: params.task,
+        role: resolved.effectiveName,
+        task: effectivePrompt,
         toolCallId,
         context: params.context,
+        modelOverride: params.model,
+        roleConfigOverride: resolved.role,
       });
+
+      // Accumulate tool-level warnings (legacy-usage, role-fallback) onto the
+      // returned result so the parent sees them without mutating the runner.
+      const extraWarnings: string[] = [...(result.warnings ?? [])];
+      if (resolved.warning) extraWarnings.push(resolved.warning);
+      if (legacyTaskUsed) extraWarnings.push("delegate: 'task' is deprecated — use 'prompt'.");
+      if (legacyRoleUsed) extraWarnings.push("delegate: 'role' is deprecated — use 'subagent_type'.");
+      const annotated = { ...result, warnings: extraWarnings };
 
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(result, null, 2),
+          text: JSON.stringify(annotated, null, 2),
         }],
-        details: result,
+        details: annotated,
       };
     },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

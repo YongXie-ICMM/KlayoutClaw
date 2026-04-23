@@ -744,7 +744,7 @@ describe("subagent-runner", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
   }
 
@@ -1087,48 +1087,52 @@ describe("delegate-tool", () => {
     const props = schema.properties;
     expect(props).toBeDefined();
 
-    // 'role' must be a required string property
+    // New API (issue #23): description/prompt/subagent_type/model are the
+    // primary params. Legacy role/task are accepted for backward compat.
+    expect(props.description).toBeDefined();
+    expect(props.description.type).toBe("string");
+    expect(props.prompt).toBeDefined();
+    expect(props.prompt.type).toBe("string");
+    expect(props.subagent_type).toBeDefined();
+    expect(props.model).toBeDefined();
+
+    // Legacy params still present (optional) for deprecation window
     expect(props.role).toBeDefined();
-    expect(props.role.type).toBe("string");
-
-    // 'task' must be a required string property
     expect(props.task).toBeDefined();
-    expect(props.task.type).toBe("string");
-
-    // 'context' must exist (optional string)
     expect(props.context).toBeDefined();
-    expect(props.context.type).toBe("string");
-
-    // 'role' and 'task' should be required (in the required array)
-    const required: string[] = schema.required ?? [];
-    expect(required).toContain("role");
-    expect(required).toContain("task");
-    // 'context' should NOT be required
-    expect(required).not.toContain("context");
   });
 
-  // SCC-F2
-  it("calling delegate with unknown role returns error listing available roles", async () => {
+  // SCC-F2 — updated for issue #23: unknown subagent_type falls back to
+  // general-purpose with a warning (not a hard error), matching Claude Code's
+  // Agent-tool pattern.
+  it("calling delegate with unknown subagent_type falls back to general-purpose with warning", async () => {
     const mockRunner = new EventEmitter() as any;
-    mockRunner.run = vi.fn();
+    mockRunner.run = vi.fn(async (opts: any) => ({
+      role: opts.role,
+      task: opts.task,
+      status: "completed",
+      findings: [],
+      warnings: [],
+      dataPaths: [],
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+      transcriptPath: "",
+    }));
 
     const config = makeSubagentConfigWithRoles();
     const tool = createDelegateTool(mockRunner, config);
 
     const result = await tool.execute("tc_bad", {
       role: "nonexistent_role",
-      task: "should fail",
+      task: "should fall back",
     });
 
-    // Runner should NOT have been called
-    expect(mockRunner.run).not.toHaveBeenCalled();
+    expect(mockRunner.run).toHaveBeenCalledTimes(1);
+    const callArgs = mockRunner.run.mock.calls[0][0];
+    expect(callArgs.role).toBe("general-purpose");
 
-    // Error should list available roles
-    const resultStr = JSON.stringify(result);
-    expect(resultStr.toLowerCase()).toContain("error");
-    expect(resultStr).toContain("scout");
-    expect(resultStr).toContain("designer");
-    expect(resultStr).toContain("analyst");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.some((w: string) => w.includes("nonexistent_role"))).toBe(true);
+    expect(parsed.warnings.some((w: string) => w.includes("general-purpose"))).toBe(true);
   });
 
   it("delegate tool calls runner.run with correct parameters", async () => {
@@ -1379,7 +1383,7 @@ describe("edge-cases", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const ids: string[] = [];
@@ -1598,7 +1602,7 @@ describe("cross-review-gaps", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     // Run with context — the SubagentRunOptions type must accept context
