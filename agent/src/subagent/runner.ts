@@ -156,9 +156,17 @@ export class SubagentRunner extends EventEmitter {
     // Guardrail: fail loudly with diagnostic info if model resolution failed.
     // Without this, pi-agent-core crashes deep inside the stream with an
     // opaque error (e.g. model.id / model.provider undefined reads).
+    //
+    // Finding #3 (code-review-issue-23): the TUI creates a placeholder entry
+    // from the upstream `tool_execution_start` event and clears it on the
+    // runner's `completed` event. If this early return fires WITHOUT
+    // emitting started+completed, the placeholder is stuck showing "running"
+    // forever. Emit both lifecycle events so every observer (TUI, logs,
+    // metrics) can transition the entry cleanly.
     if (!resolvedModel) {
+      const errorMessage = `Subagent model resolution failed: modelId="${modelId}" provider="${provider}" bareModelId="${bareModelId}". Check that roleConfig.model or the parent defaultModel is registered in ModelRegistry.`;
       const transcriptPath = transcript.save();
-      return {
+      const errorResult: SubagentResult = {
         role,
         task,
         status: "error",
@@ -167,8 +175,24 @@ export class SubagentRunner extends EventEmitter {
         dataPaths: [],
         tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
         transcriptPath,
-        errorMessage: `Subagent model resolution failed: modelId="${modelId}" provider="${provider}" bareModelId="${bareModelId}". Check that roleConfig.model or the parent defaultModel is registered in ModelRegistry.`,
+        errorMessage,
       };
+      this.emit("started", {
+        subagentId,
+        toolCallId,
+        role,
+        task,
+      } as StartedEvent);
+      this.emit("completed", {
+        subagentId,
+        toolCallId,
+        status: "error",
+        findings: 0,
+        warnings: 0,
+        tokenUsage: "0 tokens, 0 turns",
+        errorMessage,
+      });
+      return errorResult;
     }
 
     // Create the agent + session with proper config (getApiKey, convertToLlm, model)

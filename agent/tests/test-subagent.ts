@@ -1125,6 +1125,66 @@ describe("subagent-runner", () => {
     expect(result.transcriptPath).toBeTruthy();
     expect(existsSync(result.transcriptPath)).toBe(true);
   });
+
+  // Finding 3 (code-review-issue-23): model-resolution error path MUST emit
+  // started+completed so UI observers (TUI placeholder) transition the entry
+  // to error/final. Without events, the placeholder is stuck "running".
+  describe("Finding 3: model-resolution error path emits lifecycle events", () => {
+    function makeRunnerWithUnresolvedModel() {
+      const config = makeSubagentConfigWithRoles();
+      const merged = { ...config, logDir: tmpDir };
+      return new SubagentRunner({
+        config: merged,
+        mcpManager: makeMockMCPManager() as any,
+        memoryManager: makeMockMemoryManager() as any,
+        workspaceDir: tmpDir,
+        annotations: TOOL_ANNOTATIONS,
+        getApiKey: async () => "test-key",
+        defaultModel: "custom-anthropic/claude-sonnet-4-6",
+        defaultThinkingLevel: "medium",
+        // modelRegistry.find returns undefined → triggers the guardrail
+        modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      });
+    }
+
+    it("emits both started and completed events when model resolution fails", async () => {
+      const runner = makeRunnerWithUnresolvedModel();
+      const events: Array<{ kind: string; payload: any }> = [];
+      runner.on("started", (p: any) => events.push({ kind: "started", payload: p }));
+      runner.on("completed", (p: any) => events.push({ kind: "completed", payload: p }));
+
+      const result = await runner.run({
+        role: "scout",
+        task: "will fail to resolve model",
+        toolCallId: "tc_badmodel",
+        modelOverride: "nonexistent-provider/fake-model",
+      });
+
+      // Result: clean error
+      expect(result.status).toBe("error");
+      expect(result.errorMessage).toMatch(/model resolution failed/i);
+      expect(result.errorMessage).not.toMatch(/startsWith/);
+
+      // Events fired in order: started before completed
+      expect(events.length).toBe(2);
+      expect(events[0].kind).toBe("started");
+      expect(events[1].kind).toBe("completed");
+
+      // started payload has the right shape
+      const started = events[0].payload;
+      expect(started.toolCallId).toBe("tc_badmodel");
+      expect(started.role).toBe("scout");
+      expect(started.task).toBe("will fail to resolve model");
+      expect(typeof started.subagentId).toBe("string");
+
+      // completed payload indicates error + carries the message
+      const completed = events[1].payload;
+      expect(completed.status).toBe("error");
+      expect(completed.toolCallId).toBe("tc_badmodel");
+      expect(completed.subagentId).toBe(started.subagentId);
+      expect(completed.errorMessage).toMatch(/model resolution failed/i);
+    });
+  });
 });
 
 // ============================================================
