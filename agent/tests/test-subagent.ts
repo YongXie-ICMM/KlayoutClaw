@@ -1469,6 +1469,109 @@ describe("agent-wiring", () => {
     const section = buildDelegationSection(config);
     expect(section).toBeNull();
   });
+
+  // R4 finding #2: the general-purpose line in the system-prompt section must
+  // be derived from the effective role (config override wins), matching the
+  // `delegate` tool catalog — not hardcoded. Otherwise the prompt and the
+  // catalog can disagree when users narrow general-purpose via config.
+  describe("R4 finding #2: general-purpose line uses effective role", () => {
+    function countOccurrences(hay: string, needle: string): number {
+      let n = 0, idx = 0;
+      while ((idx = hay.indexOf(needle, idx)) !== -1) { n++; idx += needle.length; }
+      return n;
+    }
+
+    it("empty config → line uses built-in capabilities", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({ roles: {} });
+      const section = buildDelegationSection(config)!;
+      expect(section).toContain("general-purpose");
+      // Built-in defaults from generalPurposeRole.ts
+      expect(section).toContain("General-purpose");              // built-in label
+      expect(section).toContain("tools: read+bash+edit+write");  // built-in baseTools
+      expect(section).toContain("mcp: full");                     // built-in mcpAccess
+      expect(section).toContain("max turns: 30");                 // built-in maxTurns
+      // Must NOT contain the obsolete hardcoded phrase
+      expect(section).not.toContain("full tool surface");
+    });
+
+    it("narrowed override → line reflects override, not built-in", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": {
+            label: "Narrow GP",
+            promptFile: "",
+            workspaceFiles: [],
+            baseTools: ["read"],
+            customTools: ["submit_result"],
+            mcpAccess: "shared-readonly",
+            maxTurns: 10,
+            maxTokens: 50000,
+            systemPrompt: "narrow",
+          },
+        },
+      });
+      const section = buildDelegationSection(config)!;
+      // Override values
+      expect(section).toContain("Narrow GP");
+      expect(section).toContain("tools: read");
+      expect(section).toContain("mcp: shared-readonly");
+      expect(section).toContain("max turns: 10");
+      // Built-in defaults must NOT appear
+      expect(section).not.toContain("tools: read+bash+edit+write");
+      expect(section).not.toContain("mcp: full");
+      expect(section).not.toContain("full tool surface");
+      // Exactly one general-purpose line
+      expect(countOccurrences(section, "`general-purpose`")).toBe(1);
+    });
+
+    it("override + other roles → one general-purpose line (override) + one per other role", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": {
+            label: "Custom GP",
+            promptFile: "",
+            workspaceFiles: [],
+            baseTools: ["read"],
+            customTools: ["submit_result"],
+            mcpAccess: "none",
+            maxTurns: 5,
+            maxTokens: 10000,
+            systemPrompt: "x",
+          },
+          designer: {
+            label: "Designer",
+            promptFile: "subagent/designer.md",
+            workspaceFiles: [],
+            baseTools: ["read", "write"],
+            customTools: ["submit_result"],
+            mcpAccess: "full",
+            maxTurns: 100,
+            maxTokens: 200000,
+          },
+        },
+      });
+      const section = buildDelegationSection(config)!;
+      // Exactly one line per role
+      expect(countOccurrences(section, "`general-purpose`")).toBe(1);
+      expect(countOccurrences(section, "`designer`")).toBe(1);
+      // General-purpose reflects override
+      expect(section).toContain("Custom GP");
+      expect(section).toContain("mcp: none");
+      expect(section).toContain("max turns: 5");
+      // Designer stays as-is
+      expect(section).toContain("Designer");
+      expect(section).toMatch(/`designer`.*MCP access: full/);
+    });
+  });
 });
 
 // ============================================================
