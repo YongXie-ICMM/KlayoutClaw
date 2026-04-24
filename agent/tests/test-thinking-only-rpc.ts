@@ -377,7 +377,7 @@ describe("RPC-mode thinking-only retry integration", () => {
     await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
       onRetry: (attempt, max) => {
         chunks.length = 0;
-        sendEvent("thinking_only_reset", { attempt, max });
+        sendEvent("thinking_only_reset", { attempt, max, final: false });
         sendEvent("thinking_only_reprompt", { attempt, max });
       },
     });
@@ -394,7 +394,9 @@ describe("RPC-mode thinking-only retry integration", () => {
       "thinking_only_reprompt",
       "content_delta",
     ]);
-    expect(sentEvents[1].params).toEqual({ attempt: 1, max: 5 });
+    // R4: intermediate resets carry `final: false`; terminal ones
+    // emitted from the exhaustion branch carry `final: true`.
+    expect(sentEvents[1].params).toEqual({ attempt: 1, max: 5, final: false });
     expect(sentEvents[2].params).toEqual({ attempt: 1, max: 5 });
 
     tracker.unsubscribe();
@@ -460,13 +462,21 @@ describe("RPC-mode thinking-only retry integration", () => {
       await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
         onRetry: (attempt, max) => {
           chunks.length = 0;
-          sendEvent("thinking_only_reset", { attempt, max });
+          sendEvent("thinking_only_reset", { attempt, max, final: false });
           sendEvent("thinking_only_reprompt", { attempt, max });
         },
       });
 
     if (stillThinkingOnly) {
       chunks.length = 0;
+      // R4 finding #2: terminal reset before the error envelope so
+      // clients can discard the final failed attempt's content_delta
+      // events. `final: true` distinguishes from intermediate resets.
+      sendEvent("thinking_only_reset", {
+        attempt: retries,
+        max: 5,
+        final: true,
+      });
       const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
       sendEvent("error", { message: errMsg });
       sendError(1, -32000, errMsg);
@@ -485,6 +495,26 @@ describe("RPC-mode thinking-only retry integration", () => {
     // partial text leaks into later state.
     expect(sentEvents.some((e) => e.name === "error")).toBe(true);
     expect(chunks.length).toBe(0);
+
+    // R4 finding #2: a terminal `thinking_only_reset` with `final:true`
+    // immediately precedes the `error` event. Intermediate resets
+    // carry `final:false`.
+    const resetEvents = sentEvents.filter(
+      (e) => e.name === "thinking_only_reset",
+    );
+    // 5 intermediate + 1 terminal = 6 resets total.
+    expect(resetEvents.length).toBe(6);
+    expect(resetEvents.slice(0, 5).every((e) => e.params.final === false)).toBe(
+      true,
+    );
+    expect(resetEvents[5].params).toEqual({ attempt: 5, max: 5, final: true });
+
+    // The terminal reset comes IMMEDIATELY before the `error` event —
+    // clients that honour reset-then-error can discard partial text
+    // before surfacing the error banner.
+    const errorIdx = sentEvents.findIndex((e) => e.name === "error");
+    expect(sentEvents[errorIdx - 1].name).toBe("thinking_only_reset");
+    expect(sentEvents[errorIdx - 1].params.final).toBe(true);
 
     tracker.unsubscribe();
     unsub();

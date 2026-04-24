@@ -11,6 +11,7 @@ import { parseCommand, type CommandContext } from "./commands/index.js";
 import {
   createTurnActivityTracker,
   runPromptWithThinkingOnlyGuard,
+  THINKING_ONLY_MAX_RETRIES,
 } from "./thinking-only-guard.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
@@ -305,13 +306,24 @@ export async function startRPCServer(opts: {
                     // ALREADY received `content_delta` events for those
                     // chunks, so also emit `thinking_only_reset` to tell
                     // IDE clients to discard what they displayed for the
-                    // failed attempt. Event contract: `{ attempt, max }`
-                    // — same shape as `thinking_only_reprompt`; fires
-                    // immediately before the reprompt event so clients
-                    // can clear display state, then show a retry banner.
-                    // See code-review finding #1 (2026-04-23).
+                    // failed attempt.
+                    //
+                    // Event contract: `{ attempt, max, final }`.
+                    // - `final: false` on intermediate resets (this
+                    //   callback) — a retry follows.
+                    // - `final: true` on the exhaustion reset emitted
+                    //   after the loop gives up (R4 finding #2) — no
+                    //   retry follows, the `error` envelope comes next.
+                    // Fires immediately before `thinking_only_reprompt`
+                    // so clients can clear display state and then show
+                    // a retry banner. See code-review finding #1
+                    // (2026-04-23) and finding #2 R4 (2026-04-24).
                     chunks.length = 0;
-                    sendEvent("thinking_only_reset", { attempt, max });
+                    sendEvent("thinking_only_reset", {
+                      attempt,
+                      max,
+                      final: false,
+                    });
                     sendEvent("thinking_only_reprompt", { attempt, max });
                   },
                 },
@@ -323,6 +335,18 @@ export async function startRPCServer(opts: {
             // upstream failure — surface the exhaustion instead.
             if (stillThinkingOnly) {
               chunks.length = 0;
+              // R4 finding #2 (2026-04-24): also emit a terminal
+              // `thinking_only_reset` so IDE clients can discard the
+              // `content_delta` events from the final failed attempt
+              // — intermediate retries reset their attempts via the
+              // onRetry callback but the last attempt has no retry to
+              // trigger one. `final: true` distinguishes this from
+              // intermediate resets (followed by a retry).
+              sendEvent("thinking_only_reset", {
+                attempt: retries,
+                max: THINKING_ONLY_MAX_RETRIES,
+                final: true,
+              });
               const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
               botSession.history.recordError(errMsg);
               sendEvent("error", { message: errMsg });
