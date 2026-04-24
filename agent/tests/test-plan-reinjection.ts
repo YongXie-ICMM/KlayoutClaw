@@ -794,6 +794,78 @@ describe("createPlanReinjector: abandoned/completed plan status (Finding 2)", ()
   });
 });
 
+describe("exit_plan_mode tool: closes as completed on plan_done (R3 finding #2)", () => {
+  // Drive the real exit_plan_mode tool through approve_execute (interactive +
+  // headless) and approve_only paths, then assert the persistent
+  // PlanManager.currentPlan.status. The reinjector skip set already includes
+  // "completed", so this proves the chain from tool → status → reinjector.
+  async function buildHarness(headless: boolean) {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import(
+      "../src/planning/state-machine.js"
+    );
+    const { TranscriptMarkerEmitter, setTranscriptMarkerEmitter } = await import(
+      "../src/events/marker-emitter.js"
+    );
+    const { createExitPlanModeTool } = await import("../src/tools/plan.js");
+
+    const workspaceDir = makeWorkspace();
+    const pm = new PlanManager(workspaceDir);
+    pm.setHeadless(headless);
+    const emitter = new TranscriptMarkerEmitter();
+    setTranscriptMarkerEmitter(pm.sessionKey, emitter);
+    pm.attachStateMachine(new PlanStateMachine(emitter));
+    pm.enterPlanMode("R3-2 driver");
+    pm.writePlanContent("1. Inspect\n2. Execute");
+    return { pm, exitTool: createExitPlanModeTool(pm) };
+  }
+
+  it("interactive approve_execute closes plan with status 'completed' (was 'approved')", async () => {
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { pm, exitTool } = await buildHarness(false);
+    const promise = exitTool.execute("tc-r3-ae", { approved: true });
+    await new Promise((r) => setTimeout(r, 10));
+    resolvePlanApproval(pm.sessionKey, { action: "approve_execute" });
+    await promise;
+
+    // R3 #2: this branch transitions to plan_done so the plan is terminal.
+    // closePlanMode must be called with "completed" to make the reinjector
+    // skip it. Previously closed as "approved", which kept reminders firing.
+    expect(pm.currentPlan?.status).toBe("completed");
+    expect(pm.inPlanMode).toBe(false);
+  });
+
+  it("headless auto-execute closes plan with status 'completed' (was 'approved')", async () => {
+    const { pm, exitTool } = await buildHarness(true);
+    await exitTool.execute("tc-r3-headless", { approved: true });
+
+    // Headless takes the auto-approve branch, transitions to plan_done.
+    // Same R3 #2 contract: terminal plan = completed status.
+    expect(pm.currentPlan?.status).toBe("completed");
+    expect(pm.inPlanMode).toBe(false);
+  });
+
+  it("interactive approve_only stays 'approved' (regression: implementing-in-turns case)", async () => {
+    // The point of reinjection is reminding the agent of an approved plan
+    // it's still implementing. approve_only does NOT transition to
+    // plan_done — implementation continues across user turns. So status
+    // must stay "approved" and reinjection must keep firing.
+    const { resolvePlanApproval } = await import(
+      "../src/planning/approval-gate.js"
+    );
+    const { pm, exitTool } = await buildHarness(false);
+    const promise = exitTool.execute("tc-r3-ao", { approved: true });
+    await new Promise((r) => setTimeout(r, 10));
+    resolvePlanApproval(pm.sessionKey, { action: "approve_only" });
+    await promise;
+
+    expect(pm.currentPlan?.status).toBe("approved");
+    expect(pm.inPlanMode).toBe(false);
+  });
+});
+
 describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
   // We assert the literal CALL syntax `.incrementTurnsSinceExit(` (trailing
   // open-paren) so that a stray comment, dead import, or bare identifier

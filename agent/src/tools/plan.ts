@@ -282,7 +282,13 @@ export function createExitPlanModeTool(
             if (executingHash !== planHash) {
               return integrityViolation();
             }
-            planManager.closePlanMode("approved");
+            // R3 finding #2 (2026-04-24): close as "completed" — this branch
+            // transitions all the way to plan_done below, so the plan is
+            // terminal. The reinjector skips completed/abandoned, so post-
+            // exit reminders correctly stop firing for auto-executed plans.
+            // The "approve_only" branch stays "approved" because it leaves
+            // implementation in agent turns, where reminders are the point.
+            planManager.closePlanMode("completed");
             planManager.markExitedInThisTurn();
             stateMachine.transition(
               planManager.sessionKey,
@@ -397,7 +403,11 @@ export function createExitPlanModeTool(
         if (executingHash !== planHash) {
           return integrityViolation();
         }
-        planManager.closePlanMode("approved");
+        // R3 finding #2 (2026-04-24): close as "completed" — headless auto-
+        // execute transitions to plan_done below, so the plan is terminal.
+        // Without this, the reinjector keeps firing for an auto-executed
+        // plan that has been handed off and finished.
+        planManager.closePlanMode("completed");
         planManager.markExitedInThisTurn();
         stateMachine.transition(
           planManager.sessionKey,
