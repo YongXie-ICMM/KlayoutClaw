@@ -49,12 +49,32 @@ export function resolveRole(
  */
 /**
  * Resolve the effective general-purpose role — config override wins.
- * Internal helper used by both resolveRole and resolveRoleWithFallback so
- * every code path that ends at "general-purpose" goes through the same
- * precedence rule (finding #2).
+ * Exported so the delegate tool's catalog description uses the same
+ * precedence the runner will run with (R2 finding #1). Every code path
+ * that displays "general-purpose" in a user-visible way should go through
+ * this helper or resolveRole.
  */
-function getGeneralPurposeRole(config: SubagentConfig): RoleConfig {
+export function getEffectiveGeneralPurposeRole(config: SubagentConfig): RoleConfig {
   return config.roles[GENERAL_PURPOSE_ROLE_NAME] ?? GENERAL_PURPOSE_ROLE;
+}
+
+/** Shorthand backwards-compat alias for internal callers. */
+const getGeneralPurposeRole = getEffectiveGeneralPurposeRole;
+
+/**
+ * Return the role name the runner WILL run with for a given request.
+ * This is what UI should display — not the raw string the agent passed.
+ * Mirrors resolveRoleWithFallback's precedence (R2 finding #2).
+ */
+export function resolveEffectiveRoleName(
+  roleName: string,
+  config: SubagentConfig,
+): string {
+  if (!roleName) return GENERAL_PURPOSE_ROLE_NAME;
+  if (config.roles[roleName]) return roleName;
+  if (roleName === GENERAL_PURPOSE_ROLE_NAME) return GENERAL_PURPOSE_ROLE_NAME;
+  // Unknown → the runner falls back to general-purpose.
+  return GENERAL_PURPOSE_ROLE_NAME;
 }
 
 export function resolveRoleWithFallback(

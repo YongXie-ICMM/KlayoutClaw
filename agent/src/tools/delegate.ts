@@ -11,18 +11,38 @@ import type { SubagentConfig } from "../types/v04-contracts.js";
 import type { SubagentRunner } from "../subagent/runner.js";
 import type { PlanManager } from "../planning/index.js";
 import { Type } from "@sinclair/typebox";
-import { resolveRoleWithFallback } from "../subagent/role-resolver.js";
+import {
+  resolveRoleWithFallback,
+  getEffectiveGeneralPurposeRole,
+} from "../subagent/role-resolver.js";
 import { GENERAL_PURPOSE_ROLE_NAME } from "../subagent/built-in/generalPurposeRole.js";
 
 const DELEGATE_GUIDANCE = `Delegate a task to a subagent. Brief it like a smart colleague who just walked in — it hasn't seen this conversation, doesn't know what you've tried. Explain what you're trying to accomplish, what you've learned, and what specifically to do. Include file paths and line numbers. Never delegate understanding — don't write "based on your findings, implement it." Write prompts that prove you understood.`;
 
+/**
+ * Format a single role entry for the catalog. Kept consistent with the
+ * effective-general-purpose line so both paths render identically.
+ */
+function formatRoleEntry(
+  name: string,
+  role: import("../types/v04-contracts.js").RoleConfig,
+): string {
+  const tools = role.baseTools.length > 0 ? role.baseTools.join("+") : "none";
+  return `- ${name} — ${role.label} (tools: ${tools} · mcp: ${role.mcpAccess} · maxTurns: ${role.maxTurns})`;
+}
+
 function buildDelegateDescription(config: SubagentConfig): string {
-  const entries: string[] = [
-    `- general-purpose — broad research/implementation; full tool surface (read+bash+edit+write, full MCP). Use when no specialist fits.`,
-  ];
+  // R2 finding #1: anything that shows the role to an agent must go through
+  // the resolver. Use the effective general-purpose role (config override
+  // wins over built-in) so the catalog matches what the runner will run.
+  // Skip the general-purpose entry when iterating config.roles — it is
+  // already listed above with the effective values, and double-listing
+  // would show two contradictory lines.
+  const effectiveGeneral = getEffectiveGeneralPurposeRole(config);
+  const entries: string[] = [formatRoleEntry(GENERAL_PURPOSE_ROLE_NAME, effectiveGeneral)];
   for (const [name, r] of Object.entries(config.roles)) {
-    const tools = r.baseTools.length > 0 ? r.baseTools.join("+") : "none";
-    entries.push(`- ${name} — ${r.label} (tools: ${tools} · mcp: ${r.mcpAccess} · maxTurns: ${r.maxTurns})`);
+    if (name === GENERAL_PURPOSE_ROLE_NAME) continue;
+    entries.push(formatRoleEntry(name, r));
   }
   return `${DELEGATE_GUIDANCE}
 
