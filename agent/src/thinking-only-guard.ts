@@ -12,17 +12,13 @@
  *      is typically `[]`, making the message-shape detector useless.
  *
  * NOT HANDLED HERE: stalled tool-use (stopReason="toolUse" with no
- * trailing toolResult). The ml09/ml11 traces DO show this shape, but
- * the obvious fix — sending a `"Continue..."` user message — is
- * actively harmful. pi-ai's `transform-messages.js:125-141` injects a
- * synthetic toolResult of `"No result provided"` (with isError=true)
+ * trailing toolResult). Sending a `"Continue..."` user message in this
+ * state is actively harmful: pi-ai's `transform-messages.js:125-141`
+ * injects a synthetic toolResult of `"No result provided"` (isError=true)
  * whenever a user message follows an orphan toolCall, so the model
- * keeps going under the confidently-wrong premise that the tool
- * returned that error. That is strictly worse than returning an empty
- * completion and letting the caller deal with it (R4 finding #1,
- * 2026-04-24). If stalled-toolUse recovery is worth doing, it belongs
- * in the agent-loop layer where the original toolCall can be re-
- * dispatched — not here.
+ * continues under the confidently-wrong premise that the tool errored.
+ * Stalled-toolUse recovery belongs in the agent-loop layer where the
+ * original toolCall can be re-dispatched, not here.
  *
  * The message-shape detector covers (1) and as much of (2) as is
  * possible to see (content: []). The activity-stream fallback is a
@@ -42,11 +38,12 @@ export const THINKING_ONLY_MAX_RETRIES = 5;
  * non-retryable: auth failures, invalid_request errors, malformed body,
  * unknown 4xx, etc. Context-overflow is handled separately via pi-ai's
  * `isContextOverflow` because it has its own provider-specific patterns.
- * Keep this regex in sync if pi-coding-agent updates theirs.
+ * Keep in sync if pi-coding-agent updates theirs.
+ *
+ * HTTP status codes use `\b` so bare "500" doesn't match "5000" inside
+ * e.g. `max_tokens must be <= 5000` (a non-retryable 4xx validation
+ * error whose message happens to contain a 5xx-looking digit run).
  */
-// HTTP status codes are bounded with \b so bare "500" doesn't match
-// "5000" inside e.g. `max_tokens must be <= 5000` (non-retryable 4xx
-// validation errors). R8.4 final (gpt-5.5 xhigh).
 const RETRYABLE_ERROR_PATTERN =
   /overloaded|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
 
@@ -96,12 +93,12 @@ export function isThinkingOnlyTerminationByMessages(
 ): boolean {
   const msgs = (session.messages ?? []) as any[];
 
-  // R8 finding #2 (2026-04-24): scan is bounded to messages produced
-  // by the CURRENT prompt. In a persistent session (TUI / RPC) the
-  // same `session.messages` accumulates across turns; without a
-  // boundary an extension-handled current turn would read the
-  // PRIOR turn's trailing assistant shape and retry against stale
-  // state. Callers pass the pre-prompt message length.
+  // Scan is bounded to messages produced by the CURRENT prompt. In a
+  // persistent session (TUI / RPC) `session.messages` accumulates across
+  // turns; without this boundary an extension-handled current turn would
+  // read the PRIOR turn's trailing assistant shape and retry against stale
+  // state. Callers pass the pre-prompt message length (or an identity-
+  // derived index for compaction-tracking — see runPromptWithThinkingOnlyGuard).
   let lastAssistantIdx = -1;
   for (let i = msgs.length - 1; i >= sinceIdx; i--) {
     const m = msgs[i];
@@ -127,22 +124,18 @@ export function isThinkingOnlyTerminationByMessages(
   //
   //   - Transport / rate-limit / catch-block errors: anthropic.js:318
   //     and openai-completions.js:257 set `errorMessage` AND stopReason
-  //     ="error" together. `content` may be empty (ml09/ml11 429s that
-  //     die before any text streamed) OR contain partial text (mid-
-  //     stream disconnect after 30s of streaming — the signature that
-  //     broke R1's `!hasAnyText` gate).
+  //     ="error". `content` may be empty (e.g. 429 before any text
+  //     streamed) OR contain partial text (mid-stream disconnect).
   //   - Deliberate provider refusals / safety filters: anthropic.js:689
   //     ("refusal"), :695 ("sensitive"), openai-completions.js:646
-  //     ("content_filter"). These pass through the normal stream path
-  //     with `mapStopReason` setting `stopReason="error"` but `error
-  //     Message` is NOT set (only the catch block sets it).
+  //     ("content_filter"). These go through the normal stream path
+  //     with `mapStopReason` setting `stopReason="error"` but leaving
+  //     `errorMessage` UNSET (only the catch block sets it).
   //
-  // `errorMessage` (pi-ai AssistantMessage.errorMessage, types.d.ts:120)
-  // is the primary signal — R2 finding #1 (2026-04-24). But presence
-  // alone is too broad: context-overflow, auth, invalid_request all
-  // set errorMessage yet are not fixed by retrying. R3 finding #1
-  // (2026-04-24) narrows retry to the same set pi-coding-agent's
-  // `_isRetryableError` handles (agent-session.js:1663-1673).
+  // `errorMessage` presence is the primary signal but too broad alone:
+  // context-overflow, auth, and invalid_request all set it yet are not
+  // fixed by retrying. Mirror pi-coding-agent's `_isRetryableError`
+  // (agent-session.js:1663-1673) to narrow correctly.
   if (last.stopReason === "error") {
     const em = typeof last.errorMessage === "string" ? last.errorMessage : "";
     if (em.length === 0) {
@@ -150,31 +143,22 @@ export function isThinkingOnlyTerminationByMessages(
       return false;
     }
     // Context overflow is handled by compaction, never by Continue.
-    // pi-ai's isContextOverflow checks the 15+ provider-specific
-    // patterns (Anthropic "prompt is too long", OpenAI "exceeds the
-    // context window", etc.).
     if (isContextOverflow(last)) {
       return false;
     }
-    // Only retry errors pi-coding-agent considers retryable. Auth
-    // failures, invalid_request_error, insufficient_quota, etc. are
-    // surfaced as-is so the caller sees the real error instead of
-    // burning through 5 `Continue...` prompts. Callers use
-    // `lastTurnTerminalError` to distinguish this non-retryable path
-    // from a true success and surface it as status=error. (R3 #1
-    // excluded these from retry; R8 #1 added the separate terminal-
-    // error signal.)
+    // Auth, invalid_request, quota, etc. are surfaced as-is so the
+    // caller sees the real error instead of burning 5 `Continue...`
+    // prompts. `lastTurnTerminalError` distinguishes this path from a
+    // real success and converts it to status=error at the I/O boundary.
     if (!isRetryableErrorMessage(em)) {
       return false;
     }
     return true;
   }
 
-  // Stalled toolUse is intentionally NOT handled here — the obvious
-  // retry path (send "Continue..." user message) is actively harmful
-  // because pi-ai synthesises a fake toolResult for the orphan call.
-  // See file-header comment. Fall through to the content-shape check
-  // below; the toolCall-present branch at `hasToolCall` will abstain.
+  // Stalled toolUse is intentionally NOT handled here — see file-header.
+  // Fall through to the content-shape check below; `hasToolCall` will
+  // abstain.
 
   if (!Array.isArray(last.content)) return false;
 
@@ -233,27 +217,24 @@ export function isThinkingOnlyTerminationByMessages(
  *       thinking-only — `isThinkingOnlyTermination` returns false,
  *       so callers that only branch on `stillThinkingOnly` would
  *       fall through to the success path and emit
- *       `status: "completed"` with an empty response. That is the
- *       original ml09/ml11 silent-failure pattern in a different
- *       shape (R8 finding #1, 2026-04-24).
+ *       `status: "completed"` with an empty response. This helper
+ *       surfaces them instead.
  *   (3) refusals: `stopReason="error"` with no `errorMessage`, text
  *       content preserved from the provider. Those are a legitimate
  *       success and this helper returns null.
  *
- * Mirror of issue #24's `lastTurnWasFailure` (agent/src/session-
- * status.ts on main) — both helpers walk the trailing assistant turn.
- * Once #22 and #24 both merge, consolidate this into session-status.ts.
+ * Mirrors `lastTurnWasFailure` in `session-status.ts` — both helpers
+ * walk the trailing assistant turn. Candidate for consolidation.
  */
 export function lastTurnTerminalError(
   session: { messages?: unknown[] },
   sinceIdx: number = 0,
 ): string | null {
   const msgs = (session.messages ?? []) as any[];
-  // R8 finding #2: same boundary as isThinkingOnlyTerminationByMessages
-  // — only inspect assistant messages pushed by the current prompt.
-  // In persistent sessions (TUI / RPC) the prior turn's errorMessage
-  // is still present in `messages` and would mis-surface on a cleanly
-  // extension-handled current turn.
+  // Same boundary as isThinkingOnlyTerminationByMessages — only inspect
+  // assistant messages pushed by the current prompt. Otherwise a
+  // persistent-session scan could surface a PRIOR turn's errorMessage
+  // on a cleanly extension-handled current turn.
   for (let i = msgs.length - 1; i >= sinceIdx; i--) {
     const m = msgs[i];
     if (!m) continue;
@@ -261,14 +242,12 @@ export function lastTurnTerminalError(
     if (m.stopReason !== "error" && m.stopReason !== "aborted") return null;
     const em = typeof m.errorMessage === "string" ? m.errorMessage : "";
     if (em.length === 0) return null; // refusal with preserved content
-    // R8.2 final (gpt-5.5 xhigh): context-overflow check must come BEFORE
-    // the retryable regex. pi-coding-agent's _isRetryableError does this
-    // ordering (agent-session.js:1666-1672) and the shape detector above
-    // mirrors it (see `isContextOverflow(last)` at :153). Otherwise a
-    // context-overflow message like "prompt is too long: 250000 tokens"
-    // would hit the retryable regex (`/500/` matches "250000") and
-    // silently return null → caller takes success path with empty
-    // response → same silent-failure class as the original ml09/ml11.
+    // Context-overflow must be checked BEFORE the retryable regex:
+    // context-overflow messages like "prompt is too long: 250000 tokens"
+    // contain "500" in "250000", which the retryable regex would match,
+    // causing this helper to return null and the caller to take the
+    // success path with an empty response. Mirrors pi-coding-agent's
+    // ordering at agent-session.js:1666-1672.
     if (isContextOverflow(m)) return em; // non-retryable terminal
     if (isRetryableErrorMessage(em)) return null; // caller already retried
     return em; // non-retryable terminal error
@@ -316,38 +295,29 @@ export function isThinkingOnlyTermination(
   tracker: TurnActivityTracker,
   sinceIdx: number = 0,
 ): boolean {
-  // After rounds R1–R7 the message-shape detector covers every
-  // canonical pi-ai shape that ought to retry (thinking-only stops,
-  // retryable transport errors, aborts). The original activity-based
-  // fallback existed as belt-and-suspenders for unseen shapes, but
-  // every concrete case it could fire on today is either wrong or
-  // harmful:
+  // The message-shape detector covers every canonical pi-ai shape that
+  // ought to retry (thinking-only stops, retryable transport errors,
+  // aborts). The original activity-stream fallback existed for unseen
+  // shapes, but every concrete case it could fire on today is either
+  // wrong or harmful:
   //
-  //   - Extension-handled prompts (R7 finding #1, 2026-04-24):
-  //     pi-coding-agent autoloads _extensionRunner whenever
-  //     customTools are passed (agent-session.js:1583-1586) — qlaybot
-  //     always passes them (agent.ts:397), so
-  //     `_tryExecuteExtensionCommand` (agent-session.js:500-505) and
-  //     `_extensionRunner.emitInput` (:510-514) can resolve prompt()
-  //     cleanly with no assistant message and no stream activity.
-  //     The previous R4 #2 gate correctly returned false for this
-  //     case; an inverted "require terminal assistant with stopReason
-  //     + no activity" gate would still mis-fire on (2) and (3) below.
-  //   - Orphan toolUse (R4 finding #1, 2026-04-24): terminal
-  //     assistant with stopReason="toolUse" + a toolCall that the
-  //     agent loop never executed. Shape detector abstains
-  //     (hasToolCall trusts the stop). A Continue-prompt retry here
-  //     would trigger pi-ai's synthetic `"No result provided"`
-  //     toolResult injection (transform-messages.js:125-141) and the
-  //     model would produce confidently-wrong output grounded in a
+  //   - Extension-handled prompts: pi-coding-agent autoloads
+  //     _extensionRunner whenever customTools are passed (agent-
+  //     session.js:1583-1586) — qlaybot always does (agent.ts:397), so
+  //     _tryExecuteExtensionCommand (:500-505) and emitInput (:510-514)
+  //     can resolve prompt() cleanly with no assistant message and no
+  //     stream activity. The fallback would retry a handled command.
+  //   - Orphan toolUse: terminal assistant with stopReason="toolUse"
+  //     and a toolCall the agent loop never executed. A Continue-
+  //     prompt here triggers pi-ai's synthetic `"No result provided"`
+  //     toolResult injection (transform-messages.js:125-141); the
+  //     model then produces confidently-wrong output grounded in a
   //     fake tool error.
-  //   - Legitimate empty completion (R2 finding #2, 2026-04-24):
-  //     stopReason="stop" + content=[]. Retrying the stop corrupts a
-  //     clean finish.
+  //   - Legitimate empty completion: stopReason="stop" + content=[].
+  //     Retrying corrupts a clean finish.
   //
-  // No remaining case requires the fallback to fire. Delegate
-  // entirely to the shape detector. The `tracker` parameter is
-  // retained for API stability — callers still wire subscribe /
+  // Delegate entirely to the shape detector. The `tracker` parameter
+  // is retained for API stability — callers still wire subscribe /
   // unsubscribe around the guard, which is harmless.
   void tracker;
   return isThinkingOnlyTerminationByMessages(session, sinceIdx);
@@ -364,10 +334,10 @@ export interface PromptWithGuardResult {
   retries: number;
   stillThinkingOnly: boolean;
   /**
-   * Pre-prompt message index. Pass to `lastTurnTerminalError` so the
-   * terminal-error check only inspects assistant messages produced by
-   * THIS prompt — otherwise a persistent session could surface a prior
-   * turn's error on a cleanly-handled current turn (R8 finding #2).
+   * Boundary index into `session.messages` — the first position that
+   * belongs to the CURRENT prompt. Pass to `lastTurnTerminalError`
+   * (and other scan helpers) so inspection ignores prior-turn shapes
+   * that could mis-fire on a cleanly-handled current turn.
    */
   sinceIdx: number;
 }
@@ -391,30 +361,27 @@ export async function runPromptWithThinkingOnlyGuard(
   const maxRetries = opts.maxRetries ?? THINKING_ONLY_MAX_RETRIES;
   const continuePrompt = opts.continuePrompt ?? THINKING_ONLY_CONTINUE_PROMPT;
 
-  // R8 finding #2 (2026-04-24): snapshot the pre-prompt message index
-  // so the shape detector and lastTurnTerminalError only consider
-  // assistant messages pushed by THIS prompt. Persistent sessions
-  // (TUI, RPC) accumulate history across turns; without this bound
-  // an extension-handled / no-output current turn would inspect the
-  // prior turn's trailing assistant shape and retry against stale
-  // state.
+  // Establish a "current prompt" boundary so the shape detector and
+  // lastTurnTerminalError only inspect assistant messages pushed by
+  // THIS prompt. Persistent sessions (TUI, RPC) accumulate history
+  // across turns; without the bound, an extension-handled or no-output
+  // current turn would read the prior turn's trailing assistant shape
+  // and retry against stale state.
   //
-  // R8.1 + R8.3 (2026-04-24, gpt-5.5 xhigh finals): AgentSession.prompt()
-  // can run pre-prompt / overflow compaction that REPLACES
-  // session.messages with a shorter array before appending the current
-  // turn. A raw pre-prompt snapshot would point past the new array's
-  // end → scans never iterate → current-turn error missed → silent
-  // empty success (the original ml09/ml11 failure class).
-  //
-  // A naive length check (`n < sinceIdx`) is insufficient: compaction
-  // can drop K messages AND the prompt add K messages, netting to the
-  // same length while the current assistant message still lives BEFORE
-  // the stale snapshot (R8.3). Track the last pre-prompt message by
-  // object reference instead: after prompt, locate the reference in
-  // the post-prompt array and set sinceIdx to one past it. If the
-  // reference was dropped by compaction, scan everything (sinceIdx = 0)
-  // — safe because the stale prior-turn shape R8 #2 was guarding
-  // against has also been discarded.
+  // Why track by object identity, not length:
+  // `AgentSession.prompt()` can run pre-prompt or overflow compaction
+  // that REPLACES `session.messages` with a shorter array before
+  // appending the current turn. A length snapshot can point past the
+  // new array's end (→ scans never iterate → current-turn error
+  // missed → silent empty success, the original ml09/ml11 failure
+  // class). A length-shrink check also misses the case where
+  // compaction drops K messages AND the prompt adds K messages,
+  // netting to the same length while the current assistant lives
+  // BEFORE the stale snapshot. Snapshot the last pre-prompt message
+  // by reference; after prompt, locate it in the post-prompt array
+  // and set sinceIdx to one past it. If dropped by compaction, scan
+  // everything — safe because the stale prior-turn shape the bound
+  // was guarding against was also discarded.
   const initialMsgs = session.messages ?? [];
   const preLastMsgRef: unknown =
     initialMsgs.length > 0 ? initialMsgs[initialMsgs.length - 1] : null;

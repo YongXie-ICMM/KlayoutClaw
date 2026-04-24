@@ -306,10 +306,10 @@ async function runInteractivePlain(
       process.exit(0);
     }
 
-    // R2 finding #2: intercept slash commands so /plan verify|status work
-    // in plain mode. Mirrors the RPC path (rpc.ts:244-258). Commands that
-    // need live session state (like /plan verify, which reads planManager)
-    // work here because we reuse the same botSession, not a fresh one.
+    // Intercept slash commands via the shared CommandRegistry so /plan
+    // verify|status work in plain mode against the live session state
+    // (fresh-session routing would lose the planManager context).
+    // Mirrors the RPC path.
     if (input.startsWith("/") && botSession.commandRegistry) {
       const parsed = parseCommand(input);
       if (parsed) {
@@ -328,31 +328,28 @@ async function runInteractivePlain(
 
     try {
       botSession.history.recordPrompt(input);
-      // Bump BEFORE prompt so transformContext (running inside prompt) sees
-      // the correct turn number. R2 fix: was after, causing off-by-one.
-      // R4 #1: clear the per-turn latch so the reinjector can fire at
-      // most ONCE per user turn across all round-trips.
+      // Bump + clear BEFORE prompt so transformContext (running inside
+      // prompt) sees the correct turn number, and so the reinjector
+      // fires at most once per user turn across all round-trips.
       botSession.planManager?.clearRemindedThisTurn();
       botSession.planManager?.incrementTurnsSinceExit();
       await botSession.session.prompt(input);
-      // R5 finding #1: pi-coding-agent swallows most provider errors and
-      // resolves the promise with an error assistant turn instead of
-      // throwing. The catch below only fires for true throws (rare — mostly
-      // prompt_too_long after recovery exhaust). Check the trailing
-      // assistant turn's stopReason to catch swallowed failures and roll
-      // back the cadence bump for turns that produced no usable output.
+      // pi-coding-agent swallows most provider errors: it resolves with
+      // an error assistant turn instead of throwing, so the catch below
+      // won't see them. Check the trailing assistant's stopReason and
+      // roll back the bump for turns that produced no usable output.
       if (lastTurnWasFailure(botSession.session)) {
         botSession.planManager?.decrementTurnsSinceExit();
       }
     } catch (err: unknown) {
-      // R3 finding #1: roll back the pre-prompt bump so failed turns don't
-      // inflate the reinjection cadence. Only successful turns count.
+      // True throws (e.g. prompt_too_long after recovery exhausts):
+      // roll back the bump so failed turns don't inflate cadence.
       botSession.planManager?.decrementTurnsSinceExit();
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`\nError: ${msg}`);
     } finally {
-      // issue #24: bound the exit-turn swallow flag to one prompt cycle so
-      // a rejection/abort after exit_plan_mode can't leak into the next turn.
+      // Bound the exit-turn swallow to one prompt cycle so a
+      // rejection/abort after exit_plan_mode can't leak into the next.
       botSession.planManager?.consumeExitSwallow();
     }
     rl.prompt();
@@ -401,10 +398,9 @@ async function runJSON(args: CLIArgs): Promise<void> {
 
   try {
     botSession.history.recordPrompt(args.message);
-    // #24 bookkeeping: clear per-turn reinjection latch + bump turn counter
-    // BEFORE entering the prompt flow so transformContext sees the correct
-    // turn number and the plan blob is injected at most ONCE per user turn
-    // across all round-trips.
+    // Bump + clear BEFORE the guard call so transformContext (running
+    // inside prompt) sees the correct turn number, and so the
+    // reinjector fires at most once per user turn across all round-trips.
     botSession.planManager?.clearRemindedThisTurn();
     botSession.planManager?.incrementTurnsSinceExit();
     const { retries, stillThinkingOnly, sinceIdx } = await runPromptWithThinkingOnlyGuard(
@@ -413,10 +409,8 @@ async function runJSON(args: CLIArgs): Promise<void> {
       tracker,
       {
         onRetry: (attempt, max) => {
-          // Drop any partial text the failed turn streamed before the
-          // error stopReason arrived — otherwise the final JSON response
-          // would be `partial_failed_text + retry_text`. See code-review
-          // finding #1 (2026-04-23).
+          // Drop partial text from the failed attempt so the final JSON
+          // response doesn't become partial_failed_text + retry_text.
           chunks.length = 0;
           console.error(
             `[qlaybot] thinking-only termination detected (attempt ${attempt}/${max}), re-prompting...`,
@@ -430,18 +424,12 @@ async function runJSON(args: CLIArgs): Promise<void> {
       },
     );
 
-    // R3 finding #2 (2026-04-24): if the guard exhausted its retries,
-    // `chunks` still holds the LAST failed attempt's partial text
-    // (onRetry clears between attempts but not after the final one).
-    // Returning that as `completed` is a false-success bug — surface
-    // the exhaustion as an error instead.
-    //
-    // R5 finding #1 (2026-04-24): use `process.exitCode = 1; return;`
-    // instead of `process.exit(1)`. The latter terminates before the
-    // buffered stdout write drains when piped, and skips the outer
-    // `finally {}` that disposes the session. Setting exitCode lets
-    // the normal control flow fall through to finally, cleanup runs,
-    // stdout drains on beforeExit, and Node exits with status 1.
+    // On retry exhaustion, `chunks` still holds the LAST failed attempt's
+    // partial text (onRetry only clears between attempts). Returning that
+    // as `completed` would be a false success — emit status:"error".
+    // Use `process.exitCode = 1; return;` so the outer `finally` runs,
+    // stdout drains on beforeExit, and Node exits 1 cleanly when the
+    // caller has piped stdout.
     if (stillThinkingOnly) {
       chunks.length = 0;
       const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
@@ -451,13 +439,11 @@ async function runJSON(args: CLIArgs): Promise<void> {
       return;
     }
 
-    // R8 finding #1 (2026-04-24): non-retryable provider errors
-    // (401 / invalid_api_key, context-overflow, invalid_request_error,
-    // insufficient_quota, unknown 4xx) are deliberately excluded from
-    // the retry loop (R3 #1). Without this check the success path
-    // would emit `{status:"completed", response:""}` — the original
-    // ml09/ml11 silent-failure pattern in a different shape. Surface
-    // the provider error instead.
+    // Non-retryable provider errors (401, context-overflow,
+    // invalid_request, quota, unknown 4xx) are deliberately skipped by
+    // the retry loop. Surface them — otherwise the success path emits
+    // `{status:"completed", response:""}` (the original silent-failure
+    // pattern in a different shape).
     const terminalError = lastTurnTerminalError(botSession.session, sinceIdx);
     if (terminalError) {
       chunks.length = 0;
@@ -471,12 +457,10 @@ async function runJSON(args: CLIArgs): Promise<void> {
       return;
     }
 
-    // #24 R5: pi-coding-agent swallows most provider errors and resolves
-    // with an error assistant turn. Check the trailing turn after the
-    // retry loop so a swallowed failure rolls the cadence back instead
-    // of silently inflating it. (#22's terminalError check above already
-    // returned for non-retryable errors; this covers the retryable-
-    // recovered AND the thinking-only-retried-to-success cases.)
+    // Swallowed provider errors (pi-coding-agent resolves with an error
+    // assistant turn instead of throwing) can still slip through when
+    // the terminalError check above says it's a retryable or refusal
+    // case. Roll back the cadence for those turns too.
     if (lastTurnWasFailure(botSession.session)) {
       botSession.planManager?.decrementTurnsSinceExit();
     }
@@ -484,18 +468,17 @@ async function runJSON(args: CLIArgs): Promise<void> {
     const output = { status: "completed", response: chunks.join(""), retries };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {
-    // #24 R3 #1: roll back the pre-prompt bump so failed turns don't
-    // inflate the reinjection cadence. Only successful turns count.
-    // #22 R5 #1: fall through to `finally` so the JSON error envelope
-    // flushes cleanly and session cleanup runs (exitCode, not exit).
+    // True throws: roll back the bump; fall through to `finally` so the
+    // JSON error envelope flushes and session cleanup runs (exitCode,
+    // not process.exit, to keep stdout drain + finally intact).
     botSession.planManager?.decrementTurnsSinceExit();
     const msg = err instanceof Error ? err.message : String(err);
     const output = { status: "error", error: msg };
     console.log(JSON.stringify(output, null, 2));
     process.exitCode = 1;
   } finally {
-    // issue #24: bound the exit-turn swallow flag to one prompt cycle so a
-    // rejection/abort after exit_plan_mode can't leak into the next turn.
+    // Bound the exit-turn swallow to one prompt cycle so a
+    // rejection/abort after exit_plan_mode can't leak into the next.
     botSession.planManager?.consumeExitSwallow();
     unsubscribe();
     tracker.unsubscribe();
