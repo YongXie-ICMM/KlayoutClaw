@@ -46,19 +46,30 @@ export function createPlanReinjector(
 
     const reminderText = [
       PLAN_REINJECTION_OPEN,
-      `This is your plan, re-injected every ${config.interval} turn(s) since you exited plan mode:`,
+      `<system-reminder>`,
+      `This is your plan, re-injected every ${config.interval} turn(s) since you exited plan mode.`,
+      `Before answering the user's next message, briefly state done / in-progress / not started for each plan item, then answer the user.`,
       "",
       planContent,
       "",
-      "For each item in the plan above, briefly state: done / in-progress / not started.",
-      "Then continue with the next not-started item.",
-      "When everything is complete, call /plan verify to stop these reminders.",
+      `When everything is complete, call /plan verify to stop these reminders.`,
+      `</system-reminder>`,
       PLAN_REINJECTION_CLOSE,
     ].join("\n");
 
+    // Find the terminal user message; insert reminder BEFORE it so the
+    // user's actual request stays the last thing the model sees.
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx < 0) {
+      return [{ role: "user", content: reminderText, isMeta: true }, ...messages];
+    }
     return [
-      ...messages,
+      ...messages.slice(0, lastUserIdx),
       { role: "user", content: reminderText, isMeta: true },
+      ...messages.slice(lastUserIdx),
     ];
   };
 }

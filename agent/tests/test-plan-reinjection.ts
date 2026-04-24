@@ -314,10 +314,13 @@ describe("createPlanReinjector: cadence (interval=3)", () => {
       expect(pm.turnsSinceExit).toBe(turn);
       const msgs = [{ role: "user", content: `prompt-${turn}` }];
       const out = await phase(msgs as any);
+      // Reminder is inserted BEFORE the terminal user message, so search
+      // the whole array rather than only checking the last element.
       const injected =
         out.length > msgs.length &&
-        typeof out[out.length - 1].content === "string" &&
-        (out[out.length - 1].content as string).includes(PLAN_REINJECTION_OPEN);
+        out.some(
+          (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+        );
       expect(injected).toBe(expected[turn]);
     }
   });
@@ -336,12 +339,13 @@ describe("createPlanReinjector: cadence (interval=3)", () => {
     expect(pm.turnsSinceExit).toBe(10);
     out = await phase([{ role: "user", content: "x" }] as any);
     expect(out.length).toBe(2);
-    expect((out[1].content as string)).toContain(PLAN_REINJECTION_OPEN);
+    // Reminder at index 0 (before the terminal user message at index 1).
+    expect((out[0].content as string)).toContain(PLAN_REINJECTION_OPEN);
   });
 });
 
 describe("createPlanReinjector: content shape", () => {
-  it("appends a meta user message with plan content, markers, and verification instruction", async () => {
+  it("inserts a meta user message BEFORE the terminal user message with plan content, markers, and verification instruction", async () => {
     const {
       createPlanReinjector,
       PLAN_REINJECTION_OPEN,
@@ -351,21 +355,26 @@ describe("createPlanReinjector: content shape", () => {
     const { pm } = await activatePlanAndExit(planBody);
     const phase = createPlanReinjector(pm, { interval: 3 });
     for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    // Use a realistic conversation that ends with a user turn (the common case).
     const msgs = [
       { role: "user", content: "what's next?" },
       { role: "assistant", content: "working on it" },
+      { role: "user", content: "can you continue?" },
     ];
     const out = await phase(msgs as any);
     expect(out.length).toBe(msgs.length + 1);
-    // Preserved original messages, in order.
+    // Prefix messages preserved in order.
     expect(out[0]).toEqual(msgs[0]);
     expect(out[1]).toEqual(msgs[1]);
+    // Reminder at index 2 (before the terminal user message).
+    const reminder = out[2] as any;
+    expect(reminder.role).toBe("user");
+    expect(reminder.isMeta).toBe(true);
+    expect(typeof reminder.content).toBe("string");
+    // Terminal user message remains last.
+    expect(out[3]).toEqual(msgs[2]);
 
-    const appended = out[out.length - 1];
-    expect(appended.role).toBe("user");
-    expect(appended.isMeta).toBe(true);
-    expect(typeof appended.content).toBe("string");
-    const text = appended.content as string;
+    const text = reminder.content as string;
 
     expect(text).toContain(PLAN_REINJECTION_OPEN);
     expect(text).toContain(PLAN_REINJECTION_CLOSE);
@@ -374,17 +383,84 @@ describe("createPlanReinjector: content shape", () => {
     expect(PLAN_REINJECTION_CLOSE).toBe("</plan-reinjection>");
     // OPEN marker on its own line.
     expect(text.split("\n")).toContain(PLAN_REINJECTION_OPEN);
+    // system-reminder wrapper present.
+    expect(text).toContain("<system-reminder>");
+    expect(text).toContain("</system-reminder>");
     // Full plan body included.
     expect(text).toContain("# Heading");
     expect(text).toContain("1. step one");
     expect(text).toContain("2. step two with details");
-    // Verification instruction literals.
+    // Status-check instruction.
     expect(text).toContain(
-      "For each item in the plan above, briefly state: done / in-progress / not started.",
+      "briefly state done / in-progress / not started for each plan item",
     );
-    expect(text).toContain("Then continue with the next not-started item.");
     // How-to-stop hint.
     expect(text).toContain("/plan verify");
+  });
+});
+
+describe("createPlanReinjector: reminder placement (Finding 1)", () => {
+  it("reminder is placed BEFORE the terminal user message in a multi-turn conversation", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+
+    const msgs = [
+      { role: "system", content: "system prompt" },
+      { role: "user", content: "first user turn" },
+      { role: "assistant", content: "first assistant reply" },
+      { role: "user", content: "second user turn (terminal)" },
+    ];
+    const out = await phase(msgs as any);
+    expect(out.length).toBe(msgs.length + 1);
+    // Terminal user message must remain the last message.
+    const last = out[out.length - 1] as any;
+    expect(last.content).toBe("second user turn (terminal)");
+    expect(last.role).toBe("user");
+    // Reminder is immediately before the terminal user message.
+    const reminderMsg = out[out.length - 2] as any;
+    expect(reminderMsg.content).toContain(PLAN_REINJECTION_OPEN);
+    expect(reminderMsg.role).toBe("user");
+    expect(reminderMsg.isMeta).toBe(true);
+  });
+
+  it("single-user-message input: reminder placed before the user message, user message stays last", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+
+    const userMsg = { role: "user", content: "user request" };
+    const out = await phase([userMsg] as any);
+    expect(out.length).toBe(2);
+    // Reminder at index 0 (before the user message).
+    expect((out[0] as any).content).toContain(PLAN_REINJECTION_OPEN);
+    expect((out[0] as any).isMeta).toBe(true);
+    // User message at index 1 (last).
+    expect(out[1]).toEqual(userMsg);
+  });
+
+  it("fallback: no terminal user message → reminder prepended at index 0", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+
+    // Messages with no user role — the fallback path prepends the reminder.
+    const msgs = [{ role: "assistant", content: "assistant-only message" }];
+    const out = await phase(msgs as any);
+    expect(out.length).toBe(msgs.length + 1);
+    expect((out[0] as any).content).toContain(PLAN_REINJECTION_OPEN);
+    expect((out[0] as any).isMeta).toBe(true);
+    // Original message follows.
+    expect(out[1]).toEqual(msgs[0]);
   });
 });
 
@@ -398,8 +474,11 @@ describe("createPlanReinjector: post-verify silence", () => {
     // Cross the interval once (would normally inject).
     for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
     const firstOut = await phase([{ role: "user", content: "q" }] as any);
+    // Reminder is inserted before the terminal user message (not at end).
     expect(
-      (firstOut[firstOut.length - 1].content as string).includes(PLAN_REINJECTION_OPEN),
+      firstOut.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      ),
     ).toBe(true);
 
     pm.markVerified();
