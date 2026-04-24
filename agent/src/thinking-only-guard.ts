@@ -396,19 +396,41 @@ export async function runPromptWithThinkingOnlyGuard(
   // prior turn's trailing assistant shape and retry against stale
   // state.
   //
-  // R8.1 finding (2026-04-24, gpt-5.5 xhigh final): AgentSession.prompt()
+  // R8.1 + R8.3 (2026-04-24, gpt-5.5 xhigh finals): AgentSession.prompt()
   // can run pre-prompt / overflow compaction that REPLACES
   // session.messages with a shorter array before appending the current
   // turn. A raw pre-prompt snapshot would point past the new array's
   // end → scans never iterate → current-turn error missed → silent
-  // empty success (the original ml09/ml11 failure class). Recompute the
-  // boundary after each prompt: if the history shrunk below the
-  // snapshot, compaction dropped the stale prior-turn shape anyway so
-  // it's safe to scan everything (sinceIdx = 0) for the current turn.
-  let sinceIdx = session.messages?.length ?? 0;
+  // empty success (the original ml09/ml11 failure class).
+  //
+  // A naive length check (`n < sinceIdx`) is insufficient: compaction
+  // can drop K messages AND the prompt add K messages, netting to the
+  // same length while the current assistant message still lives BEFORE
+  // the stale snapshot (R8.3). Track the last pre-prompt message by
+  // object reference instead: after prompt, locate the reference in
+  // the post-prompt array and set sinceIdx to one past it. If the
+  // reference was dropped by compaction, scan everything (sinceIdx = 0)
+  // — safe because the stale prior-turn shape R8 #2 was guarding
+  // against has also been discarded.
+  const initialMsgs = session.messages ?? [];
+  const preLastMsgRef: unknown =
+    initialMsgs.length > 0 ? initialMsgs[initialMsgs.length - 1] : null;
+  let sinceIdx = initialMsgs.length;
   const reboundAfterCompaction = (): number => {
-    const n = session.messages?.length ?? 0;
-    if (n < sinceIdx) sinceIdx = 0;
+    const msgs = session.messages ?? [];
+    if (preLastMsgRef === null) {
+      // Empty pre-prompt history — scan everything.
+      sinceIdx = 0;
+      return sinceIdx;
+    }
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i] === preLastMsgRef) {
+        sinceIdx = i + 1;
+        return sinceIdx;
+      }
+    }
+    // preLastMsgRef dropped by compaction → scan everything new.
+    sinceIdx = 0;
     return sinceIdx;
   };
 

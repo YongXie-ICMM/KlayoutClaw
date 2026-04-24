@@ -1133,6 +1133,92 @@ describe("sinceIdx compaction safety (R8.1 finding — gpt-5.5 xhigh final)", ()
     // (errorMessage "overloaded_error" is retryable, so it returns null)
   });
 
+  it("compaction drops K + prompt adds K → same length, identity-tracked rebind fires (R8.3 final)", async () => {
+    // Codex finding: pre-prompt length 4; compaction drops 2, prompt adds
+    // 2 (user + assistant) → final length 4 = sinceIdx. Naive length check
+    // `n < sinceIdx` doesn't trigger. Object-identity tracking finds the
+    // pre-last message was dropped → rebinds sinceIdx to 0 and the current
+    // assistant error is detected.
+    const preLast = makeAssistant("custom-anthropic", {
+      stopReason: "stop",
+      content: [{ type: "text", text: "previous clean" }],
+    });
+    const priorHistory = [
+      makeUser("t1"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "t1 reply" }],
+      }),
+      makeUser("t2"),
+      preLast,
+    ];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Compaction drops first 2 messages; prompt adds user + assistant error.
+        session.messages = [
+          priorHistory[2], // kept: makeUser("t2")
+          priorHistory[3], // kept: preLast
+          makeUser("t3 current"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "401 Invalid API key",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "t3 current",
+      tracker,
+    );
+    // preLast IS still in the post-prompt array at index 1; sinceIdx = 2.
+    // Current assistant error at index 3 is AFTER sinceIdx → detected.
+    expect(result.sinceIdx).toBe(2);
+    expect(
+      lastTurnTerminalError(session, result.sinceIdx),
+    ).toBe("401 Invalid API key");
+  });
+
+  it("compaction drops preLast entirely → rebinds to 0, current-turn error detected (R8.3 final)", async () => {
+    // Harder case: compaction discards the pre-prompt last message. Object
+    // identity not found in post-prompt array → sinceIdx resets to 0.
+    const preLast = makeAssistant("custom-anthropic", {
+      stopReason: "stop",
+      content: [{ type: "text", text: "old" }],
+    });
+    const priorHistory = [makeUser("t1"), preLast];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Full compaction: drop everything, rebuild with summary + new turn.
+        session.messages = [
+          makeUser("[compacted summary]"),
+          makeUser("t2"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "prompt is too long: 300000 tokens",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "t2",
+      tracker,
+    );
+    expect(result.sinceIdx).toBe(0);
+    expect(lastTurnTerminalError(session, result.sinceIdx)).toBe(
+      "prompt is too long: 300000 tokens",
+    );
+  });
+
   it("context-overflow msg with retryable-looking token count → surfaces as terminal (R8.2 final)", () => {
     // Non-retryable context-overflow error whose errorMessage contains
     // "250000" (so /500/ in isRetryableErrorMessage matches). Without the
