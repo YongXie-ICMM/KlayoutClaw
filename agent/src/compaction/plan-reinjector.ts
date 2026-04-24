@@ -54,7 +54,11 @@ export function createPlanReinjector(
       "",
       planContent,
       "",
-      `When everything is complete, call /plan verify to stop these reminders.`,
+      // R3 finding #3 (2026-04-24): slash commands are user-only — the
+      // model can't invoke /plan verify from its own response. Tell the
+      // model to inform the user instead, so the human can run the
+      // command themselves.
+      `When you believe all plan items are complete, explicitly tell the user the plan is done. The user can then run /plan verify to stop these reminders.`,
       `</system-reminder>`,
       PLAN_REINJECTION_CLOSE,
     ].join("\n");

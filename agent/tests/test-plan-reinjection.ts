@@ -532,6 +532,45 @@ describe("createPlanReinjector: content shape", () => {
     // How-to-stop hint.
     expect(text).toContain("/plan verify");
   });
+
+  // R3 finding #3 (2026-04-24): the reminder used to instruct the model
+  // to "call /plan verify", but slash commands are user-only — the model
+  // can't invoke them from its own response. The wording must route the
+  // verify action through the user.
+  it("reminder does NOT instruct the model to call /plan verify directly (R3 finding #3)", async () => {
+    const { createPlanReinjector } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("# Heading\nbody");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const out = await phase([{ role: "user", content: "q" }] as any);
+    const reminder = out[0] as any;
+    const text = reminder.content as string;
+    // The old, broken phrasing told the model to invoke a user-only command.
+    expect(text).not.toContain("call /plan verify");
+    // The literal imperative "call" with a slash command is the bug —
+    // forbid the imperative form, even if the rest of the wording changes.
+    expect(text).not.toMatch(/\bcall\s+\/plan\b/);
+  });
+
+  it("reminder routes /plan verify through the user, not the model (R3 finding #3)", async () => {
+    const { createPlanReinjector } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("# Heading\nbody");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const out = await phase([{ role: "user", content: "q" }] as any);
+    const reminder = out[0] as any;
+    const text = reminder.content as string;
+    // The new wording must mention "the user" as the actor for /plan verify.
+    expect(text).toContain("the user");
+    expect(text).toContain("/plan verify");
+    // And the model is told to "tell" / "inform" / "explicitly tell" the user
+    // when the plan is done — not to invoke the command itself.
+    expect(text).toMatch(/tell\s+the\s+user/i);
+  });
 });
 
 describe("createPlanReinjector: reminder placement (Finding 1)", () => {
