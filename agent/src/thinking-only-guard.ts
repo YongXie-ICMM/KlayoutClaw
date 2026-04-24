@@ -21,7 +21,21 @@
  * `docs/early_exit_report_2026_04_23_k2p6.md` and issue #22.
  */
 
+import { isContextOverflow } from "@mariozechner/pi-ai";
+
 export const THINKING_ONLY_MAX_RETRIES = 5;
+
+/**
+ * Canonical retryable-error regex mirrored from pi-coding-agent's
+ * `_isRetryableError` (agent-session.js:1672). Any `stopReason="error"`
+ * whose `errorMessage` does NOT match this pattern is treated as
+ * non-retryable: auth failures, invalid_request errors, malformed body,
+ * unknown 4xx, etc. Context-overflow is handled separately via pi-ai's
+ * `isContextOverflow` because it has its own provider-specific patterns.
+ * Keep this regex in sync if pi-coding-agent updates theirs.
+ */
+const RETRYABLE_ERROR_PATTERN =
+  /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
 
 export const THINKING_ONLY_CONTINUE_PROMPT =
   "Continue. You stopped mid-task after a thinking block — keep working.";
@@ -96,18 +110,32 @@ export function isThinkingOnlyTerminationByMessages(
   //     Message` is NOT set (only the catch block sets it).
   //
   // `errorMessage` (pi-ai AssistantMessage.errorMessage, types.d.ts:120)
-  // is the definitive signal. Gate retry on its presence, not on
-  // content shape — see R2 finding #1 (2026-04-24).
+  // is the primary signal — R2 finding #1 (2026-04-24). But presence
+  // alone is too broad: context-overflow, auth, invalid_request all
+  // set errorMessage yet are not fixed by retrying. R3 finding #1
+  // (2026-04-24) narrows retry to the same set pi-coding-agent's
+  // `_isRetryableError` handles (agent-session.js:1663-1673).
   if (last.stopReason === "error") {
-    if (
-      typeof last.errorMessage === "string" &&
-      last.errorMessage.length > 0
-    ) {
-      return true;
+    const em = typeof last.errorMessage === "string" ? last.errorMessage : "";
+    if (em.length === 0) {
+      // Refusal / content_filter / safety — preserve the stop.
+      return false;
     }
-    // No errorMessage: refusal / content_filter (preserve), or the
-    // rare refusal-with-suppressed-text case. Either way, don't retry.
-    return false;
+    // Context overflow is handled by compaction, never by Continue.
+    // pi-ai's isContextOverflow checks the 15+ provider-specific
+    // patterns (Anthropic "prompt is too long", OpenAI "exceeds the
+    // context window", etc.).
+    if (isContextOverflow(last)) {
+      return false;
+    }
+    // Only retry errors pi-coding-agent considers retryable. Auth
+    // failures, invalid_request_error, insufficient_quota, etc. are
+    // surfaced as-is so the caller sees the real error instead of
+    // burning through 5 `Continue...` prompts.
+    if (!RETRYABLE_ERROR_PATTERN.test(em)) {
+      return false;
+    }
+    return true;
   }
 
   // Stalled tool-use: the model emitted a tool call but the loop never

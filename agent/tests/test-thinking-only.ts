@@ -241,6 +241,10 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
     // catch block (anthropic.js:318, openai-completions.js:257) sets
     // both. The previous gate classified this as a refusal and
     // silently returned the truncated answer.
+    //
+    // R3: errorMessage string must also match pi-coding-agent's
+    // canonical retryable regex (agent-session.js:1672). Use "fetch
+    // failed" — the real phrase undici emits for mid-stream TCP drops.
     const msgs = [
       makeUser("write a long essay"),
       makeAssistant("custom-anthropic", {
@@ -248,7 +252,7 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
         content: [
           { type: "text", text: "Once upon a time there was a long-running..." },
         ],
-        errorMessage: "Connection reset by peer",
+        errorMessage: "fetch failed",
       }),
     ];
     expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
@@ -266,6 +270,76 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
       }),
     ];
     expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: context-overflow (stopReason=error + 'prompt is too long') → false", () => {
+    // pi-ai isContextOverflow (utils/overflow.js) matches this
+    // phrase for anthropic. pi-coding-agent's _isRetryableError
+    // (agent-session.js:1668) explicitly excludes overflow from
+    // retry — compaction handles it, not a Continue loop.
+    const msgs = [
+      makeUser("a very long prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "prompt is too long: 213462 tokens > 200000 maximum",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: openai context-overflow ('exceeds the context window') → false", () => {
+    const msgs = [
+      makeUser("oversized"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "Your input exceeds the context window of this model",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: auth failure (stopReason=error + 'Invalid API key') → false", () => {
+    // Not in pi-coding-agent's retryable regex. Surface the error
+    // instead of burning 5 Continues against a bad credential.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: invalid_request_error (stopReason=error) → false", () => {
+    const msgs = [
+      makeUser("malformed"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: messages.0.content: field required",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: upstream 502 (stopReason=error) → true", () => {
+    // Canonical retryable — pi-coding-agent's regex matches 502.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "502 Bad Gateway",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
   });
 
   it("aborted mid-stream (stopReason=aborted) → true", () => {
