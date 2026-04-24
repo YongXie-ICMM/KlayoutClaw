@@ -357,7 +357,7 @@ async function runJSON(args: CLIArgs): Promise<void> {
 
   try {
     botSession.history.recordPrompt(args.message);
-    await runPromptWithThinkingOnlyGuard(
+    const { retries, stillThinkingOnly } = await runPromptWithThinkingOnlyGuard(
       botSession.session,
       args.message,
       tracker,
@@ -380,7 +380,20 @@ async function runJSON(args: CLIArgs): Promise<void> {
       },
     );
 
-    const output = { status: "completed", response: chunks.join("") };
+    // R3 finding #2 (2026-04-24): if the guard exhausted its retries,
+    // `chunks` still holds the LAST failed attempt's partial text
+    // (onRetry clears between attempts but not after the final one).
+    // Returning that as `completed` is a false-success bug — surface
+    // the exhaustion as an error instead.
+    if (stillThinkingOnly) {
+      chunks.length = 0;
+      const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
+      const output = { status: "error", error: errMsg, retries };
+      console.log(JSON.stringify(output, null, 2));
+      process.exit(1);
+    }
+
+    const output = { status: "completed", response: chunks.join(""), retries };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

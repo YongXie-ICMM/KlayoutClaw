@@ -293,32 +293,50 @@ export async function startRPCServer(opts: {
           try {
             // Defense in depth against thinking-only terminations. Same guard
             // as cli.ts runJSON — see thinking-only-guard.ts and issue #22.
-            await runPromptWithThinkingOnlyGuard(
-              botSession.session,
-              message,
-              tracker,
-              {
-                onRetry: (attempt, max) => {
-                  // Drop any partial text the failed turn streamed
-                  // before the error stopReason arrived. The client has
-                  // ALREADY received `content_delta` events for those
-                  // chunks, so also emit `thinking_only_reset` to tell
-                  // IDE clients to discard what they displayed for the
-                  // failed attempt. Event contract: `{ attempt, max }`
-                  // — same shape as `thinking_only_reprompt`; fires
-                  // immediately before the reprompt event so clients
-                  // can clear display state, then show a retry banner.
-                  // See code-review finding #1 (2026-04-23).
-                  chunks.length = 0;
-                  sendEvent("thinking_only_reset", { attempt, max });
-                  sendEvent("thinking_only_reprompt", { attempt, max });
+            const { retries, stillThinkingOnly } =
+              await runPromptWithThinkingOnlyGuard(
+                botSession.session,
+                message,
+                tracker,
+                {
+                  onRetry: (attempt, max) => {
+                    // Drop any partial text the failed turn streamed
+                    // before the error stopReason arrived. The client has
+                    // ALREADY received `content_delta` events for those
+                    // chunks, so also emit `thinking_only_reset` to tell
+                    // IDE clients to discard what they displayed for the
+                    // failed attempt. Event contract: `{ attempt, max }`
+                    // — same shape as `thinking_only_reprompt`; fires
+                    // immediately before the reprompt event so clients
+                    // can clear display state, then show a retry banner.
+                    // See code-review finding #1 (2026-04-23).
+                    chunks.length = 0;
+                    sendEvent("thinking_only_reset", { attempt, max });
+                    sendEvent("thinking_only_reprompt", { attempt, max });
+                  },
                 },
-              },
-            );
+              );
+
+            // R3 finding #2 (2026-04-24): if retries exhausted, the
+            // chunks buffer still holds the last failed attempt's
+            // partial text. Returning it as `completed` masks an
+            // upstream failure — surface the exhaustion instead.
+            if (stillThinkingOnly) {
+              chunks.length = 0;
+              const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
+              botSession.history.recordError(errMsg);
+              sendEvent("error", { message: errMsg });
+              sendError(req.id, -32000, errMsg);
+              break;
+            }
 
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
-            sendResult(req.id, { status: "completed", response: responseText });
+            sendResult(req.id, {
+              status: "completed",
+              response: responseText,
+              retries,
+            });
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             botSession.history.recordError(msg);

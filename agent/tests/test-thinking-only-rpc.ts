@@ -416,4 +416,251 @@ describe("RPC-mode thinking-only retry integration", () => {
     tracker.unsubscribe();
     unsub();
   });
+
+  // ---------------------------------------------------------------------------
+  // R3 finding #2 (2026-04-24): exhausted retries must surface as error,
+  // not as a false-success response containing the last attempt's partial
+  // text. These tests mirror cli.ts:runJSON and rpc.ts prompt-handler
+  // branching on `{ retries, stillThinkingOnly }`.
+  // ---------------------------------------------------------------------------
+
+  it("R3 RPC: exhausted retries emit error event + sendError, NOT sendResult(completed)", async () => {
+    // Every turn ends with a retryable transport error + partial text.
+    // The guard loops until maxRetries and returns stillThinkingOnly=true.
+    // Build 1 initial + 5 retries = 6 behaviors.
+    const behaviors = Array.from({ length: 6 }, () => (
+      (emit: any, messages: any[]) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            delta: "half-written chunk ",
+          },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "half-written chunk " }],
+          stopReason: "error",
+          errorMessage: "502 Bad Gateway",
+        });
+      }
+    ));
+    const session = createMockSession(behaviors);
+
+    const sentEvents: Array<{ name: string; params: any }> = [];
+    const sendEvent = (name: string, params: any) =>
+      sentEvents.push({ name, params });
+
+    let sendResultCalled: any = null;
+    let sendErrorCalled: any = null;
+    const sendResult = (id: number, body: any) => {
+      sendResultCalled = { id, body };
+    };
+    const sendError = (id: number, code: number, msg: string) => {
+      sendErrorCalled = { id, code, msg };
+    };
+
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+    const tracker = createTurnActivityTracker(session);
+
+    // Mirror rpc.ts prompt handler exhaustion branching.
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: (attempt, max) => {
+          chunks.length = 0;
+          sendEvent("thinking_only_reset", { attempt, max });
+          sendEvent("thinking_only_reprompt", { attempt, max });
+        },
+      });
+
+    if (stillThinkingOnly) {
+      chunks.length = 0;
+      const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
+      sendEvent("error", { message: errMsg });
+      sendError(1, -32000, errMsg);
+    } else {
+      sendResult(1, { status: "completed", response: chunks.join(""), retries });
+    }
+
+    expect(stillThinkingOnly).toBe(true);
+    expect(retries).toBe(5);
+    expect(sendResultCalled).toBeNull();
+    expect(sendErrorCalled).not.toBeNull();
+    expect(sendErrorCalled.code).toBe(-32000);
+    expect(sendErrorCalled.msg).toMatch(/Retries exhausted after 5 attempts/);
+
+    // The final `error` event is emitted; `chunks` is cleared so no
+    // partial text leaks into later state.
+    expect(sentEvents.some((e) => e.name === "error")).toBe(true);
+    expect(chunks.length).toBe(0);
+
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("R3 RPC: successful recovery includes `retries` in completed response", async () => {
+    // Turns 1-3 fail with retryable transport error; turn 4 clean text.
+    const session = createMockSession([
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "a " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "a " }],
+          stopReason: "error",
+          errorMessage: "overloaded",
+        });
+      },
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "b " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "b " }],
+          stopReason: "error",
+          errorMessage: "rate limit exceeded",
+        });
+      },
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "c " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "c " }],
+          stopReason: "error",
+          errorMessage: "503 service unavailable",
+        });
+      },
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "final answer" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "final answer" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+    const tracker = createTurnActivityTracker(session);
+
+    let sendResultCalled: any = null;
+    const sendResult = (id: number, body: any) => {
+      sendResultCalled = { id, body };
+    };
+
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    if (!stillThinkingOnly) {
+      sendResult(1, {
+        status: "completed",
+        response: chunks.join(""),
+        retries,
+      });
+    }
+
+    expect(stillThinkingOnly).toBe(false);
+    expect(retries).toBe(3);
+    expect(sendResultCalled?.body).toEqual({
+      status: "completed",
+      response: "final answer",
+      retries: 3,
+    });
+
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("R3 CLI: exhausted retries produce status='error' + exit path, not status='completed'", async () => {
+    // Mirrors cli.ts:runJSON exhaustion branch. 6 consecutive retryable
+    // errors drain the retry budget; caller must NOT return partial text
+    // as completed.
+    const behaviors = Array.from({ length: 6 }, () => (
+      (emit: any, messages: any[]) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "partial " },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "partial " }],
+          stopReason: "error",
+          errorMessage: "fetch failed",
+        });
+      }
+    ));
+    const session = createMockSession(behaviors);
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+    const tracker = createTurnActivityTracker(session);
+
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    // Mirror cli.ts runJSON exhaustion branch: would process.exit(1)
+    // after emitting JSON status=error. Assert the contract pieces.
+    expect(stillThinkingOnly).toBe(true);
+    expect(retries).toBe(5);
+
+    let output: any;
+    if (stillThinkingOnly) {
+      chunks.length = 0;
+      output = {
+        status: "error",
+        error: `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`,
+        retries,
+      };
+    } else {
+      output = { status: "completed", response: chunks.join(""), retries };
+    }
+
+    expect(output.status).toBe("error");
+    expect(output.response).toBeUndefined();
+    expect(output.retries).toBe(5);
+    expect(chunks.length).toBe(0);
+
+    tracker.unsubscribe();
+    unsub();
+  });
 });
