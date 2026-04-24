@@ -1444,16 +1444,30 @@ describe("agent-wiring", () => {
     expect(section2).not.toBe(section1);
   });
 
-  it("system prompt delegation section is absent when no roles configured", async () => {
-    // Import the delegation section builder directly -- this module must exist
+  it("delegation section describes built-in general-purpose when enabled:true + roles:{} (R3 #1)", async () => {
     const { buildDelegationSection } = await import(
       "../src/prompts/sections/delegation.js"
     );
     const config = makeSubagentConfig({ roles: {} });
 
     const section = buildDelegationSection(config);
-    // With no roles, section should be empty/null
-    expect(!section || section.length === 0).toBe(true);
+    // Post-redesign: built-in general-purpose is a reachable target whenever
+    // the subagent layer is enabled, so the section is emitted even with
+    // empty roles and names general-purpose.
+    expect(section).not.toBeNull();
+    expect(section!).toContain("## Delegation");
+    expect(section!).toContain("general-purpose");
+  });
+
+  it("delegation section is absent when subagent.enabled is false (regression)", async () => {
+    const { buildDelegationSection } = await import(
+      "../src/prompts/sections/delegation.js"
+    );
+    const config = makeSubagentConfig({ roles: {} });
+    (config as any).enabled = false;
+
+    const section = buildDelegationSection(config);
+    expect(section).toBeNull();
   });
 });
 
@@ -1662,7 +1676,7 @@ describe("cross-review-gaps", () => {
     expect(prompt).toContain("Analyst");
   });
 
-  it("buildSystemPrompt omits delegation section when no subagent roles", async () => {
+  it("buildSystemPrompt includes delegation section when enabled:true + roles:{} (R3 #1)", async () => {
     const { buildSystemPrompt, PromptMode } = await import(
       "../src/prompts/index.js"
     );
@@ -1675,7 +1689,27 @@ describe("cross-review-gaps", () => {
       subagentConfig: makeSubagentConfig({ roles: {} }),
     } as any);
 
-    // With no roles, the delegation heading must NOT appear
+    // Post-redesign: built-in general-purpose is reachable whenever the
+    // subagent layer is enabled, so the Delegation heading IS emitted.
+    expect(prompt).toContain("## Delegation");
+    expect(prompt).toContain("general-purpose");
+  });
+
+  it("buildSystemPrompt omits delegation section when subagent.enabled is false (regression)", async () => {
+    const { buildSystemPrompt, PromptMode } = await import(
+      "../src/prompts/index.js"
+    );
+
+    const cfg: any = makeSubagentConfig({ roles: {} });
+    cfg.enabled = false;
+    const prompt = buildSystemPrompt({
+      mode: PromptMode.Full,
+      workspaceDir: join(dirname(fileURLToPath(import.meta.url)), "..", "workspace"),
+      toolNames: ["read", "bash"],
+      connectedServers: [],
+      subagentConfig: cfg,
+    } as any);
+
     expect(prompt).not.toContain("## Delegation");
   });
 

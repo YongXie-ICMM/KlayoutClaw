@@ -275,3 +275,126 @@ describe("delegate tool — redesigned API (issue #23)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// R3 finding #1: delegate tool must be registered whenever
+// `config.subagent.enabled === true`, regardless of `roles` count. Before this
+// fix a pre-redesign `Object.keys(roles).length > 0` gate suppressed delegate
+// on fresh-install configs (which ship with roles:{}), making the built-in
+// general-purpose fallback unreachable.
+// ---------------------------------------------------------------------------
+import { assembleTools } from "../src/tools/index.js";
+import { TOOL_ANNOTATIONS } from "../src/tools/annotations.js";
+
+describe("R3 finding #1: delegate registration gate", () => {
+  function makeMockMcpManager() {
+    return {
+      allTools: () => [],
+      callTool: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+    } as any;
+  }
+  function makeMockMemoryManager() {
+    return { save: async () => {}, search: async () => [] } as any;
+  }
+  function makeMockModelRegistry() {
+    return {
+      find: () => ({ id: "mock", provider: "mock", api: "anthropic-messages" }),
+    } as any;
+  }
+  function makeFullConfig(subagent: SubagentConfig) {
+    return {
+      subagent,
+      agent: { defaultModel: "custom-anthropic/claude-sonnet-4-6", thinkingLevel: "medium" },
+    } as any;
+  }
+  function baseAssembleOpts(subagent: SubagentConfig) {
+    return {
+      config: makeFullConfig(subagent),
+      mcpManager: makeMockMcpManager(),
+      memoryManager: makeMockMemoryManager(),
+      cwd: "/tmp",
+      workspaceDir: "/tmp",
+      annotations: TOOL_ANNOTATIONS,
+      getApiKey: async () => "test-key",
+      defaultModel: "custom-anthropic/claude-sonnet-4-6",
+      defaultThinkingLevel: "medium",
+      modelRegistry: makeMockModelRegistry(),
+      isSubagent: false,
+    };
+  }
+
+  it("enabled:true, roles:{} (fresh install) → delegate IS registered (was broken)", () => {
+    const subagent: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    const { toolMap, runner } = assembleTools(baseAssembleOpts(subagent) as any);
+    expect(toolMap.delegate).toBeDefined();
+    expect(runner).not.toBeNull();
+  });
+
+  it("enabled:true, roles:{designer:...} → delegate IS registered (regression)", () => {
+    const subagent: SubagentConfig = {
+      enabled: true, logDir: "/tmp", maxLogFiles: 10,
+      roles: {
+        designer: {
+          label: "Designer", promptFile: "subagent/designer.md", workspaceFiles: [],
+          baseTools: ["read", "write"], customTools: ["submit_result"],
+          mcpAccess: "full", maxTurns: 100, maxTokens: 200000,
+        },
+      },
+    };
+    const { toolMap, runner } = assembleTools(baseAssembleOpts(subagent) as any);
+    expect(toolMap.delegate).toBeDefined();
+    expect(runner).not.toBeNull();
+  });
+
+  it("enabled:false, roles:{} → delegate is NOT registered", () => {
+    const subagent: SubagentConfig = { enabled: false, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    const { toolMap, runner } = assembleTools(baseAssembleOpts(subagent) as any);
+    expect(toolMap.delegate).toBeUndefined();
+    expect(runner).toBeNull();
+  });
+
+  it("enabled:false, roles:{designer:...} → delegate is NOT registered (respect explicit disable)", () => {
+    const subagent: SubagentConfig = {
+      enabled: false, logDir: "/tmp", maxLogFiles: 10,
+      roles: {
+        designer: {
+          label: "Designer", promptFile: "subagent/designer.md", workspaceFiles: [],
+          baseTools: ["read", "write"], customTools: ["submit_result"],
+          mcpAccess: "full", maxTurns: 100, maxTokens: 200000,
+        },
+      },
+    };
+    const { toolMap, runner } = assembleTools(baseAssembleOpts(subagent) as any);
+    expect(toolMap.delegate).toBeUndefined();
+    expect(runner).toBeNull();
+  });
+
+  it("end-to-end: enabled:true + empty roles → agent can delegate to general-purpose via the registered tool", async () => {
+    const subagent: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    const { toolMap, runner } = assembleTools(baseAssembleOpts(subagent) as any);
+    const delegateTool = toolMap.delegate;
+    expect(delegateTool).toBeDefined();
+
+    // Stub runner.run so we don't exercise the real subagent pipeline — only
+    // verify the delegate tool dispatches to general-purpose with empty roles.
+    let captured: any = null;
+    (runner as any).run = async (opts: any) => {
+      captured = opts;
+      return {
+        role: opts.role, task: opts.task, status: "completed",
+        findings: ["ok"], warnings: [], dataPaths: [],
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+        transcriptPath: "",
+      };
+    };
+
+    const result = await (delegateTool as any).execute("tc-fresh-install", {
+      description: "fresh install",
+      prompt: "Do a simple read.",
+    });
+    expect(captured).not.toBeNull();
+    expect(captured.role).toBe("general-purpose");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.status).toBe("completed");
+  });
+});
