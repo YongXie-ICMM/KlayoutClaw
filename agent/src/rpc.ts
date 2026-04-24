@@ -8,6 +8,7 @@ import { subscribeToSession } from "./events.js";
 import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
 import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
+import { lastTurnWasFailure } from "./session-status.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
@@ -286,16 +287,36 @@ export async function startRPCServer(opts: {
           });
 
           try {
+            // Bump BEFORE prompt so transformContext sees the correct turn
+            // number. R2 fix: was after, causing off-by-one.
+            // R4 #1: clear the per-turn reinjection latch so the plan blob
+            // is injected at most ONCE per user turn across all round-trips.
+            botSession.planManager?.clearRemindedThisTurn();
+            botSession.planManager?.incrementTurnsSinceExit();
             await botSession.session.prompt(message);
+            // R5 finding #1: pi-coding-agent swallows most provider errors
+            // and resolves with an error assistant turn instead of throwing.
+            // Check the trailing turn's stopReason to roll back cadence for
+            // turns that produced no usable output.
+            if (lastTurnWasFailure(botSession.session)) {
+              botSession.planManager?.decrementTurnsSinceExit();
+            }
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
             sendResult(req.id, { status: "completed", response: responseText });
           } catch (err: unknown) {
+            // R3 finding #1: roll back the pre-prompt bump so failed turns
+            // don't inflate the reinjection cadence. Only successful turns
+            // count.
+            botSession.planManager?.decrementTurnsSinceExit();
             const msg = err instanceof Error ? err.message : String(err);
             botSession.history.recordError(msg);
             sendEvent("error", { message: msg });
             sendError(req.id, -32000, `Prompt failed: ${msg}`);
           } finally {
+            // issue #24: bound the exit-turn swallow flag to one prompt
+            // cycle so a rejection/abort after exit_plan_mode can't leak.
+            botSession.planManager?.consumeExitSwallow();
             unsubscribe();
           }
           break;

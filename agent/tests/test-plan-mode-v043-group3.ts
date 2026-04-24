@@ -576,13 +576,19 @@ describe("Group 3 · Step 10/11 · source-grep regressions", () => {
     expect(src).not.toMatch(/planManager\?\.isActive\(\)/);
   });
 
-  it("src/commands/index.ts no longer imports or registers planCommand", () => {
+  it("src/commands/index.ts registers planCommand for CLI/RPC (issue #24 supersedes group-3 step 10)", () => {
+    // Issue #24 reversed v0.4.3 group-3 step 10's decision to delete the
+    // /plan command. Reason: reinjection + `/plan verify` need a shared
+    // slash-command handler reachable from CLI, RPC, AND TUI. App.tsx
+    // still intercepts /plan inline for TUI modal behavior, but the
+    // underlying command must exist in the registry so non-TUI frontends
+    // can invoke it too. This test was originally "no longer imports or
+    // registers planCommand" and has been inverted.
     const src = readSrc("commands/index.ts");
-    expect(src).not.toContain("planCommand");
-    expect(src).not.toMatch(/import\s*\{\s*planCommand\s*\}/);
-    // Also confirm the COMMAND_NAMES array no longer lists "plan" as a
-    // command (App.tsx uses the `/plan` prefix match directly instead).
-    expect(src).not.toMatch(/"plan"\s*,/);
+    expect(src).toContain("planCommand");
+    expect(src).toMatch(/import\s*\{\s*planCommand\s*\}/);
+    // COMMAND_NAMES must list "plan" again so help/completion surfaces it.
+    expect(src).toMatch(/"plan"/);
   });
 
   it("src/agent.ts no longer imports wrapToolWithSandbox", () => {
@@ -701,8 +707,15 @@ describe("Group 3 · Step 10/11 · source-grep regressions", () => {
     }
   });
 
-  it("src/commands/plan.ts file no longer exists", () => {
-    expect(existsSync(SRC("commands/plan.ts"))).toBe(false);
+  it("src/commands/plan.ts file exists (issue #24 reinstates the /plan command handler)", () => {
+    // Issue #24 reversed v0.4.3 group-3 step 10's decision to delete
+    // src/commands/plan.ts. Reason: /plan verify (the reinjection stop
+    // command) needs a shared handler reachable from CLI, RPC, AND TUI.
+    // The test was originally "file no longer exists" and has been
+    // inverted. App.tsx's inline /plan intercept still handles the TUI
+    // modal flow, but the command file is required so non-TUI frontends
+    // can invoke it via the CommandRegistry.
+    expect(existsSync(SRC("commands/plan.ts"))).toBe(true);
   });
 
   it("src/tui/components/App.tsx subscribes via planManager.subscribe (not .onStateChange)", () => {

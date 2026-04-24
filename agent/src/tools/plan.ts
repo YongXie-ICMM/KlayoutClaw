@@ -176,6 +176,10 @@ export function createExitPlanModeTool(
         if (!plan) {
           return ok({ status: "error", message: "Failed to exit plan mode." });
         }
+        // Issue #24: arm the one-shot exit-turn swallow so the in-flight
+        // prompt's success-path bump doesn't count the exit-turn itself
+        // as post-exit turn 1.
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_abandoned",
           plan_id: plan.id,
@@ -188,6 +192,7 @@ export function createExitPlanModeTool(
         if (!legacyPlan) {
           return ok({ status: "error", message: "Failed to exit plan mode." });
         }
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_approved",
           plan_id: legacyPlan.id,
@@ -249,6 +254,7 @@ export function createExitPlanModeTool(
           },
         );
         planManager.closePlanMode("abandoned");
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_abandoned",
           plan_id: plan.id,
@@ -276,7 +282,14 @@ export function createExitPlanModeTool(
             if (executingHash !== planHash) {
               return integrityViolation();
             }
-            planManager.closePlanMode("approved");
+            // R3 finding #2 (2026-04-24): close as "completed" — this branch
+            // transitions all the way to plan_done below, so the plan is
+            // terminal. The reinjector skips completed/abandoned, so post-
+            // exit reminders correctly stop firing for auto-executed plans.
+            // The "approve_only" branch stays "approved" because it leaves
+            // implementation in agent turns, where reminders are the point.
+            planManager.closePlanMode("completed");
+            planManager.markExitedInThisTurn();
             stateMachine.transition(
               planManager.sessionKey,
               "plan_approved",
@@ -306,6 +319,7 @@ export function createExitPlanModeTool(
               { auto: false, executeAfterApproval: false },
             );
             planManager.closePlanMode("approved");
+            planManager.markExitedInThisTurn();
             return ok({
               status: "plan_approved",
               plan_id: plan.id,
@@ -347,6 +361,7 @@ export function createExitPlanModeTool(
           );
           planSlugCache.delete(planManager.sessionKey);
           planManager.exitPlanMode(false);
+          planManager.markExitedInThisTurn();
           return ok({
             status: "plan_abandoned",
             plan_id: plan.id,
@@ -366,6 +381,7 @@ export function createExitPlanModeTool(
           );
           planSlugCache.delete(planManager.sessionKey);
           planManager.exitPlanMode(false);
+          planManager.markExitedInThisTurn();
           return ok({
             status: "plan_abandoned",
             reason: "caller_disconnected",
@@ -387,7 +403,12 @@ export function createExitPlanModeTool(
         if (executingHash !== planHash) {
           return integrityViolation();
         }
-        planManager.closePlanMode("approved");
+        // R3 finding #2 (2026-04-24): close as "completed" — headless auto-
+        // execute transitions to plan_done below, so the plan is terminal.
+        // Without this, the reinjector keeps firing for an auto-executed
+        // plan that has been handed off and finished.
+        planManager.closePlanMode("completed");
+        planManager.markExitedInThisTurn();
         stateMachine.transition(
           planManager.sessionKey,
           "plan_approved",

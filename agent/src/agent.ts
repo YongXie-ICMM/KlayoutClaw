@@ -49,6 +49,10 @@ import { PlanManager } from "./planning/index.js";
 import { PlanStateMachine } from "./planning/state-machine.js";
 import { createToolResultPruner } from "./compaction/tool-result-pruner.js";
 import { createStateLoaderTransform } from "./compaction/state-loader.js";
+import {
+  createPlanReinjector,
+  prunePlanReinjections,
+} from "./compaction/plan-reinjector.js";
 import { resolveCompactionConfig, type CompactionConfig } from "./compaction/index.js";
 import { extractStateFiles } from "./compaction/state-extractor.js";
 import { buildCompactInstructions } from "./compaction/prompt-loader.js";
@@ -364,22 +368,35 @@ export async function createDesignSession(
   };
   const autoRecall = createAutoRecallTransform(memoryManager, autoRecallConfig);
 
-  // Phase 1: Tool result pruning
+  // Phase: Tool result pruning
   const pruner = createToolResultPruner(compactionConfig.toolResultPruning);
 
-  // Phase 2: State loader (inject compaction state into context)
+  // Phase: State loader (inject compaction state into context)
   const stateLoader = createStateLoaderTransform(workspaceDir);
+
+  // Phase: Plan re-injection (issue #24). Periodically re-inject the plan
+  // file contents after plan mode exit to keep the agent honest about
+  // multi-turn plan execution.
+  const planReinjector = createPlanReinjector(planManager, {
+    interval: config.plan.reinjectionInterval,
+  });
 
   const transformContext = async (
     messages: AgentMessage[],
     signal?: AbortSignal,
   ): Promise<AgentMessage[]> => {
-    // Phase 1: prune old tool results
-    let transformed = pruner(messages);
-    // Phase 2: auto-recall memory (before state injection to keep search query clean)
+    // Phase: drop stale <plan-reinjection> blocks first so the context
+    // never carries more than one at a time.
+    let transformed = await prunePlanReinjections(messages as any);
+    // Phase: prune old tool results.
+    transformed = pruner(transformed);
+    // Phase: auto-recall memory (bug #8: must precede stateLoader so the
+    // recall query anchors on the real user message, not injected state).
     transformed = await autoRecall(transformed, signal);
-    // Phase 3: inject compaction state
+    // Phase: inject compaction state.
     transformed = stateLoader(transformed);
+    // Phase: append the plan re-injection reminder if cadence matches.
+    transformed = await planReinjector(transformed as any);
     return transformed;
   };
 

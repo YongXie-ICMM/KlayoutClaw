@@ -130,6 +130,7 @@ E2E tests need `ANTHROPIC_API_KEY` set + KLayout MCP at :8765.
 - Compaction: `settings.json` → `compaction` (autoThreshold: 90%, warningThreshold: 70%, toolResultPruning)
 - Search (v0.4): `settings.json` → `search.mode`, `search.minRerank`, `search.rerankMinScore`, `search.rerankMaxTokens`
 - Embedding (v0.4): `settings.json` → `embedding.baseUrl`, `embedding.apiKey`, `embedding.model`, `embedding.dimensions`, `embedding.similarityThreshold`
+- Plan re-injection (issue #24): `settings.json` → `plan.reinjectionInterval` (default `3`). After the agent exits plan mode, the current plan file contents are re-injected as a `<plan-reinjection>` reminder every N successful user turns. Set to `0` to disable. Stop reminders for the current plan with `/plan verify`.
 
 ## RPC Events
 `ready`, `prompt_start`, `content_delta`, `thinking`, `tool_use`, `tool_result`, `usage_update`, `error`

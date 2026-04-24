@@ -26,7 +26,8 @@ export type PlanEventType =
   | "plan_mode_entered"
   | "plan_mode_exited"
   | "plan_created"
-  | "plan_updated";
+  | "plan_updated"
+  | "plan_verified";
 
 export interface PlanEvent {
   type: PlanEventType;

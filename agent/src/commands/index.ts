@@ -13,6 +13,7 @@ import { tasksCommand } from "./tasks.js";
 import { helpCommand } from "./help.js";
 import { exitCommand } from "./exit.js";
 import { compactCommand } from "./compact.js";
+import { planCommand } from "./plan.js";
 
 export interface CommandContext {
   session: QlayBotSession;
@@ -92,12 +93,21 @@ export function createCommandRegistry(): CommandRegistry {
   registry.register(memoryCommand);
   registry.register(tasksCommand);
   registry.register(compactCommand);
+  registry.register(planCommand);
   registry.register(helpCommand);
   registry.register(exitCommand);
   return registry;
 }
 
-/** All command names for CLI detection */
+/**
+ * All command names for CLI one-shot detection (`qlaybot model ...` etc).
+ * "plan" is intentionally absent: /plan is an in-session runtime command
+ * and requires live plan state (PlanManager._currentPlan). Running it via
+ * runSlashCommand creates a fresh session with no plan loaded, so
+ * `qlaybot plan status` would always report "No active plan". Instead,
+ * /plan verify|status work in interactive plain mode via the parseCommand
+ * intercept in runInteractivePlain (R2 finding #2).
+ */
 export const COMMAND_NAMES = [
   "model", "mcp", "config", "context", "memory",
   "tasks", "compact", "help", "exit",

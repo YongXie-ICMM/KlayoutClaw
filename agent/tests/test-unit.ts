@@ -177,16 +177,16 @@ describe("CommandRegistry", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("has all 9 commands registered (v0.4.3: /plan removed, handled by App.tsx slash intercept)", () => {
-    // v0.4.3 Group 3 step 10 deleted `src/commands/plan.ts` and its
-    // registration — the `/plan` slash is now intercepted by App.tsx
-    // before the CommandRegistry (spec §1.8.1). COMMAND_NAMES therefore
-    // does NOT contain "plan", and the registry does not register a
-    // plan command.
+  it("has 9 CLI-one-shot commands; 'plan' is registry-only (R2 finding #2)", () => {
+    // R2 fix: "plan" removed from COMMAND_NAMES so `qlaybot plan status`
+    // no longer goes through runSlashCommand (which creates a fresh session
+    // with no plan state loaded). The planCommand is still registered in
+    // the registry for RPC and interactive plain mode (via parseCommand
+    // intercept in runInteractivePlain).
     const registry = createCommandRegistry();
     expect(COMMAND_NAMES.length).toBe(9);
     expect(COMMAND_NAMES).not.toContain("plan");
-    expect(registry.has("plan")).toBe(false);
+    expect(registry.has("plan")).toBe(true); // still in registry for RPC/plain
     for (const name of COMMAND_NAMES) {
       expect(registry.has(name)).toBe(true);
     }

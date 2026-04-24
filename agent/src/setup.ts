@@ -328,6 +328,9 @@ export async function runSetupWizard(options: WizardOptions): Promise<QlayBotCon
       dimensions: 1536,
       similarityThreshold: 0.3,
     },
+    plan: {
+      reinjectionInterval: 3,
+    },
     verbose: false,
   };
 
