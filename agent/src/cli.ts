@@ -385,21 +385,32 @@ async function runJSON(args: CLIArgs): Promise<void> {
     // (onRetry clears between attempts but not after the final one).
     // Returning that as `completed` is a false-success bug — surface
     // the exhaustion as an error instead.
+    //
+    // R5 finding #1 (2026-04-24): use `process.exitCode = 1; return;`
+    // instead of `process.exit(1)`. The latter terminates before the
+    // buffered stdout write drains when piped, and skips the outer
+    // `finally {}` that disposes the session. Setting exitCode lets
+    // the normal control flow fall through to finally, cleanup runs,
+    // stdout drains on beforeExit, and Node exits with status 1.
     if (stillThinkingOnly) {
       chunks.length = 0;
       const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
       const output = { status: "error", error: errMsg, retries };
       console.log(JSON.stringify(output, null, 2));
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     const output = { status: "completed", response: chunks.join(""), retries };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {
+    // R5 finding #1 audit: same pattern as the exhaustion branch —
+    // fall through to `finally` so the JSON error envelope flushes
+    // cleanly and session cleanup runs.
     const msg = err instanceof Error ? err.message : String(err);
     const output = { status: "error", error: msg };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     unsubscribe();
     tracker.unsubscribe();

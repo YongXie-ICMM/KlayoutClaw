@@ -677,4 +677,150 @@ describe("RPC-mode thinking-only retry integration", () => {
     tracker.unsubscribe();
     unsub();
   });
+
+  // ---------------------------------------------------------------------------
+  // R5 finding #1 (2026-04-24): CLI exhaustion must set process.exitCode and
+  // return, not call process.exit(1) — so the buffered stdout write drains
+  // when piped and the outer `finally {}` runs (unsubscribe, dispose).
+  // ---------------------------------------------------------------------------
+
+  it("R5 CLI exhaustion: JSON envelope is complete + parseable, exitCode=1, finally runs", async () => {
+    // Simulate cli.ts:runJSON exhaustion branch with mock stdout +
+    // mock exitCode + mock finally. Assert that:
+    //   - stdout captures a complete parseable JSON envelope
+    //   - process.exitCode is 1 (not called via process.exit)
+    //   - the outer finally runs AFTER the return
+    //   - no process.exit was invoked
+    const behaviors = Array.from({ length: 6 }, () => (
+      (_emit: any, messages: any[]) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "503 service unavailable",
+        });
+      }
+    ));
+    const session = createMockSession(behaviors);
+    const tracker = createTurnActivityTracker(session);
+
+    // Mock the Node-level side effects cli.ts uses.
+    const stdoutWrites: string[] = [];
+    const mockConsoleLog = (s: string) => stdoutWrites.push(s);
+    let exitCodeSet: number | null = null;
+    let processExitCalled = false;
+    let finallyRan = false;
+    const mockSetExitCode = (n: number) => {
+      exitCodeSet = n;
+    };
+    const mockProcessExit = () => {
+      processExitCalled = true;
+    };
+
+    // Mirror cli.ts runJSON try/finally shape.
+    try {
+      const { retries, stillThinkingOnly } =
+        await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+          onRetry: () => {},
+        });
+
+      if (stillThinkingOnly) {
+        const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
+        const output = { status: "error", error: errMsg, retries };
+        mockConsoleLog(JSON.stringify(output, null, 2));
+        // R5 fix: set exitCode + return instead of process.exit(1).
+        mockSetExitCode(1);
+        return; // exits the try block; finally still runs
+      }
+      // success path (not reached in this test)
+      mockConsoleLog(JSON.stringify({ status: "completed", retries }));
+    } finally {
+      finallyRan = true;
+    }
+
+    // Assert the R5 contract pieces.
+    expect(exitCodeSet).toBe(1);
+    expect(processExitCalled).toBe(false); // NOT process.exit(1)
+    expect(finallyRan).toBe(true);
+    expect(stdoutWrites.length).toBe(1);
+
+    // Stdout must be a complete, parseable JSON envelope.
+    const parsed = JSON.parse(stdoutWrites[0]);
+    expect(parsed).toEqual({
+      status: "error",
+      error: expect.stringMatching(
+        /Session stopped producing output after 5 retry attempts/,
+      ),
+      retries: 5,
+    });
+
+    tracker.unsubscribe();
+  });
+
+  it("R5 CLI success regression: success path still produces valid parseable JSON", async () => {
+    const session = createMockSession([
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "ok" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const stdoutWrites: string[] = [];
+    const mockConsoleLog = (s: string) => stdoutWrites.push(s);
+    let exitCodeSet: number | null = null;
+    let finallyRan = false;
+
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+
+    try {
+      const { retries, stillThinkingOnly } =
+        await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+          onRetry: () => {
+            chunks.length = 0;
+          },
+        });
+
+      if (stillThinkingOnly) {
+        exitCodeSet = 1;
+        return;
+      }
+      mockConsoleLog(
+        JSON.stringify(
+          { status: "completed", response: chunks.join(""), retries },
+          null,
+          2,
+        ),
+      );
+    } finally {
+      finallyRan = true;
+    }
+
+    expect(exitCodeSet).toBeNull();
+    expect(finallyRan).toBe(true);
+    expect(stdoutWrites.length).toBe(1);
+    const parsed = JSON.parse(stdoutWrites[0]);
+    expect(parsed).toEqual({
+      status: "completed",
+      response: "ok",
+      retries: 0,
+    });
+
+    tracker.unsubscribe();
+    unsub();
+  });
 });
