@@ -300,6 +300,26 @@ async function runInteractivePlain(
       process.exit(0);
     }
 
+    // R2 finding #2: intercept slash commands so /plan verify|status work
+    // in plain mode. Mirrors the RPC path (rpc.ts:244-258). Commands that
+    // need live session state (like /plan verify, which reads planManager)
+    // work here because we reuse the same botSession, not a fresh one.
+    if (input.startsWith("/") && botSession.commandRegistry) {
+      const parsed = parseCommand(input);
+      if (parsed) {
+        const ctx: CommandContext = { session: botSession, mode: "shell" };
+        try {
+          const result = await botSession.commandRegistry.execute(parsed.name, parsed.args, ctx);
+          console.log(result.output);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`\nError: ${msg}`);
+        }
+        rl.prompt();
+        return;
+      }
+    }
+
     try {
       botSession.history.recordPrompt(input);
       // Bump BEFORE prompt so transformContext (running inside prompt) sees

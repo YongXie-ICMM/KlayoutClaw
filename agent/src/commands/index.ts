@@ -99,8 +99,16 @@ export function createCommandRegistry(): CommandRegistry {
   return registry;
 }
 
-/** All command names for CLI detection */
+/**
+ * All command names for CLI one-shot detection (`qlaybot model ...` etc).
+ * "plan" is intentionally absent: /plan is an in-session runtime command
+ * and requires live plan state (PlanManager._currentPlan). Running it via
+ * runSlashCommand creates a fresh session with no plan loaded, so
+ * `qlaybot plan status` would always report "No active plan". Instead,
+ * /plan verify|status work in interactive plain mode via the parseCommand
+ * intercept in runInteractivePlain (R2 finding #2).
+ */
 export const COMMAND_NAMES = [
   "model", "mcp", "config", "context", "memory",
-  "tasks", "compact", "plan", "help", "exit",
+  "tasks", "compact", "help", "exit",
 ];

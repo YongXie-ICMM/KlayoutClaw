@@ -1104,6 +1104,73 @@ describe("Wiring check: /plan status TUI intercept (Finding 3)", () => {
   });
 });
 
+describe("Wiring check: runInteractivePlain slash intercept (R2 finding #2)", () => {
+  // Static grep tests confirming that runInteractivePlain intercepts /commands
+  // via parseCommand before falling through to session.prompt. This gives
+  // /plan verify|status a working path in plain CLI mode.
+  const cliSrcPath = resolve(__dirname, "..", "src", "cli.ts");
+
+  function sliceFnBody(src: string, fnDecl: string): string {
+    const start = src.indexOf(fnDecl);
+    if (start < 0) return "";
+    const after = src.slice(start + fnDecl.length);
+    const nextFnRel = after.search(/\n(?:export\s+)?(?:async\s+)?function\s+/);
+    return nextFnRel >= 0 ? after.slice(0, nextFnRel) : after;
+  }
+
+  it("runInteractivePlain rl.on('line') handler calls parseCommand( before session.prompt(", () => {
+    const src = stripComments(readFileSync(cliSrcPath, "utf-8"));
+    const fnBody = sliceFnBody(src, "function runInteractivePlain");
+    const lineHandler = fnBody.match(
+      /rl\.on\(\s*["']line["']\s*,\s*async[\s\S]*?\n\s*\}\);/,
+    );
+    expect(lineHandler).toBeTruthy();
+    const body = lineHandler![0];
+    const parseIdx = body.indexOf("parseCommand(");
+    const promptIdx = body.indexOf("session.prompt(");
+    expect(parseIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    // parseCommand intercept must appear BEFORE the session.prompt call
+    // so slash commands are routed to the registry, not sent to the model.
+    expect(parseIdx).toBeLessThan(promptIdx);
+  });
+
+  it("runInteractivePlain slash intercept returns early (does not fall through to session.prompt)", () => {
+    const src = stripComments(readFileSync(cliSrcPath, "utf-8"));
+    const fnBody = sliceFnBody(src, "function runInteractivePlain");
+    const lineHandler = fnBody.match(
+      /rl\.on\(\s*["']line["']\s*,\s*async[\s\S]*?\n\s*\}\);/,
+    );
+    expect(lineHandler).toBeTruthy();
+    const body = lineHandler![0];
+    // The slash intercept must contain a return statement so it doesn't
+    // fall through to the main session.prompt user-turn path.
+    const parseIdx = body.indexOf("parseCommand(");
+    const promptIdx = body.indexOf("session.prompt(");
+    // Find the first `return` after parseCommand and before session.prompt
+    const returnInIntercept = body.indexOf("return;", parseIdx);
+    expect(returnInIntercept).toBeGreaterThanOrEqual(0);
+    expect(returnInIntercept).toBeLessThan(promptIdx);
+  });
+
+  it("plain text input still reaches session.prompt (regression)", () => {
+    // The slash intercept must only trigger for inputs starting with '/'.
+    // Plain text must still go to session.prompt (regression check).
+    const src = stripComments(readFileSync(cliSrcPath, "utf-8"));
+    const fnBody = sliceFnBody(src, "function runInteractivePlain");
+    const lineHandler = fnBody.match(
+      /rl\.on\(\s*["']line["']\s*,\s*async[\s\S]*?\n\s*\}\);/,
+    );
+    expect(lineHandler).toBeTruthy();
+    const body = lineHandler![0];
+    // The slash intercept must be gated on input.startsWith("/") so
+    // plain text bypasses it.
+    expect(body).toMatch(/input\.startsWith\s*\(\s*["']\//);
+    // session.prompt( must still exist in the handler (the non-slash path).
+    expect(body).toContain("session.prompt(");
+  });
+});
+
 describe("Settings: plan.reinjectionInterval default + override", () => {
   // loadConfig() produces the effective config after merging settings.json.
   // We cast to `any` so the test compiles before the Executor adds the

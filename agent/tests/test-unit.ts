@@ -177,18 +177,16 @@ describe("CommandRegistry", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("has all 10 commands registered (issue #24 reinstates /plan for shared CLI/RPC/TUI handling)", () => {
-    // Issue #24 reversed v0.4.3 group-3 step 10's removal of the /plan
-    // command. /plan verify (the reinjection stop) needs a shared slash-
-    // command handler reachable from CLI, RPC, AND TUI. App.tsx still
-    // intercepts /plan inline for the modal UI flow, but the registry
-    // now also carries a plan handler so non-TUI frontends can dispatch
-    // it. This test was originally pinned at 9 commands with "plan"
-    // explicitly absent — inverted per issue #24.
+  it("has 9 CLI-one-shot commands; 'plan' is registry-only (R2 finding #2)", () => {
+    // R2 fix: "plan" removed from COMMAND_NAMES so `qlaybot plan status`
+    // no longer goes through runSlashCommand (which creates a fresh session
+    // with no plan state loaded). The planCommand is still registered in
+    // the registry for RPC and interactive plain mode (via parseCommand
+    // intercept in runInteractivePlain).
     const registry = createCommandRegistry();
-    expect(COMMAND_NAMES.length).toBe(10);
-    expect(COMMAND_NAMES).toContain("plan");
-    expect(registry.has("plan")).toBe(true);
+    expect(COMMAND_NAMES.length).toBe(9);
+    expect(COMMAND_NAMES).not.toContain("plan");
+    expect(registry.has("plan")).toBe(true); // still in registry for RPC/plain
     for (const name of COMMAND_NAMES) {
       expect(registry.has(name)).toBe(true);
     }
