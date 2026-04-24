@@ -228,7 +228,7 @@ function makeDeps(overrides?: {
     getApiKey: async () => "test-key",
     defaultModel: "custom-anthropic/claude-sonnet-4-6",
     defaultThinkingLevel: "medium",
-    modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+    modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     tmpDir,
     logDir,
   };
@@ -573,7 +573,7 @@ describe("Group 3: Budget enforcement", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const result = await runner.run({
@@ -609,7 +609,7 @@ describe("Group 3: Budget enforcement", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const result = await runner.run({
@@ -731,7 +731,7 @@ describe("Group 4: Cross-layer integration", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     await runner.run({
@@ -768,7 +768,7 @@ describe("Group 4: Cross-layer integration", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const tool = createDelegateTool(runner, config);
@@ -788,30 +788,34 @@ describe("Group 4: Cross-layer integration", () => {
   // unconditionally blocked while the parent is in plan mode); that
   // new contract is covered by test-plan-mode-v043-group2.ts.
 
-  it("SCC-H5f: delegate tool validates unknown role", async () => {
+  it("SCC-H5f: delegate tool with unknown role falls back to general-purpose (issue #23)", async () => {
+    // Updated for issue #23 redesign: unknown subagent_type falls back to
+    // general-purpose with a warning instead of hard-failing.
     const logDir = makeTmpDir();
     const config = makeSubagentConfig({
       logDir,
       roles: { scout: makeScoutRole() },
     });
 
-    const runner = new SubagentRunner({
-      config,
-      mcpManager: { callTool: vi.fn().mockResolvedValue({ content: [] }) },
-      memoryManager: { search: vi.fn().mockResolvedValue([]) },
-      workspaceDir: makeTmpDir(),
-      annotations: TOOL_ANNOTATIONS,
-      getApiKey: async () => "test-key",
-      defaultModel: "custom-anthropic/claude-sonnet-4-6",
-      defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
-    });
+    const mockRun = vi.fn(async (opts: any) => ({
+      role: opts.role,
+      task: opts.task,
+      status: "completed" as const,
+      findings: [],
+      warnings: [],
+      dataPaths: [],
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+      transcriptPath: "",
+    }));
+    const runner = { run: mockRun } as any;
 
     const tool = createDelegateTool(runner, config);
     const result = await tool.execute("tc-unknown", { role: "nonexistent", task: "test" });
 
-    expect(result.content[0].text).toContain("Unknown role");
-    expect(result.content[0].text).toContain("nonexistent");
+    expect(mockRun).toHaveBeenCalledTimes(1);
+    expect(mockRun.mock.calls[0][0].role).toBe("general-purpose");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.some((w: string) => w.includes("nonexistent"))).toBe(true);
   });
 
   it("SCC-H5l: no submit_result before forced stop produces synthesized partial result", async () => {
@@ -832,7 +836,7 @@ describe("Group 4: Cross-layer integration", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     // Do not call submit_result — just let turns exhaust
@@ -1004,7 +1008,7 @@ describe("Group 4: Cross-layer integration", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const result = await runner.run({
@@ -1062,7 +1066,7 @@ describe("Group 4: Cross-layer integration", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     let subagentId: string | null = null;

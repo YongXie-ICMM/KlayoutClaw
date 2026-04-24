@@ -828,6 +828,22 @@ export function tuiReducer(state: TUIState, action: TUIAction): TUIState {
       };
     }
 
+    case "SUBAGENT_CANCEL_PLACEHOLDER": {
+      // R3 finding #2: delegate's tool-level validation branches
+      // (missing prompt, plan-mode restricted) return BEFORE calling
+      // runner.run, so runner never emits `started`/`completed`. Without
+      // this action the placeholder created by tool_execution_start stays
+      // in "running" forever as a phantom row.
+      //
+      // Only remove if SUBAGENT_START hasn't run yet — once the runner
+      // has mapped id → subagentId, that entry belongs to a live run and
+      // must not be touched by cancellation.
+      const filtered = state.subagents.filter(
+        (s) => !(s.toolCallId === action.toolCallId && s.id === action.toolCallId),
+      );
+      return { ...state, subagents: filtered };
+    }
+
     case "SUBAGENT_START": {
       const updated = state.subagents.map((s) =>
         s.toolCallId === action.toolCallId

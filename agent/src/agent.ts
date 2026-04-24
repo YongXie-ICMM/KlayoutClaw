@@ -240,8 +240,11 @@ export async function createDesignSession(
   const allServers = getAllMCPServers(config);
   const allDisabledTools = Object.values(allServers).flatMap(s => s.disabledTools ?? []);
 
-  // Use extended assembleTools signature when subagent is configured
-  const hasSubagent = config.subagent?.enabled && Object.keys(config.subagent?.roles ?? {}).length > 0;
+  // Use extended assembleTools signature when subagent is enabled. After the
+  // issue-#23 redesign the built-in general-purpose role is a reachable
+  // target even with roles:{}, so we no longer gate on role count here (R3
+  // finding #1) — the returned runner is needed for delegate registration.
+  const hasSubagent = config.subagent?.enabled === true;
   let rawBaseTools: Record<string, any>;
   let rawCustomTools: any[];
   let subagentRunner: SubagentRunner | null = null;

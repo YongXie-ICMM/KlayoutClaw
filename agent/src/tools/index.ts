@@ -266,10 +266,14 @@ export function assembleTools(opts: any): any {
       }
     }
 
-    // Add delegate tool if subagent is enabled with roles
+    // Register delegate tool whenever subagent is enabled. The pre-redesign
+    // gate also required `Object.keys(roles).length > 0`, but after the
+    // issue-#23 redesign the built-in `general-purpose` role is always a
+    // reachable target. Keeping the length gate made fresh installs
+    // (roles: {}) silently drop delegate, defeating the fallback (R3 #1).
     const subagentConfig: SubagentConfig = opts.config.subagent;
     const planManager: PlanManager | undefined = opts.planManager;
-    if (subagentConfig?.enabled && Object.keys(subagentConfig.roles).length > 0) {
+    if (subagentConfig?.enabled === true) {
       runner = new SubagentRunner({
         config: subagentConfig,
         mcpManager: opts.mcpManager,
@@ -304,7 +308,12 @@ export function assembleTools(opts: any): any {
       toolMap[exitTool.name] = exitTool;
       if (toolMap.memory_save) toolMap.memory_save = wrapToolForPlanDraftedFreeze(toolMap.memory_save, planManager);
       if (toolMap.memory_search) toolMap.memory_search = wrapToolForPlanDraftedFreeze(toolMap.memory_search, planManager);
-      if (toolMap.delegate) toolMap.delegate = wrapToolForPlanDraftedFreeze(toolMap.delegate, planManager);
+      // R5 finding #1: do NOT wrap delegate with the plan_drafted freeze.
+      // Its own execute() already handles plan-mode (returns
+      // plan_mode_restricted + emits `cancelled` so the TUI clears the
+      // SUBAGENT_PLACEHOLDER). The freeze wrapper short-circuits before
+      // execute runs, so the cancelled event never fires and the placeholder
+      // leaks. Delegate owns its own plan-mode contract.
       if (toolMap.thinking) toolMap.thinking = wrapToolForPlanDraftedFreeze(toolMap.thinking, planManager);
       toolMap[enterTool.name] = wrapToolForPlanDraftedFreeze(toolMap[enterTool.name], planManager);
       toolMap[exitTool.name] = wrapToolForPlanDraftedFreeze(toolMap[exitTool.name], planManager);

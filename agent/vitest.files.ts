@@ -10,6 +10,7 @@ export const unitFiles = [
   "tests/test-search.ts",
   "tests/test-subagent.ts",
   "tests/test-subagent-components.ts",
+  "tests/test-delegate-redesign.ts",
   "tests/test-tier1-bugs.ts",
   "tests/test-tier2-bugs.ts",
   "tests/test-reviewer-findings.ts",
@@ -41,4 +42,5 @@ export const e2eFiles = [
   "tests/test-e2e.ts",
   "tests/test-phase2b-e2e.ts",
   "tests/test-phase7-vc-cross-track.ts",
+  "tests/test-delegate-e2e.ts",
 ];

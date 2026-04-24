@@ -99,6 +99,8 @@ export interface RoleConfig {
   maxTokens: number;
   model?: string;
   thinkingLevel?: string;
+  /** Inline system prompt — takes precedence over promptFile when set. */
+  systemPrompt?: string;
 }
 
 // ---------------------------------------------------------------------------

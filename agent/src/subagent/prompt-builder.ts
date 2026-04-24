@@ -16,10 +16,16 @@ export function buildSubagentPrompt(
 ): string {
   const sections: string[] = [];
 
-  // Read the main prompt file
-  const promptPath = join(workspaceDir, roleConfig.promptFile);
-  if (existsSync(promptPath)) {
-    sections.push(readFileSync(promptPath, "utf-8"));
+  // Inline systemPrompt takes precedence over promptFile (used by built-in roles
+  // like general-purpose that don't ship a workspace file).
+  if (roleConfig.systemPrompt) {
+    sections.push(roleConfig.systemPrompt);
+  } else {
+    // Read the main prompt file
+    const promptPath = join(workspaceDir, roleConfig.promptFile);
+    if (existsSync(promptPath)) {
+      sections.push(readFileSync(promptPath, "utf-8"));
+    }
   }
 
   // Read workspace files

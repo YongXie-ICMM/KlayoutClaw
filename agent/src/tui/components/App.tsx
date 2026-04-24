@@ -27,6 +27,7 @@ import { getConfigDir, getAllMCPServers } from "../../config.js";
 import { formatTurnMessage } from "../../verbose-helpers.js";
 import { TOOL_ANNOTATIONS } from "../../tools/annotations.js";
 import { resolvePlanApproval } from "../../planning/approval-gate.js";
+import { parseDelegatePlaceholder } from "../delegate-placeholder.js";
 import type { MCPServerData } from "./ConfigPanel.js";
 
 function isCurrentlyThinking(msg: import("../types.js").AssistantMessageData | null): boolean {
@@ -130,19 +131,28 @@ export function App({ botSession }: AppProps) {
         dispatch({ type: "THINKING_DELTA", delta }),
       onToolStartWithId: (toolCallId, toolName, args) => {
         dispatch({ type: "TOOL_START", toolCallId, toolName, args });
-        // Two-phase ID mapping: create placeholder entry for delegate tool
+        // Two-phase ID mapping: create placeholder entry for delegate tool.
+        // The reducer's SUBAGENT_PLACEHOLDER is idempotent — once an entry
+        // exists for this toolCallId it is NOT overwritten, so the fields
+        // must be correct on the first dispatch. Field-name translation +
+        // effective-name resolution (R2 finding #2) is done in
+        // parseDelegatePlaceholder so the TUI matches what the runner runs.
         if (toolName === "delegate") {
-          try {
-            const parsed = typeof args === "string" ? JSON.parse(args) : (args ?? {}) as any;
+          // subagent may be disabled in config; fall back to an empty-roles
+          // stub so the parser still resolves the effective general-purpose.
+          const subagentCfg = botSession.config.subagent ?? {
+            enabled: false, logDir: "", maxLogFiles: 0, roles: {},
+          };
+          const fields = parseDelegatePlaceholder(args, subagentCfg);
+          if (fields) {
             dispatch({
               type: "SUBAGENT_PLACEHOLDER",
               toolCallId,
-              role: parsed.role ?? "unknown",
-              task: parsed.task ?? "",
+              role: fields.role,
+              task: fields.task,
             });
-          } catch {
-            // Malformed args — placeholder will be created by runner "started" fallback
           }
+          // Malformed args → placeholder will be created by runner "started" fallback
         }
       },
       onToolUpdate: (toolCallId, _toolName, partialResult) =>
@@ -309,12 +319,24 @@ export function App({ botSession }: AppProps) {
         errorMessage: ev.errorMessage,
       });
 
+    // R3 finding #2: delegate's tool-level validation branches (plan-mode
+    // restricted, missing prompt) return before runner.run — no started /
+    // completed fires. The placeholder created by tool_execution_start
+    // would stay "running" forever. On `cancelled`, drop the placeholder.
+    const onCancelled = (ev: any) =>
+      dispatch({
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      });
+
     runner.on("started", onStarted);
     runner.on("thinking", onThinking);
     runner.on("text", onText);
     runner.on("tool_start", onToolStart);
     runner.on("tool_end", onToolEnd);
     runner.on("completed", onCompleted);
+    runner.on("cancelled", onCancelled);
 
     return () => {
       runner.off("started", onStarted);
@@ -323,6 +345,7 @@ export function App({ botSession }: AppProps) {
       runner.off("tool_start", onToolStart);
       runner.off("tool_end", onToolEnd);
       runner.off("completed", onCompleted);
+      runner.off("cancelled", onCancelled);
     };
   }, [botSession.subagentRunner]);
 

@@ -1106,3 +1106,533 @@ describe("Group 9: Inspect Window Key Routing", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Finding 1 (code-review-issue-23) — delegate placeholder parses both new and
+// legacy args. The reducer's SUBAGENT_PLACEHOLDER is idempotent, so the
+// fields written on the first tool_execution_start must be correct; if they
+// aren't, the panel shows "unknown / empty" forever.
+//
+// R2 finding #2 — parseDelegatePlaceholder now also resolves the effective
+// role name (so unknown subagent_type values display as "general-purpose",
+// matching what the runner actually runs).
+// ---------------------------------------------------------------------------
+import { parseDelegatePlaceholder } from "../src/tui/delegate-placeholder.js";
+import type { SubagentConfig } from "../src/types/v04-contracts.js";
+
+function makePlaceholderCfg(overrides?: Partial<SubagentConfig>): SubagentConfig {
+  return {
+    enabled: true, logDir: "/tmp", maxLogFiles: 10,
+    roles: {
+      designer: {
+        label: "Designer", promptFile: "subagent/designer.md", workspaceFiles: [],
+        baseTools: ["read", "write"], customTools: ["submit_result"],
+        mcpAccess: "full", maxTurns: 100, maxTokens: 200000,
+      },
+    },
+    ...overrides,
+  };
+}
+
+describe("Finding 1: parseDelegatePlaceholder", () => {
+  it("new schema: {subagent_type, prompt} (known role) → role=subagent_type, task=prompt", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "designer", prompt: "design a Hall bar" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields).not.toBeNull();
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design a Hall bar");
+  });
+
+  it("legacy schema: {role, task} (known role) → role=role, task=task", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "designer", task: "design a Hall bar" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields).not.toBeNull();
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design a Hall bar");
+  });
+
+  it("new schema preferred over legacy when both present", () => {
+    const cfg = makePlaceholderCfg({
+      roles: {
+        designer: makePlaceholderCfg().roles.designer,
+        scout: {
+          label: "Scout", promptFile: "", workspaceFiles: [],
+          baseTools: ["read"], customTools: ["submit_result"],
+          mcpAccess: "shared-readonly", maxTurns: 50, maxTokens: 100000,
+        },
+      },
+    });
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({
+        subagent_type: "scout",
+        prompt: "scout task",
+        role: "designer",
+        task: "designer task",
+      }),
+      cfg,
+    );
+    expect(fields!.role).toBe("scout");
+    expect(fields!.task).toBe("scout task");
+  });
+
+  it("neither field present → falls back to general-purpose / empty", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ description: "oops" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("");
+  });
+
+  it("already-object args (not a JSON string) are accepted", () => {
+    const fields = parseDelegatePlaceholder(
+      { subagent_type: "designer", prompt: "analyze" },
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("analyze");
+  });
+
+  it("malformed JSON string returns null (caller falls back to 'started' event)", () => {
+    expect(parseDelegatePlaceholder("{not json", makePlaceholderCfg())).toBeNull();
+  });
+
+  it("dispatching placeholder built from new-schema args yields correct panel entry", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "general-purpose", prompt: "read README" }),
+      makePlaceholderCfg(),
+    )!;
+    let state = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-new",
+      role: fields.role,
+      task: fields.task,
+    } as TUIAction);
+    const subs = (state as any).subagents as SubagentTUIEntry[];
+    expect(subs).toHaveLength(1);
+    expect(subs[0].role).toBe("general-purpose");
+    expect(subs[0].task).toBe("read README");
+    expect(subs[0].status).toBe("running");
+  });
+
+  it("legacy placeholder remains correct end-to-end (regression)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "designer", task: "legacy task" }),
+      makePlaceholderCfg(),
+    )!;
+    let state = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-legacy",
+      role: fields.role,
+      task: fields.task,
+    } as TUIAction);
+    const subs = (state as any).subagents as SubagentTUIEntry[];
+    expect(subs[0].role).toBe("designer");
+    expect(subs[0].task).toBe("legacy task");
+  });
+});
+
+describe("R2 finding #2: placeholder shows effective role, not raw args", () => {
+  it("new schema, unknown subagent_type → placeholder shows 'general-purpose'", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "totally-made-up", prompt: "do something" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("do something");
+  });
+
+  it("legacy schema, unknown role → placeholder shows 'general-purpose'", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "nonexistent", task: "legacy unknown" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("legacy unknown");
+  });
+
+  it("new schema, omitted role → placeholder shows 'general-purpose' (matches delegate default)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ description: "no role given", prompt: "do thing" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("do thing");
+  });
+
+  it("new schema, known role → placeholder shows the known role (regression)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "designer", prompt: "design" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design");
+  });
+
+  it("unknown-role fallback + custom 'general-purpose' config → still shows 'general-purpose'", () => {
+    const cfg = makePlaceholderCfg({
+      roles: {
+        "general-purpose": {
+          label: "Custom GP", promptFile: "", workspaceFiles: [],
+          baseTools: ["read"], customTools: ["submit_result"],
+          mcpAccess: "shared-readonly", maxTurns: 5, maxTokens: 10000,
+        },
+      },
+    });
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "typo-role", prompt: "x" }),
+      cfg,
+    );
+    // Effective NAME is still "general-purpose" — resolver picks the config
+    // override under that name when the runner runs it. The panel label is
+    // computed from the runtime RoleConfig later; here we only assert the
+    // name lines up with what the runner will actually run.
+    expect(fields!.role).toBe("general-purpose");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3 finding #2 — delegate validation failures must clear their placeholder.
+// The reducer handles SUBAGENT_CANCEL_PLACEHOLDER; the delegate tool emits
+// a `cancelled` event on validation failure; App.tsx bridges the two.
+// ---------------------------------------------------------------------------
+describe("R3 finding #2: SUBAGENT_CANCEL_PLACEHOLDER reducer action", () => {
+  it("removes the placeholder matching toolCallId when START hasn't run", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-bad",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-bad",
+      reason: "missing_prompt",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("does NOT remove a subagent entry that has already transitioned to START", () => {
+    // Place a valid entry then SUBAGENT_START to remap id. A stray cancel
+    // for the SAME toolCallId must NOT touch the live run.
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-live",
+      role: "designer",
+      task: "design",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_START",
+      subagentId: "sa-real",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents[0].id).toBe("sa-real");
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].id).toBe("sa-real");
+  });
+
+  it("is a no-op for an unknown toolCallId", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-existing",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    const before = state.subagents.length;
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-nonexistent",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(before);
+  });
+
+  it("end-to-end: placeholder → cancel → panel has no phantom row", () => {
+    let state: any = initialState;
+    // 1. tool_execution_start arrives, places placeholder
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-missing-prompt",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].status).toBe("running");
+
+    // 2. delegate.execute rejects for missing prompt, emits `cancelled`
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-missing-prompt",
+      reason: "missing_prompt",
+    } as TUIAction);
+
+    // 3. Panel is clean — no phantom "running" row
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("multiple placeholders: cancel only removes the targeted one", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-a",
+      role: "general-purpose",
+      task: "a",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-b",
+      role: "designer",
+      task: "b",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(2);
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-a",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].toolCallId).toBe("tc-b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3 finding #2 — integration: delegate.execute emits `cancelled` on the
+// validation branches so App.tsx's bridge can dispatch the cleanup action.
+// ---------------------------------------------------------------------------
+describe("R3 finding #2: delegate emits `cancelled` on validation failures", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  async function makeEnv() {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), {
+      run: vi.fn(async () => ({
+        role: "general-purpose", task: "x", status: "completed",
+        findings: [], warnings: [], dataPaths: [],
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+        transcriptPath: "",
+      })),
+    });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    return { runner, tool: createDelegateTool(runner as any, cfg) };
+  }
+
+  it("missing prompt → emits `cancelled` with toolCallId + reason", async () => {
+    const { runner, tool } = await makeEnv();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    const result = await (tool as any).execute("tc-missing", {
+      description: "no prompt",
+    });
+
+    expect(result.details.error).toBe(true);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-missing");
+    expect(events[0].reason).toBe("missing_prompt");
+  });
+
+  it("valid call → does NOT emit `cancelled`", async () => {
+    const { runner, tool } = await makeEnv();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    await (tool as any).execute("tc-ok", {
+      description: "ok",
+      prompt: "do it",
+    });
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(0);
+  });
+
+  it("plan-mode restricted → emits `cancelled` with reason=plan_mode_restricted", async () => {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), { run: vi.fn() });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    const planManager = { inPlanMode: true } as any;
+    const tool = createDelegateTool(runner as any, cfg, planManager);
+
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    const result = await (tool as any).execute("tc-plan", {
+      description: "x",
+      prompt: "blocked",
+    });
+
+    expect(result.details.planModeRestricted).toBe(true);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-plan");
+    expect(events[0].reason).toBe("plan_mode_restricted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6 finding #1 — emitCancelled must defer to a microtask so pi-agent-core's
+// async `tool_execution_start` subscriber lands the placeholder BEFORE the
+// cancel arrives. Synchronous emission raced ahead of the start event,
+// leaving the placeholder created (after the cancel was a no-op) stuck in
+// "running" forever.
+// ---------------------------------------------------------------------------
+describe("R6 finding #1: emitCancelled defers to next microtask", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  async function makeDelegate() {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), { run: vi.fn() });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    return { runner, tool: createDelegateTool(runner as any, cfg) };
+  }
+
+  it("contract: cancelled event does NOT fire synchronously inside execute()", async () => {
+    const { runner, tool } = await makeDelegate();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    // Kick off execute but do NOT await — capture the synchronous post-state.
+    const pending = (tool as any).execute("tc-sync", { description: "no prompt" });
+
+    // Inside execute(), the missing-prompt branch ran synchronously and
+    // queued the cancel via queueMicrotask. The microtask has NOT drained
+    // yet, so no listener has seen the event.
+    expect(events).toHaveLength(0);
+
+    await pending;
+    // After awaiting, microtasks have drained — cancel arrived.
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-sync");
+  });
+
+  it("codex timing scenario: pre-queued placeholder lands BEFORE the cancel — final state is clean", async () => {
+    // Models the real production timing where pi-agent-core queues
+    // tool_execution_start (subscriber callback) BEFORE calling execute().
+    // The subscriber sits in the microtask queue; execute() runs sync; if
+    // emitCancelled fired sync it would race ahead of the subscriber.
+    const { runner, tool } = await makeDelegate();
+
+    // Wire the runner's `cancelled` to dispatch into the reducer (mirrors
+    // App.tsx onCancelled). Wire the simulated start subscriber to dispatch
+    // SUBAGENT_PLACEHOLDER.
+    let state: any = initialState;
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // Pre-queue the placeholder dispatch on the microtask queue (this is
+    // what pi-agent-core's EventStream subscriber would do for
+    // tool_execution_start, queued BEFORE execute() is called).
+    Promise.resolve().then(() => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_PLACEHOLDER",
+        toolCallId: "tc-race",
+        role: "general-purpose",
+        task: "",
+      } as TUIAction);
+    });
+
+    // Now run execute() — the cancel microtask is queued AFTER the
+    // pre-queued placeholder microtask above.
+    await (tool as any).execute("tc-race", { description: "no prompt" });
+
+    // Drain any straggling microtasks (defensive).
+    await Promise.resolve();
+
+    // FIFO microtask order: placeholder created first, then cancel removed
+    // it. No phantom row.
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("regression: synchronous start-then-cancel ordering still cleans up (R3 path unchanged)", async () => {
+    const { runner, tool } = await makeDelegate();
+    let state: any = initialState;
+
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // The placeholder is dispatched synchronously BEFORE execute is called
+    // (alternative timing where the subscriber wins immediately).
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-sync-order",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+
+    await (tool as any).execute("tc-sync-order", { description: "no prompt" });
+    await Promise.resolve();
+
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("live-run safety: if SUBAGENT_START remaps the id before cancel arrives, the live entry survives", async () => {
+    // Defends against a hypothetical race where the runner actually started
+    // (SUBAGENT_START fired between placeholder and a stale cancel). The
+    // reducer's existing guard (R3 finding #2 reducer test) keeps the live
+    // entry — confirm end-to-end with the new microtask-deferred emit.
+    const { runner, tool } = await makeDelegate();
+    let state: any = initialState;
+
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // Pre-existing live run for this toolCallId.
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-live",
+      role: "designer",
+      task: "design",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_START",
+      subagentId: "sa-real",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents[0].id).toBe("sa-real");
+
+    // A stale cancel for tc-live arrives via the deferred emit.
+    await (tool as any).execute("tc-live", { description: "no prompt" });
+    await Promise.resolve();
+
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].id).toBe("sa-real");
+  });
+});

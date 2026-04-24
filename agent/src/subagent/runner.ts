@@ -89,12 +89,14 @@ export class SubagentRunner extends EventEmitter {
     task: string;
     toolCallId: string;
     context?: string;
+    modelOverride?: string;
+    roleConfigOverride?: import("../types/v04-contracts.js").RoleConfig;
   }): Promise<SubagentResult> {
     const { role, task, toolCallId, context } = opts;
     const subagentId = randomUUID();
 
-    // Resolve role
-    const roleConfig = resolveRole(role, this.deps.config);
+    // Resolve role — prefer explicit override (used by delegate's general-purpose fallback)
+    const roleConfig = opts.roleConfigOverride ?? resolveRole(role, this.deps.config);
     if (!roleConfig) {
       return {
         role,
@@ -141,8 +143,8 @@ export class SubagentRunner extends EventEmitter {
       this.deps.config.maxLogFiles,
     );
 
-    // Resolve model: role override → parent default
-    const modelId = roleConfig.model ?? this.deps.defaultModel;
+    // Resolve model: per-call override → role override → parent default
+    const modelId = opts.modelOverride ?? roleConfig.model ?? this.deps.defaultModel;
     const thinkingLevel = (roleConfig.thinkingLevel ?? this.deps.defaultThinkingLevel) as ThinkingLevel;
 
     // Resolve model string to Model<any> via ModelRegistry (matches agent.ts pattern)
@@ -151,10 +153,52 @@ export class SubagentRunner extends EventEmitter {
       : ["", modelId];
     const resolvedModel = this.deps.modelRegistry.find(provider, bareModelId);
 
+    // Guardrail: fail loudly with diagnostic info if model resolution failed.
+    // Without this, pi-agent-core crashes deep inside the stream with an
+    // opaque error (e.g. model.id / model.provider undefined reads).
+    //
+    // Finding #3 (code-review-issue-23): the TUI creates a placeholder entry
+    // from the upstream `tool_execution_start` event and clears it on the
+    // runner's `completed` event. If this early return fires WITHOUT
+    // emitting started+completed, the placeholder is stuck showing "running"
+    // forever. Emit both lifecycle events so every observer (TUI, logs,
+    // metrics) can transition the entry cleanly.
+    if (!resolvedModel) {
+      const errorMessage = `Subagent model resolution failed: modelId="${modelId}" provider="${provider}" bareModelId="${bareModelId}". Check that roleConfig.model or the parent defaultModel is registered in ModelRegistry.`;
+      const transcriptPath = transcript.save();
+      const errorResult: SubagentResult = {
+        role,
+        task,
+        status: "error",
+        findings: [],
+        warnings: [],
+        dataPaths: [],
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+        transcriptPath,
+        errorMessage,
+      };
+      this.emit("started", {
+        subagentId,
+        toolCallId,
+        role,
+        task,
+      } as StartedEvent);
+      this.emit("completed", {
+        subagentId,
+        toolCallId,
+        status: "error",
+        findings: 0,
+        warnings: 0,
+        tokenUsage: "0 tokens, 0 turns",
+        errorMessage,
+      });
+      return errorResult;
+    }
+
     // Create the agent + session with proper config (getApiKey, convertToLlm, model)
     const agent = new Agent({
       initialState: {
-        model: resolvedModel ?? undefined,
+        model: resolvedModel,
         thinkingLevel,
       },
       convertToLlm,
@@ -304,14 +348,23 @@ export class SubagentRunner extends EventEmitter {
           promptArg = runState.injectedMessages.shift()!;
         }
 
-        // Call prompt
+        // Call prompt with a defined string. AgentSession.prompt(text) requires
+        // `text` to be a string — it calls text.startsWith("/") internally and
+        // crashes with "Cannot read properties of undefined (reading 'startsWith')"
+        // if called with no argument. Previously the else-branch below called
+        // `session.prompt()` with no args, which was the root cause of issue #23.
+        // When the agent has gone idle without calling submit_result and nothing
+        // was injected, we send a short continuation nudge so the session stays
+        // alive until submit_result fires or the budget is exhausted.
+        let promptText: string;
         if (promptArg !== undefined) {
-          await session.prompt(promptArg);
+          promptText = promptArg;
         } else if (turns === 0) {
-          await session.prompt(taskMessage);
+          promptText = taskMessage;
         } else {
-          await session.prompt();
+          promptText = "Continue the task. When complete, call submit_result.";
         }
+        await session.prompt(promptText);
 
         turns++;
 

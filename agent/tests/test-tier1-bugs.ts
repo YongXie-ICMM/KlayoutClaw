@@ -215,7 +215,7 @@ function makeRunner(roleOverrides?: Partial<RoleConfig>) {
       callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] }),
     } as any,
     memoryManager: { search: vi.fn().mockResolvedValue([]) } as any,
-    modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+    modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
   });
 }
 

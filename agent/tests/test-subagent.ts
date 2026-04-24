@@ -353,6 +353,87 @@ describe("role-resolver", () => {
     expect(roles.map((r) => r.name)).toEqual(["alpha", "beta"]);
     expect(resolveRole("scout", config)).toBeNull();
   });
+
+  // Finding 2 (code-review-issue-23): config override for "general-purpose"
+  // must win over the built-in role. Option A: config precedence over
+  // built-in. The built-in is a safety net for configs that don't define one.
+  describe("Finding 2: 'general-purpose' name is overridable by config", () => {
+    let resolveRoleWithFallback: typeof import("../src/subagent/role-resolver.js").resolveRoleWithFallback;
+    beforeEach(async () => {
+      const mod = await import("../src/subagent/role-resolver.js");
+      resolveRoleWithFallback = mod.resolveRoleWithFallback;
+    });
+
+    it("resolveRole: config.roles['general-purpose'] overrides built-in", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({
+            label: "Custom GP",
+            baseTools: ["read"],
+            mcpAccess: "shared-readonly",
+            maxTurns: 5,
+            maxTokens: 1000,
+          }),
+        },
+      });
+      const role = resolveRole("general-purpose", config);
+      expect(role).not.toBeNull();
+      expect(role!.label).toBe("Custom GP");
+      expect(role!.maxTurns).toBe(5);
+      expect(role!.mcpAccess).toBe("shared-readonly");
+    });
+
+    it("resolveRole: built-in returned when no config override", () => {
+      const config = makeSubagentConfig({ roles: {} });
+      const role = resolveRole("general-purpose", config);
+      expect(role).not.toBeNull();
+      expect(role!.label).toBe("General-purpose");     // from built-in
+      expect(role!.mcpAccess).toBe("full");            // built-in default
+    });
+
+    it("resolveRoleWithFallback: config override wins, no warning", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({ label: "Custom GP", maxTurns: 7 }),
+        },
+      });
+      const resolved = resolveRoleWithFallback("general-purpose", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("Custom GP");
+      expect(resolved.role.maxTurns).toBe(7);
+      expect(resolved.warning).toBeUndefined();
+    });
+
+    it("resolveRoleWithFallback: built-in when no override, no warning", () => {
+      const config = makeSubagentConfig({ roles: {} });
+      const resolved = resolveRoleWithFallback("general-purpose", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("General-purpose");
+      expect(resolved.warning).toBeUndefined();
+    });
+
+    it("resolveRoleWithFallback: unknown name still falls back to built-in with warning", () => {
+      const config = makeSubagentConfig({ roles: { scout: makeScoutRole() } });
+      const resolved = resolveRoleWithFallback("does-not-exist", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("General-purpose");
+      expect(resolved.warning).toBeDefined();
+      expect(resolved.warning!).toContain("does-not-exist");
+    });
+
+    it("resolveRoleWithFallback: unknown name + custom general-purpose → falls back to CUSTOM", () => {
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": makeScoutRole({ label: "Custom GP", maxTurns: 3 }),
+        },
+      });
+      const resolved = resolveRoleWithFallback("nonexistent", config);
+      expect(resolved.effectiveName).toBe("general-purpose");
+      expect(resolved.role.label).toBe("Custom GP");   // NOT the built-in
+      expect(resolved.role.maxTurns).toBe(3);
+      expect(resolved.warning).toBeDefined();
+    });
+  });
 });
 
 // ============================================================
@@ -744,7 +825,7 @@ describe("subagent-runner", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
   }
 
@@ -1044,6 +1125,66 @@ describe("subagent-runner", () => {
     expect(result.transcriptPath).toBeTruthy();
     expect(existsSync(result.transcriptPath)).toBe(true);
   });
+
+  // Finding 3 (code-review-issue-23): model-resolution error path MUST emit
+  // started+completed so UI observers (TUI placeholder) transition the entry
+  // to error/final. Without events, the placeholder is stuck "running".
+  describe("Finding 3: model-resolution error path emits lifecycle events", () => {
+    function makeRunnerWithUnresolvedModel() {
+      const config = makeSubagentConfigWithRoles();
+      const merged = { ...config, logDir: tmpDir };
+      return new SubagentRunner({
+        config: merged,
+        mcpManager: makeMockMCPManager() as any,
+        memoryManager: makeMockMemoryManager() as any,
+        workspaceDir: tmpDir,
+        annotations: TOOL_ANNOTATIONS,
+        getApiKey: async () => "test-key",
+        defaultModel: "custom-anthropic/claude-sonnet-4-6",
+        defaultThinkingLevel: "medium",
+        // modelRegistry.find returns undefined → triggers the guardrail
+        modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      });
+    }
+
+    it("emits both started and completed events when model resolution fails", async () => {
+      const runner = makeRunnerWithUnresolvedModel();
+      const events: Array<{ kind: string; payload: any }> = [];
+      runner.on("started", (p: any) => events.push({ kind: "started", payload: p }));
+      runner.on("completed", (p: any) => events.push({ kind: "completed", payload: p }));
+
+      const result = await runner.run({
+        role: "scout",
+        task: "will fail to resolve model",
+        toolCallId: "tc_badmodel",
+        modelOverride: "nonexistent-provider/fake-model",
+      });
+
+      // Result: clean error
+      expect(result.status).toBe("error");
+      expect(result.errorMessage).toMatch(/model resolution failed/i);
+      expect(result.errorMessage).not.toMatch(/startsWith/);
+
+      // Events fired in order: started before completed
+      expect(events.length).toBe(2);
+      expect(events[0].kind).toBe("started");
+      expect(events[1].kind).toBe("completed");
+
+      // started payload has the right shape
+      const started = events[0].payload;
+      expect(started.toolCallId).toBe("tc_badmodel");
+      expect(started.role).toBe("scout");
+      expect(started.task).toBe("will fail to resolve model");
+      expect(typeof started.subagentId).toBe("string");
+
+      // completed payload indicates error + carries the message
+      const completed = events[1].payload;
+      expect(completed.status).toBe("error");
+      expect(completed.toolCallId).toBe("tc_badmodel");
+      expect(completed.subagentId).toBe(started.subagentId);
+      expect(completed.errorMessage).toMatch(/model resolution failed/i);
+    });
+  });
 });
 
 // ============================================================
@@ -1087,48 +1228,52 @@ describe("delegate-tool", () => {
     const props = schema.properties;
     expect(props).toBeDefined();
 
-    // 'role' must be a required string property
+    // New API (issue #23): description/prompt/subagent_type/model are the
+    // primary params. Legacy role/task are accepted for backward compat.
+    expect(props.description).toBeDefined();
+    expect(props.description.type).toBe("string");
+    expect(props.prompt).toBeDefined();
+    expect(props.prompt.type).toBe("string");
+    expect(props.subagent_type).toBeDefined();
+    expect(props.model).toBeDefined();
+
+    // Legacy params still present (optional) for deprecation window
     expect(props.role).toBeDefined();
-    expect(props.role.type).toBe("string");
-
-    // 'task' must be a required string property
     expect(props.task).toBeDefined();
-    expect(props.task.type).toBe("string");
-
-    // 'context' must exist (optional string)
     expect(props.context).toBeDefined();
-    expect(props.context.type).toBe("string");
-
-    // 'role' and 'task' should be required (in the required array)
-    const required: string[] = schema.required ?? [];
-    expect(required).toContain("role");
-    expect(required).toContain("task");
-    // 'context' should NOT be required
-    expect(required).not.toContain("context");
   });
 
-  // SCC-F2
-  it("calling delegate with unknown role returns error listing available roles", async () => {
+  // SCC-F2 — updated for issue #23: unknown subagent_type falls back to
+  // general-purpose with a warning (not a hard error), matching Claude Code's
+  // Agent-tool pattern.
+  it("calling delegate with unknown subagent_type falls back to general-purpose with warning", async () => {
     const mockRunner = new EventEmitter() as any;
-    mockRunner.run = vi.fn();
+    mockRunner.run = vi.fn(async (opts: any) => ({
+      role: opts.role,
+      task: opts.task,
+      status: "completed",
+      findings: [],
+      warnings: [],
+      dataPaths: [],
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+      transcriptPath: "",
+    }));
 
     const config = makeSubagentConfigWithRoles();
     const tool = createDelegateTool(mockRunner, config);
 
     const result = await tool.execute("tc_bad", {
       role: "nonexistent_role",
-      task: "should fail",
+      task: "should fall back",
     });
 
-    // Runner should NOT have been called
-    expect(mockRunner.run).not.toHaveBeenCalled();
+    expect(mockRunner.run).toHaveBeenCalledTimes(1);
+    const callArgs = mockRunner.run.mock.calls[0][0];
+    expect(callArgs.role).toBe("general-purpose");
 
-    // Error should list available roles
-    const resultStr = JSON.stringify(result);
-    expect(resultStr.toLowerCase()).toContain("error");
-    expect(resultStr).toContain("scout");
-    expect(resultStr).toContain("designer");
-    expect(resultStr).toContain("analyst");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.some((w: string) => w.includes("nonexistent_role"))).toBe(true);
+    expect(parsed.warnings.some((w: string) => w.includes("general-purpose"))).toBe(true);
   });
 
   it("delegate tool calls runner.run with correct parameters", async () => {
@@ -1299,16 +1444,133 @@ describe("agent-wiring", () => {
     expect(section2).not.toBe(section1);
   });
 
-  it("system prompt delegation section is absent when no roles configured", async () => {
-    // Import the delegation section builder directly -- this module must exist
+  it("delegation section describes built-in general-purpose when enabled:true + roles:{} (R3 #1)", async () => {
     const { buildDelegationSection } = await import(
       "../src/prompts/sections/delegation.js"
     );
     const config = makeSubagentConfig({ roles: {} });
 
     const section = buildDelegationSection(config);
-    // With no roles, section should be empty/null
-    expect(!section || section.length === 0).toBe(true);
+    // Post-redesign: built-in general-purpose is a reachable target whenever
+    // the subagent layer is enabled, so the section is emitted even with
+    // empty roles and names general-purpose.
+    expect(section).not.toBeNull();
+    expect(section!).toContain("## Delegation");
+    expect(section!).toContain("general-purpose");
+  });
+
+  it("delegation section is absent when subagent.enabled is false (regression)", async () => {
+    const { buildDelegationSection } = await import(
+      "../src/prompts/sections/delegation.js"
+    );
+    const config = makeSubagentConfig({ roles: {} });
+    (config as any).enabled = false;
+
+    const section = buildDelegationSection(config);
+    expect(section).toBeNull();
+  });
+
+  // R4 finding #2: the general-purpose line in the system-prompt section must
+  // be derived from the effective role (config override wins), matching the
+  // `delegate` tool catalog — not hardcoded. Otherwise the prompt and the
+  // catalog can disagree when users narrow general-purpose via config.
+  describe("R4 finding #2: general-purpose line uses effective role", () => {
+    function countOccurrences(hay: string, needle: string): number {
+      let n = 0, idx = 0;
+      while ((idx = hay.indexOf(needle, idx)) !== -1) { n++; idx += needle.length; }
+      return n;
+    }
+
+    it("empty config → line uses built-in capabilities", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({ roles: {} });
+      const section = buildDelegationSection(config)!;
+      expect(section).toContain("general-purpose");
+      // Built-in defaults from generalPurposeRole.ts
+      expect(section).toContain("General-purpose");              // built-in label
+      expect(section).toContain("tools: read+bash+edit+write");  // built-in baseTools
+      expect(section).toContain("mcp: full");                     // built-in mcpAccess
+      expect(section).toContain("max turns: 30");                 // built-in maxTurns
+      // Must NOT contain the obsolete hardcoded phrase
+      expect(section).not.toContain("full tool surface");
+    });
+
+    it("narrowed override → line reflects override, not built-in", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": {
+            label: "Narrow GP",
+            promptFile: "",
+            workspaceFiles: [],
+            baseTools: ["read"],
+            customTools: ["submit_result"],
+            mcpAccess: "shared-readonly",
+            maxTurns: 10,
+            maxTokens: 50000,
+            systemPrompt: "narrow",
+          },
+        },
+      });
+      const section = buildDelegationSection(config)!;
+      // Override values
+      expect(section).toContain("Narrow GP");
+      expect(section).toContain("tools: read");
+      expect(section).toContain("mcp: shared-readonly");
+      expect(section).toContain("max turns: 10");
+      // Built-in defaults must NOT appear
+      expect(section).not.toContain("tools: read+bash+edit+write");
+      expect(section).not.toContain("mcp: full");
+      expect(section).not.toContain("full tool surface");
+      // Exactly one general-purpose line
+      expect(countOccurrences(section, "`general-purpose`")).toBe(1);
+    });
+
+    it("override + other roles → one general-purpose line (override) + one per other role", async () => {
+      const { buildDelegationSection } = await import(
+        "../src/prompts/sections/delegation.js"
+      );
+      const config = makeSubagentConfig({
+        roles: {
+          "general-purpose": {
+            label: "Custom GP",
+            promptFile: "",
+            workspaceFiles: [],
+            baseTools: ["read"],
+            customTools: ["submit_result"],
+            mcpAccess: "none",
+            maxTurns: 5,
+            maxTokens: 10000,
+            systemPrompt: "x",
+          },
+          designer: {
+            label: "Designer",
+            promptFile: "subagent/designer.md",
+            workspaceFiles: [],
+            baseTools: ["read", "write"],
+            customTools: ["submit_result"],
+            mcpAccess: "full",
+            maxTurns: 100,
+            maxTokens: 200000,
+          },
+        },
+      });
+      const section = buildDelegationSection(config)!;
+      // Exactly one line per role
+      expect(countOccurrences(section, "`general-purpose`")).toBe(1);
+      expect(countOccurrences(section, "`designer`")).toBe(1);
+      // General-purpose reflects override
+      expect(section).toContain("Custom GP");
+      expect(section).toContain("mcp: none");
+      expect(section).toContain("max turns: 5");
+      // Designer stays as-is
+      expect(section).toContain("Designer");
+      expect(section).toMatch(/`designer`.*MCP access: full/);
+    });
   });
 });
 
@@ -1379,7 +1641,7 @@ describe("edge-cases", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     const ids: string[] = [];
@@ -1517,7 +1779,7 @@ describe("cross-review-gaps", () => {
     expect(prompt).toContain("Analyst");
   });
 
-  it("buildSystemPrompt omits delegation section when no subagent roles", async () => {
+  it("buildSystemPrompt includes delegation section when enabled:true + roles:{} (R3 #1)", async () => {
     const { buildSystemPrompt, PromptMode } = await import(
       "../src/prompts/index.js"
     );
@@ -1530,7 +1792,27 @@ describe("cross-review-gaps", () => {
       subagentConfig: makeSubagentConfig({ roles: {} }),
     } as any);
 
-    // With no roles, the delegation heading must NOT appear
+    // Post-redesign: built-in general-purpose is reachable whenever the
+    // subagent layer is enabled, so the Delegation heading IS emitted.
+    expect(prompt).toContain("## Delegation");
+    expect(prompt).toContain("general-purpose");
+  });
+
+  it("buildSystemPrompt omits delegation section when subagent.enabled is false (regression)", async () => {
+    const { buildSystemPrompt, PromptMode } = await import(
+      "../src/prompts/index.js"
+    );
+
+    const cfg: any = makeSubagentConfig({ roles: {} });
+    cfg.enabled = false;
+    const prompt = buildSystemPrompt({
+      mode: PromptMode.Full,
+      workspaceDir: join(dirname(fileURLToPath(import.meta.url)), "..", "workspace"),
+      toolNames: ["read", "bash"],
+      connectedServers: [],
+      subagentConfig: cfg,
+    } as any);
+
     expect(prompt).not.toContain("## Delegation");
   });
 
@@ -1598,7 +1880,7 @@ describe("cross-review-gaps", () => {
       getApiKey: async () => "test-key",
       defaultModel: "custom-anthropic/claude-sonnet-4-6",
       defaultThinkingLevel: "medium",
-      modelRegistry: { find: vi.fn().mockReturnValue(undefined) } as any,
+      modelRegistry: { find: vi.fn().mockReturnValue({ id: "mock-model", provider: "mock-provider", api: "anthropic-messages" }) } as any,
     });
 
     // Run with context — the SubagentRunOptions type must accept context
