@@ -1187,7 +1187,11 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     const src = stripComments(readFileSync(p, "utf-8"));
     const body = sliceFnBody(src, "function runJSON");
     expect(body.length).toBeGreaterThan(0);
-    const primaryIdx = body.indexOf(".prompt(args.message)");
+    // Post-#22-merge: the bare session.prompt(args.message) call is now
+    // wrapped by runPromptWithThinkingOnlyGuard(). Accept either anchor.
+    const direct = body.indexOf(".prompt(args.message)");
+    const guardIdx = body.indexOf("runPromptWithThinkingOnlyGuard(");
+    const primaryIdx = direct >= 0 ? direct : guardIdx;
     expect(primaryIdx).toBeGreaterThanOrEqual(0);
     const incIdx = body.indexOf(".incrementTurnsSinceExit(");
     expect(incIdx).toBeGreaterThanOrEqual(0);
@@ -1227,10 +1231,18 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     const p = resolve(__dirname, "..", "src", "rpc.ts");
     expect(existsSync(p)).toBe(true);
     const src = stripComments(readFileSync(p, "utf-8"));
-    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    // Greedy-span the full `case "prompt"` body up to the next `case "..."`
+    // or the closing `}`. The non-greedy-until-first-break regex was
+    // correct pre-#22-merge but the case now contains multiple `break;`
+    // statements (stillThinkingOnly, terminalError, success-path).
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?(?=case\s+"[^"]+"\s*:)/);
     expect(m).toBeTruthy();
     const body = m![0];
-    const promptIdx = body.indexOf("session.prompt(");
+    // Post-#22-merge: bare session.prompt() replaced by runPromptWith
+    // ThinkingOnlyGuard(). Accept either anchor.
+    const direct = body.indexOf("session.prompt(");
+    const guardIdx = body.indexOf("runPromptWithThinkingOnlyGuard(");
+    const promptIdx = direct >= 0 ? direct : guardIdx;
     const incIdx = body.indexOf(".incrementTurnsSinceExit(");
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(incIdx).toBeGreaterThanOrEqual(0);
@@ -1259,7 +1271,10 @@ describe("Wiring check: entrypoints clear remindedThisTurn latch (R4 finding #1)
     const src = stripComments(readFileSync(p, "utf-8"));
     const body = sliceFnBody(src, "function runJSON");
     const clearIdx = body.indexOf(".clearRemindedThisTurn(");
-    const primaryIdx = body.indexOf(".prompt(args.message)");
+    // Post-#22-merge: bare prompt call wrapped by guard helper.
+    const direct = body.indexOf(".prompt(args.message)");
+    const guardIdx = body.indexOf("runPromptWithThinkingOnlyGuard(");
+    const primaryIdx = direct >= 0 ? direct : guardIdx;
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     expect(primaryIdx).toBeGreaterThanOrEqual(0);
     expect(clearIdx).toBeLessThan(primaryIdx);
@@ -1279,11 +1294,14 @@ describe("Wiring check: entrypoints clear remindedThisTurn latch (R4 finding #1)
   it('agent/src/rpc.ts case "prompt" clears latch BEFORE session.prompt(', () => {
     const p = resolve(__dirname, "..", "src", "rpc.ts");
     const src = stripComments(readFileSync(p, "utf-8"));
-    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    // Span the full case "prompt" body — post-#22-merge has multiple breaks.
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?(?=case\s+"[^"]+"\s*:)/);
     expect(m).toBeTruthy();
     const body = m![0];
     const clearIdx = body.indexOf(".clearRemindedThisTurn(");
-    const promptIdx = body.indexOf("session.prompt(");
+    const direct = body.indexOf("session.prompt(");
+    const guardIdx = body.indexOf("runPromptWithThinkingOnlyGuard(");
+    const promptIdx = direct >= 0 ? direct : guardIdx;
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(clearIdx).toBeLessThan(promptIdx);
@@ -1355,7 +1373,8 @@ describe("Wiring check: catch blocks roll back the bump (R3 finding #1)", () => 
   it('agent/src/rpc.ts case "prompt" catch block calls decrementTurnsSinceExit()', () => {
     const p = resolve(__dirname, "..", "src", "rpc.ts");
     const src = stripComments(readFileSync(p, "utf-8"));
-    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    // Span the full case "prompt" body — post-#22-merge has multiple breaks.
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?(?=case\s+"[^"]+"\s*:)/);
     expect(m).toBeTruthy();
     const body = m![0];
     // R5: two decrement sites — post-prompt check + catch.
@@ -2025,7 +2044,8 @@ describe("Wiring check: entrypoints call lastTurnWasFailure after prompt (R5 fin
     const p = resolve(__dirname, "..", "src", "rpc.ts");
     const src = stripComments(readFileSync(p, "utf-8"));
     expect(src).toMatch(/from\s+["']\.\/session-status(?:\.js)?["']/);
-    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    // Span full case "prompt" body — post-#22-merge has multiple breaks.
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?(?=case\s+"[^"]+"\s*:)/);
     expect(m).toBeTruthy();
     expect(m![0]).toContain("lastTurnWasFailure(");
   });

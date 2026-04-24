@@ -1,0 +1,1303 @@
+/**
+ * Unit tests for the early-exit / thinking-only termination guard
+ * (issue #22).
+ *
+ * Critical design note: `@mariozechner/pi-ai` normalises all provider
+ * outputs to canonical {text, thinking, toolCall} blocks before they
+ * land in `session.messages` (see pi-ai/dist/types.d.ts:114). So these
+ * tests use the canonical shape for every provider path. What actually
+ * differs across providers (anthropic / kimi-coding / openai-completions)
+ * is the FAILURE MODE, not the block types:
+ *
+ *   - kimi-coding (anthropic-messages API): 429 overload → stopReason
+ *     "error", content=[]. Auto-retry may exhaust, or a toolUse turn
+ *     may be left with an un-executed tool call.
+ *   - custom-anthropic (anthropic-messages API): same canonical shape;
+ *     the historical issue-#22 hypothesis was a clean thinking-only
+ *     stop with a finalized `thinking` block.
+ *   - custom-openai (openai-completions API): same canonical shape via
+ *     pi-ai's openai-completions provider. `reasoning`-typed content
+ *     would only appear if pi-ai broke its normalization; we assert
+ *     the guard still catches it as a defensive measure.
+ *
+ * The real ml09/ml11 shapes were captured from
+ *   ~/.qlaybot/sessions/2026-04-23T06-53-* .jsonl
+ *   ~/.qlaybot/sessions/2026-04-23T06-58-* .jsonl
+ * and are reproduced verbatim (truncated) in the provider-specific
+ * fixtures below.
+ */
+
+import { describe, it, expect } from "vitest";
+import {
+  createTurnActivityTracker,
+  isRetryableErrorMessage,
+  isThinkingOnlyTermination,
+  isThinkingOnlyTerminationByMessages,
+  lastTurnTerminalError,
+  runPromptWithThinkingOnlyGuard,
+} from "../src/thinking-only-guard.js";
+
+// ---------------------------------------------------------------------------
+// Canonical SDK message-shape helpers (matches pi-ai types.d.ts:114)
+// ---------------------------------------------------------------------------
+
+interface CanonicalAssistant {
+  role: "assistant";
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "thinking"; thinking: string; thinkingSignature?: string }
+    | { type: "toolCall"; id: string; name: string; arguments: any }
+  >;
+  api: string;
+  provider: string;
+  model: string;
+  usage: any;
+  stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+  errorMessage?: string;
+  timestamp: number;
+}
+
+function makeAssistant(
+  provider: "kimi-coding" | "custom-anthropic" | "custom-openai",
+  opts: {
+    stopReason: CanonicalAssistant["stopReason"];
+    content: CanonicalAssistant["content"];
+    errorMessage?: string;
+  },
+): CanonicalAssistant {
+  return {
+    role: "assistant",
+    content: opts.content,
+    api:
+      provider === "custom-openai" ? "openai-completions" : "anthropic-messages",
+    provider,
+    model: provider === "kimi-coding" ? "k2p6" : provider === "custom-anthropic" ? "claude-opus-4-6" : "gpt-5",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: opts.stopReason,
+    errorMessage: opts.errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
+function makeUser(text: string): any {
+  return {
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp: Date.now(),
+  };
+}
+
+function makeToolResult(toolCallId: string, text: string): any {
+  return {
+    role: "toolResult",
+    toolCallId,
+    toolName: "read",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Healthy terminations — MUST return false (no re-prompt)
+// ---------------------------------------------------------------------------
+
+describe("healthy terminations (no retry)", () => {
+  it("stopReason=stop with text content → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "Here is my answer." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("stopReason=stop with text + thinking → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "let me think..." },
+          { type: "text", text: "Here is my answer." },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("stopReason=toolUse FOLLOWED BY toolResult (mid-convo) → false", () => {
+    const msgs = [
+      makeUser("hello"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "need to read" },
+          { type: "toolCall", id: "t1", name: "read", arguments: { path: "x" } },
+        ],
+      }),
+      makeToolResult("t1", "file content..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "done" }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Early-exit patterns observed in the ml09/ml11 evidence
+// ---------------------------------------------------------------------------
+
+describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
+  it("rate-limit error (stopReason=error, content=[]) — auto-retry exhausted → true", () => {
+    // Shape observed at
+    //   ~/.qlaybot/sessions/2026-04-23T06-53-24-810Z_...jsonl entry 4
+    // Historical: the original detector returned FALSE here because
+    // content=[] satisfied neither hasThinking nor any other condition.
+    const msgs = [
+      makeUser("start work"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"The engine is currently overloaded..."},"type":"error"}',
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("R4: stalled toolUse — toolCall with no trailing toolResult → false (NOT retried)", () => {
+    // Shape observed at the LAST entry of both
+    //   ~/.qlaybot/sessions/2026-04-23T06-53-24-810Z_...jsonl
+    //   ~/.qlaybot/sessions/2026-04-23T06-58-19-676Z_...jsonl
+    // — stopReason="toolUse" + toolCall content + no trailing toolResult.
+    //
+    // Commit b48b062 classified this as thinking-only and sent a
+    // "Continue..." user message. R4 finding #1 (2026-04-24) showed
+    // that path is harmful: pi-ai's transform-messages.js:125-141
+    // injects a synthetic `"No result provided"` toolResult for the
+    // orphan toolCall before any user message, so the model continues
+    // under the confidently-wrong premise that the tool errored.
+    //
+    // Option A (chosen): the guard abstains — `hasToolCall` falls
+    // through to `if (hasText || hasToolCall) return false;`. Caller
+    // sees stillThinkingOnly=false and returns a clean (possibly
+    // empty-text) completion. Stalled-toolUse recovery, if ever
+    // implemented, belongs in the agent-loop layer where the original
+    // toolCall can be re-dispatched — not here.
+    const msgs = [
+      makeUser("start work"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          {
+            type: "thinking",
+            thinking:
+              "This is a complex multi-step task. Let me save the checklist.",
+          },
+          {
+            type: "toolCall",
+            id: "t1",
+            name: "write",
+            arguments: { path: "/tmp/checklist.md", content: "..." },
+          },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R4: ml09/ml11 exact trace tail (429 error turn + orphan toolUse turn) → false", () => {
+    // Full reproduction of the final three messages in both ml09 and
+    // ml11 real sessions: toolResult from a prior tool call, then a
+    // 429 error turn pi-coding-agent's auto-retry pushed, then the
+    // retry's toolCall that was never executed. The guard must NOT
+    // classify this trailing orphan as retryable.
+    const msgs = [
+      makeUser("design the device"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "read the spec" },
+          { type: "toolCall", id: "t1", name: "read", arguments: { path: "spec.md" } },
+        ],
+      }),
+      makeToolResult("t1", "spec contents..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"overloaded"}}',
+      }),
+      // Orphan retry turn — toolCall never executed. THIS must NOT
+      // trigger a Continue-prompt.
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "retrying..." },
+          { type: "toolCall", id: "t2", name: "write", arguments: { path: "out.md" } },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("refusal with content text (stopReason=error + 'I can't help') → false", () => {
+    // R2 finding #1 (2026-04-24): the definitive refusal signal is
+    // ABSENCE of `errorMessage`, not content-shape. pi-ai's
+    // mapStopReason paths (anthropic "refusal"/"sensitive", openai
+    // "content_filter") set stopReason="error" but never touch
+    // errorMessage — only the provider catch block does.
+    const msgs = [
+      makeUser("do something policy-violating"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [{ type: "text", text: "I can't help with that." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("content-filter (stopReason=error + refusal + thinking) → false", () => {
+    // openai-completions content_filter: thinking block may still be
+    // present alongside the refusal text. No errorMessage → no retry.
+    const msgs = [
+      makeUser("banned request"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [
+          { type: "thinking", thinking: "Considering policy..." },
+          { type: "text", text: "I won't do that." },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R2: mid-stream transport error (stopReason=error + errorMessage + partial text) → true", () => {
+    // The regression R1's !hasAnyText gate introduced. A transport
+    // error that strikes AFTER some text streamed leaves partial text
+    // AND errorMessage on the final assistant message — pi-ai's
+    // catch block (anthropic.js:318, openai-completions.js:257) sets
+    // both. The previous gate classified this as a refusal and
+    // silently returned the truncated answer.
+    //
+    // R3: errorMessage string must also match pi-coding-agent's
+    // canonical retryable regex (agent-session.js:1672). Use "fetch
+    // failed" — the real phrase undici emits for mid-stream TCP drops.
+    const msgs = [
+      makeUser("write a long essay"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [
+          { type: "text", text: "Once upon a time there was a long-running..." },
+        ],
+        errorMessage: "fetch failed",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("R2: error with no errorMessage and empty content → false (refusal-with-suppressed-text)", () => {
+    // Rare: stopReason="error" with neither errorMessage nor any
+    // preserved text. Treat as refusal-like — the SDK chose to end
+    // the turn deliberately, so preserve the stop rather than loop.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: context-overflow (stopReason=error + 'prompt is too long') → false", () => {
+    // pi-ai isContextOverflow (utils/overflow.js) matches this
+    // phrase for anthropic. pi-coding-agent's _isRetryableError
+    // (agent-session.js:1668) explicitly excludes overflow from
+    // retry — compaction handles it, not a Continue loop.
+    const msgs = [
+      makeUser("a very long prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "prompt is too long: 213462 tokens > 200000 maximum",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: openai context-overflow ('exceeds the context window') → false", () => {
+    const msgs = [
+      makeUser("oversized"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "Your input exceeds the context window of this model",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: auth failure (stopReason=error + 'Invalid API key') → false", () => {
+    // Not in pi-coding-agent's retryable regex. Surface the error
+    // instead of burning 5 Continues against a bad credential.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: invalid_request_error (stopReason=error) → false", () => {
+    const msgs = [
+      makeUser("malformed"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: messages.0.content: field required",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R3: upstream 502 (stopReason=error) → true", () => {
+    // Canonical retryable — pi-coding-agent's regex matches 502.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "502 Bad Gateway",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("aborted mid-stream (stopReason=aborted) → true", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "aborted",
+        content: [],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+describe("custom-anthropic — issue-#22 original hypothesis", () => {
+  it("clean thinking-only stop (stopReason=stop, content=[thinking]) → true", () => {
+    // The plan-doc's canonical thinking-only shape. This is what the
+    // ORIGINAL detector was designed to catch, and it still does.
+    const msgs = [
+      makeUser("solve this"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          {
+            type: "thinking",
+            thinking:
+              "Let me work through this step by step...",
+            thinkingSignature: "SIG...",
+          },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("thinking + empty text (only whitespace) → true", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "thinking body" },
+          { type: "text", text: "   \n\t  " },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+describe("custom-openai — openai-completions API", () => {
+  it("clean thinking-only (canonical shape still used post-normalization) → true", () => {
+    // pi-ai/providers/openai-completions.js normalizes reasoning output
+    // into canonical {type:"thinking", thinking:"..."} blocks. Test the
+    // canonical shape for this provider.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-openai", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "o1-style reasoning text..." }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("defensive: legacy-shaped 'reasoning' block still detected → true", () => {
+    // Should pi-ai ever surface a non-canonical `reasoning` type directly
+    // (e.g., a new openai provider variant), the guard still catches it.
+    const msgs = [
+      makeUser("go"),
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", text: "non-canonical reasoning body" }],
+      } as any,
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Edge / defensive cases
+// ---------------------------------------------------------------------------
+
+describe("edge cases", () => {
+  it("empty messages array → false", () => {
+    expect(isThinkingOnlyTerminationByMessages({ messages: [] })).toBe(false);
+  });
+
+  it("missing messages field → false", () => {
+    expect(isThinkingOnlyTerminationByMessages({})).toBe(false);
+  });
+
+  it("no assistant turn anywhere → false (shape abstains, fallback decides)", () => {
+    const msgs = [makeUser("hi")];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("trailing user message does not defeat walk-back to assistant", () => {
+    // e.g. a pending-next-turn message injected after the assistant.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "body" }],
+      }),
+      makeUser("ping"),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("empty-body thinking ('  ') with stopReason=stop → false", () => {
+    const msgs = [
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "   " }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("tool-call-only turn followed by toolResult → false", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "toolCall", id: "t1", name: "read", arguments: {} },
+        ],
+      }),
+      makeToolResult("t1", "..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "ok" }],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("malformed: content is a string → false (can't decide from shape)", () => {
+    const msgs = [
+      { role: "assistant", content: "some raw string" as any } as any,
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("malformed: content is undefined → false (can't decide from shape)", () => {
+    const msgs = [{ role: "assistant", content: undefined } as any];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Activity-stream fallback
+// ---------------------------------------------------------------------------
+
+function mockSession(messages: any[] = []): {
+  messages: any[];
+  subscribe: (l: (ev: any) => void) => () => void;
+  emit: (ev: any) => void;
+} {
+  const listeners: ((ev: any) => void)[] = [];
+  return {
+    messages,
+    subscribe(l) {
+      listeners.push(l);
+      return () => {
+        const i = listeners.indexOf(l);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    },
+    emit(ev) {
+      for (const l of listeners) l(ev);
+    },
+  };
+}
+
+describe("createTurnActivityTracker", () => {
+  it("records sawText on a text_delta message_update", () => {
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hi" },
+    });
+    expect(tracker.current()).toEqual({ sawText: true, sawToolCall: false });
+    tracker.unsubscribe();
+  });
+
+  it("records sawToolCall on tool_execution_start", () => {
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({ type: "tool_execution_start", toolName: "x", args: {} });
+    expect(tracker.current()).toEqual({ sawText: false, sawToolCall: true });
+    tracker.unsubscribe();
+  });
+
+  it("does NOT set sawToolCall on a toolcall_start content block (pre-execution)", () => {
+    // Critical distinction: toolcall_start is a content_block event from
+    // the model stream; tool_execution_start is a top-level agent-loop
+    // event that fires only when the tool handler is actually invoked.
+    // The stalled-toolUse case (issue #22) is exactly: toolcall_start
+    // fires but tool_execution_start does not.
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_end", contentIndex: 0 },
+    });
+    expect(tracker.current().sawToolCall).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("ignores thinking_delta", () => {
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "..." },
+    });
+    expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
+    tracker.unsubscribe();
+  });
+
+  it("reset() clears between turns", () => {
+    const s = mockSession();
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hi" },
+    });
+    tracker.reset();
+    expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
+    tracker.unsubscribe();
+  });
+
+  it("tolerates session with no subscribe method", () => {
+    const tracker = createTurnActivityTracker({} as any);
+    expect(tracker.current()).toEqual({ sawText: false, sawToolCall: false });
+    expect(() => tracker.unsubscribe()).not.toThrow();
+  });
+});
+
+describe("isThinkingOnlyTermination (combined)", () => {
+  it("R4: stalled kimi-toolUse does NOT retry (Continue-prompt would corrupt tool state)", () => {
+    // Rewritten from the b48b062 version that asserted retry=true.
+    // R4 finding #1: the Continue path triggers pi-ai's synthetic
+    // "No result provided" toolResult injection
+    // (transform-messages.js:125-141). Asserting no-retry here locks
+    // in the Option A choice.
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "..." },
+          { type: "toolCall", id: "t1", name: "write", arguments: {} },
+        ],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "..." },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+    });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_end", contentIndex: 1 },
+    });
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("shape catches kimi rate-limit (stopReason=error, content=[])", () => {
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "429 rate_limit_error",
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
+    tracker.unsubscribe();
+  });
+
+  it("R7: no terminal assistant + no activity → false (extension-handled path, NOT retried)", () => {
+    // R7 finding #1 (2026-04-24) inverted this gate. pi-coding-agent
+    // autoloads extensions whenever customTools is passed
+    // (agent-session.js:1583-1586), and qlaybot always passes
+    // customTools (agent.ts:397). `_tryExecuteExtensionCommand` and
+    // `_extensionRunner.emitInput` can resolve prompt() cleanly with
+    // no assistant message + no stream activity. Treating that as
+    // thinking-only caused spurious 5x retries against handled
+    // commands. The gate now requires a terminal assistant with
+    // stopReason before the activity check runs.
+    const s = mockSession([makeUser("go")]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("healthy: text_delta fired → false", () => {
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "hello" }],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hello" },
+    });
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("healthy: tool was actually executed (tool_execution_start fired) → false", () => {
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }],
+      }),
+      makeToolResult("t1", "data"),
+      makeAssistant("kimi-coding", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "done" }],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    s.emit({ type: "tool_execution_start", toolName: "read", args: {} });
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "done" },
+    });
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  // ---------------------------------------------------------------------------
+  // R2 finding #2 (2026-04-24): the activity fallback must not fire when a
+  // terminal assistant message is present. Only the "no terminal assistant at
+  // all" case falls through to the activity signals.
+  // ---------------------------------------------------------------------------
+
+  it("R2: legitimate empty completion (stopReason=stop, content=[], no activity) → false", () => {
+    // User asked for no output, or a tool-only turn that emitted no
+    // follow-up text. Shape detector abstains (no text, no toolCall,
+    // no thinking). Before the R2 gate, the fallback saw !sawText &&
+    // !sawToolCall and fired a spurious `Continue...` retry.
+    const s = mockSession([
+      makeUser("respond with nothing"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R2: legitimate empty completion with streaming (sawText=true, final content=[]) → false", () => {
+    // Edge case: streaming happened but pi-ai normalized away the
+    // (possibly whitespace-only) text blocks, leaving final content=[]
+    // + stopReason="stop". Shape detector abstains. Fallback must not
+    // fire because a terminal assistant message is present.
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "something" },
+    });
+    // sawText=true, but shape abstains; with terminal assistant the
+    // gate short-circuits before even consulting the tracker.
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R7: extension-command-handled path (prompt() returns cleanly, no assistant, no events) → false", () => {
+    // Concretely simulates pi-coding-agent's _tryExecuteExtensionCommand
+    // (agent-session.js:500-505 / :612-637): qlaybot sends a
+    // `/extension-cmd` message, pi routes it to an extension handler
+    // which completes synchronously without invoking the model.
+    // session.messages is unchanged from before the call, no stream
+    // events fire. Before R7 this classified as thinking-only and
+    // triggered up to 5 billed model calls via the Continue-prompt.
+    const s = mockSession([makeUser("/my-extension-command arg1 arg2")]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R7: input-handler-handled path (emitInput returned handled) → false", () => {
+    // agent-session.js:510-514: an input handler short-circuits the
+    // agent loop before prompt() reaches the model. Same shape as the
+    // extension-command case from the guard's perspective — no
+    // assistant message, no activity — must NOT retry.
+    const s = mockSession([makeUser("plain text the input handler consumed")]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R7: unknown future content shape with stopReason + no activity → false (trust the stop)", () => {
+    // The activity-based fallback is now disabled entirely — see the
+    // R7 comment on isThinkingOnlyTermination. An unrecognised future
+    // SDK content block arriving alongside stopReason is trusted: the
+    // model said it finished, so a Continue-prompt would be at least
+    // as likely to corrupt state as to recover anything (cf. the R4
+    // orphan-toolUse synthetic-result injection). If a future pi-ai
+    // change actually requires recovery here, the shape detector is
+    // the right layer to extend.
+    const s = mockSession([
+      makeUser("go"),
+      {
+        role: "assistant",
+        content: [{ type: "future_unknown_block", payload: "x" } as any],
+        stopReason: "stop",
+      } as any,
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R8 finding #1 (2026-04-24): non-retryable provider errors must surface as
+// terminal errors, NOT as silent fake-success completions. Exercises
+// `lastTurnTerminalError` at the unit level; the caller-wired-in tests live
+// in test-thinking-only-rpc.ts under the CLI/RPC mock harnesses.
+// ---------------------------------------------------------------------------
+
+describe("lastTurnTerminalError (R8 finding #1)", () => {
+  it("401 auth failure → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBe("401 Invalid API key");
+  });
+
+  it("context-overflow (anthropic 'prompt is too long') → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("oversized"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "prompt is too long: 213462 tokens > 200000 maximum",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /prompt is too long/,
+    );
+  });
+
+  it("insufficient_quota → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "insufficient_quota: billing issue",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /insufficient_quota/,
+    );
+  });
+
+  it("invalid_request_error → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("malformed"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: messages.0.content: field required",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /invalid_request_error/,
+    );
+  });
+
+  it("refusal (stopReason=error, no errorMessage, text preserved) → null", () => {
+    // Refusals are a legitimate success path — no terminal-error
+    // surface. The text content is the caller's response.
+    const msgs = [
+      makeUser("policy-violating"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [{ type: "text", text: "I can't help with that." }],
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("retryable 429 rate-limit → null (caller already retried)", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"overloaded"}}',
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("retryable 502 upstream → null", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "502 Bad Gateway",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("clean success (stopReason=stop) → null", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "hello" }],
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("aborted with errorMessage → returns message (not retryable, surface it)", () => {
+    // An aborted turn that also carries a non-retryable errorMessage
+    // (e.g. user pressed escape during a long request with a
+    // malformed body). Surface it rather than silently ignoring.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "aborted",
+        content: [],
+        errorMessage: "Request was aborted",
+      }),
+    ];
+    // "Request was aborted" doesn't match RETRYABLE_ERROR_PATTERN, so
+    // it surfaces as terminal. If pi-coding-agent's regex ever covers
+    // this phrase, the helper will flip to null — that is acceptable.
+    expect(isRetryableErrorMessage("Request was aborted")).toBe(false);
+    expect(lastTurnTerminalError({ messages: msgs })).toBe("Request was aborted");
+  });
+
+  it("no assistant message at all → null", () => {
+    expect(lastTurnTerminalError({ messages: [makeUser("go")] })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R8 finding #2 (2026-04-24): scans must be bounded to the current prompt's
+// assistant messages. In persistent sessions (TUI / RPC) the prior turn's
+// shape must not leak into the current turn's retry decision.
+// ---------------------------------------------------------------------------
+
+describe("sinceIdx boundary (R8 finding #2)", () => {
+  it("prior retryable-error turn + current extension-handled prompt → guard does NOT retry", () => {
+    // Persistent-session shape: prior turn ended in a retryable
+    // transport error (never recovered — kept in history), then a
+    // fresh /extension-command prompt resolved without pushing any
+    // new assistant message. Without sinceIdx the scan walks back
+    // into the prior error and retries it.
+    const priorMessages: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "overloaded",
+      }),
+      makeUser("/extension-command"),
+    ];
+    // sinceIdx = priorMessages.length means "only inspect messages
+    // pushed AFTER this point" — simulates snapshot taken before the
+    // second session.prompt() call. Current prompt pushed nothing.
+    const sinceIdx = priorMessages.length;
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: priorMessages }, sinceIdx),
+    ).toBe(false);
+    expect(
+      lastTurnTerminalError({ messages: priorMessages }, sinceIdx),
+    ).toBeNull();
+  });
+
+  it("prior clean turn + current thinking-only stop → guard DOES retry on current turn", () => {
+    // Ensure bounding doesn't break the retry logic when the CURRENT
+    // turn genuinely needs a retry.
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "clean answer" }],
+      }),
+      makeUser("solve this"),
+    ];
+    const sinceIdx = msgs.length;
+    // Current prompt produced a thinking-only turn.
+    msgs.push(
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "hmm..." },
+        ],
+      }),
+    );
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: msgs }, sinceIdx),
+    ).toBe(true);
+  });
+
+  it("fresh session (sinceIdx=0) retains original behavior — thinking-only retries", () => {
+    const msgs: any[] = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "..." }],
+      }),
+    ];
+    // Default sinceIdx=0 — scans full history, equivalent to old behavior.
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: msgs }, 0),
+    ).toBe(true);
+  });
+
+  it("prior terminal error + current extension-handled prompt → lastTurnTerminalError returns null", () => {
+    // Otherwise rpc.ts/cli.ts would surface the PRIOR turn's 401 as
+    // if it were the current prompt's failure.
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+      makeUser("/extension-command handled cleanly"),
+    ];
+    const sinceIdx = msgs.length;
+    expect(lastTurnTerminalError({ messages: msgs }, sinceIdx)).toBeNull();
+  });
+
+  it("current-turn terminal error after prior clean turn → lastTurnTerminalError returns it", () => {
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "ok" }],
+      }),
+      makeUser("second prompt"),
+    ];
+    const sinceIdx = msgs.length;
+    msgs.push(
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    );
+    expect(lastTurnTerminalError({ messages: msgs }, sinceIdx)).toBe(
+      "401 Invalid API key",
+    );
+  });
+});
+
+describe("sinceIdx compaction safety (R8.1 finding — gpt-5.5 xhigh final)", () => {
+  // AgentSession.prompt() can perform pre-prompt or overflow compaction
+  // that REPLACES session.messages with a shorter array before appending
+  // the current turn. runPromptWithThinkingOnlyGuard rebinds sinceIdx=0
+  // when it detects a shrink so the scans still find the current assistant
+  // turn. Exercises the rebind via the user-facing API — no direct access
+  // to the private helper.
+
+  it("compaction shrinks messages → guard rebinds and still detects current-turn error", async () => {
+    // Pre-prompt: persistent session with 20 messages (long history simulation).
+    const priorHistory = Array.from({ length: 20 }, (_, i) =>
+      makeUser(`prior turn ${i}`),
+    );
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Simulate pi-coding-agent: compaction drops history to 2 messages,
+        // then appends the current assistant turn (a retryable error).
+        session.messages = [
+          makeUser("compacted system context"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "overloaded_error",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "user turn",
+      tracker,
+    );
+    // sinceIdx started at 20; after compaction messages.length=2 (< 20) →
+    // rebind to 0. The retryable-error shape is then detected, retries fire
+    // (stalled on the mock — same shape every call), and stillThinkingOnly
+    // reflects the real state. Critical assertion: sinceIdx is NOT left
+    // pointing past the end of the compacted array.
+    expect(result.sinceIdx).toBe(0);
+    expect(result.retries).toBeGreaterThan(0);
+    // Final check — lastTurnTerminalError sees the compacted current turn.
+    expect(lastTurnTerminalError(session, result.sinceIdx)).toBeNull();
+    // (errorMessage "overloaded_error" is retryable, so it returns null)
+  });
+
+  it("compaction drops K + prompt adds K → same length, identity-tracked rebind fires (R8.3 final)", async () => {
+    // Codex finding: pre-prompt length 4; compaction drops 2, prompt adds
+    // 2 (user + assistant) → final length 4 = sinceIdx. Naive length check
+    // `n < sinceIdx` doesn't trigger. Object-identity tracking finds the
+    // pre-last message was dropped → rebinds sinceIdx to 0 and the current
+    // assistant error is detected.
+    const preLast = makeAssistant("custom-anthropic", {
+      stopReason: "stop",
+      content: [{ type: "text", text: "previous clean" }],
+    });
+    const priorHistory = [
+      makeUser("t1"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "t1 reply" }],
+      }),
+      makeUser("t2"),
+      preLast,
+    ];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Compaction drops first 2 messages; prompt adds user + assistant error.
+        session.messages = [
+          priorHistory[2], // kept: makeUser("t2")
+          priorHistory[3], // kept: preLast
+          makeUser("t3 current"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "401 Invalid API key",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "t3 current",
+      tracker,
+    );
+    // preLast IS still in the post-prompt array at index 1; sinceIdx = 2.
+    // Current assistant error at index 3 is AFTER sinceIdx → detected.
+    expect(result.sinceIdx).toBe(2);
+    expect(
+      lastTurnTerminalError(session, result.sinceIdx),
+    ).toBe("401 Invalid API key");
+  });
+
+  it("compaction drops preLast entirely → rebinds to 0, current-turn error detected (R8.3 final)", async () => {
+    // Harder case: compaction discards the pre-prompt last message. Object
+    // identity not found in post-prompt array → sinceIdx resets to 0.
+    const preLast = makeAssistant("custom-anthropic", {
+      stopReason: "stop",
+      content: [{ type: "text", text: "old" }],
+    });
+    const priorHistory = [makeUser("t1"), preLast];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Full compaction: drop everything, rebuild with summary + new turn.
+        session.messages = [
+          makeUser("[compacted summary]"),
+          makeUser("t2"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "prompt is too long: 300000 tokens",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "t2",
+      tracker,
+    );
+    expect(result.sinceIdx).toBe(0);
+    expect(lastTurnTerminalError(session, result.sinceIdx)).toBe(
+      "prompt is too long: 300000 tokens",
+    );
+  });
+
+  it("invalid_request with numeric limit (max_tokens <= 5000) not mis-classified as retryable (R8.4 final)", () => {
+    // Codex R8.4: bare `500` alternation would match "5000" in
+    // "max_tokens must be <= 5000" → classified retryable → wastes 5
+    // Continue retries + masks the actionable error. Word-boundaried
+    // alternations prevent the false positive.
+    const msgs = [
+      makeUser("bad request"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: max_tokens must be <= 5000 for this model",
+      }),
+    ];
+    // Should be treated as non-retryable terminal (not retried).
+    expect(isRetryableErrorMessage(msgs[1].errorMessage)).toBe(false);
+    expect(lastTurnTerminalError({ messages: msgs })).toBe(
+      "invalid_request_error: max_tokens must be <= 5000 for this model",
+    );
+  });
+
+  it("genuine 500 server error still matches retryable (R8.4 regression)", () => {
+    expect(
+      isRetryableErrorMessage("HTTP 500: upstream server error"),
+    ).toBe(true);
+    expect(isRetryableErrorMessage("status 500")).toBe(true);
+    expect(isRetryableErrorMessage("got 500 from provider")).toBe(true);
+  });
+
+  it("context-overflow msg with retryable-looking token count → surfaces as terminal (R8.2 final)", () => {
+    // Non-retryable context-overflow error whose errorMessage contains
+    // "250000" (so /500/ in isRetryableErrorMessage matches). Without the
+    // isContextOverflow-first ordering, this would silently return null
+    // and the caller would write status:"completed" with empty response.
+    const msgs = [
+      makeUser("too much context"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "prompt is too long: 250000 tokens > 200000 maximum",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBe(
+      "prompt is too long: 250000 tokens > 200000 maximum",
+    );
+  });
+
+  it("no compaction → sinceIdx preserved, boundary respected (R8 #2 regression)", async () => {
+    const priorHistory = [
+      makeUser("prior user"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "overloaded_error", // retryable prior error
+      }),
+    ];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // No compaction — session.messages grows, current turn appended clean.
+        session.messages.push(
+          makeAssistant("custom-anthropic", {
+            stopReason: "stop",
+            content: [{ type: "text", text: "done" }],
+          }),
+        );
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "user turn",
+      tracker,
+    );
+    // sinceIdx captured pre-prompt at 2. No shrink → stays at 2 so the
+    // scan skips the prior retryable-error turn and sees the clean stop.
+    expect(result.sinceIdx).toBe(2);
+    expect(result.retries).toBe(0);
+    expect(result.stillThinkingOnly).toBe(false);
+  });
+});

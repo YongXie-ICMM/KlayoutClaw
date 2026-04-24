@@ -28,6 +28,11 @@ import {
 } from "./verbose-helpers.js";
 import { lastTurnWasFailure } from "./session-status.js";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import {
+  createTurnActivityTracker,
+  lastTurnTerminalError,
+  runPromptWithThinkingOnlyGuard,
+} from "./thinking-only-guard.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -361,29 +366,6 @@ async function runInteractivePlain(
   });
 }
 
-/**
- * Check if the last assistant message in the session was thinking-only
- * (no text, no tool calls). This indicates the model emitted a stop token
- * prematurely after a thinking block — the SDK treats it as "done" but
- * the agent was still mid-task.
- */
-function isThinkingOnlyTermination(session: { messages: any[] }): boolean {
-  const msgs = session.messages;
-  if (msgs.length === 0) return false;
-  const last = msgs[msgs.length - 1];
-  if (last.role !== "assistant" || !Array.isArray(last.content)) return false;
-  const hasThinking = last.content.some(
-    (c: any) => c.type === "thinking" && c.thinking?.trim().length > 0,
-  );
-  const hasText = last.content.some(
-    (c: any) => c.type === "text" && c.text?.trim().length > 0,
-  );
-  const hasToolCall = last.content.some((c: any) => c.type === "toolCall");
-  return hasThinking && !hasText && !hasToolCall;
-}
-
-const THINKING_ONLY_MAX_RETRIES = 5;
-
 async function runJSON(args: CLIArgs): Promise<void> {
   if (!args.message) {
     console.error("Error: --message required for JSON mode");
@@ -415,61 +397,108 @@ async function runJSON(args: CLIArgs): Promise<void> {
   const unsubscribe = subscribeToSession(botSession.session, {
     onTextDelta: (text) => chunks.push(text),
   });
+  const tracker = createTurnActivityTracker(botSession.session);
 
   try {
     botSession.history.recordPrompt(args.message);
-    // Bump BEFORE prompt so transformContext sees the correct turn number.
-    // Placed outside the thinking-only retry loop: one user turn = one bump.
-    // R2 fix: was after, causing off-by-one.
-    // R4 #1: clear the per-turn reinjection latch so the plan blob is
-    // injected at most ONCE per user turn across all round-trips.
+    // #24 bookkeeping: clear per-turn reinjection latch + bump turn counter
+    // BEFORE entering the prompt flow so transformContext sees the correct
+    // turn number and the plan blob is injected at most ONCE per user turn
+    // across all round-trips.
     botSession.planManager?.clearRemindedThisTurn();
     botSession.planManager?.incrementTurnsSinceExit();
-    await botSession.session.prompt(args.message);
+    const { retries, stillThinkingOnly, sinceIdx } = await runPromptWithThinkingOnlyGuard(
+      botSession.session,
+      args.message,
+      tracker,
+      {
+        onRetry: (attempt, max) => {
+          // Drop any partial text the failed turn streamed before the
+          // error stopReason arrived — otherwise the final JSON response
+          // would be `partial_failed_text + retry_text`. See code-review
+          // finding #1 (2026-04-23).
+          chunks.length = 0;
+          console.error(
+            `[qlaybot] thinking-only termination detected (attempt ${attempt}/${max}), re-prompting...`,
+          );
+        },
+        onGiveUp: (max) => {
+          console.error(
+            `[qlaybot] still thinking-only after ${max} retries, giving up`,
+          );
+        },
+      },
+    );
 
-    // Guard against premature termination: if the model stopped after a
-    // thinking-only response (no text, no tool call), re-prompt to continue.
-    let retries = 0;
-    while (
-      isThinkingOnlyTermination(botSession.session) &&
-      retries < THINKING_ONLY_MAX_RETRIES
-    ) {
-      retries++;
-      console.error(
-        `[qlaybot] thinking-only termination detected (attempt ${retries}/${THINKING_ONLY_MAX_RETRIES}), re-prompting...`,
-      );
-      await botSession.session.prompt("Continue. You stopped mid-task after a thinking block — keep working.");
+    // R3 finding #2 (2026-04-24): if the guard exhausted its retries,
+    // `chunks` still holds the LAST failed attempt's partial text
+    // (onRetry clears between attempts but not after the final one).
+    // Returning that as `completed` is a false-success bug — surface
+    // the exhaustion as an error instead.
+    //
+    // R5 finding #1 (2026-04-24): use `process.exitCode = 1; return;`
+    // instead of `process.exit(1)`. The latter terminates before the
+    // buffered stdout write drains when piped, and skips the outer
+    // `finally {}` that disposes the session. Setting exitCode lets
+    // the normal control flow fall through to finally, cleanup runs,
+    // stdout drains on beforeExit, and Node exits with status 1.
+    if (stillThinkingOnly) {
+      chunks.length = 0;
+      const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
+      const output = { status: "error", error: errMsg, retries };
+      console.log(JSON.stringify(output, null, 2));
+      process.exitCode = 1;
+      return;
     }
 
-    if (retries > 0 && isThinkingOnlyTermination(botSession.session)) {
-      console.error(
-        `[qlaybot] still thinking-only after ${THINKING_ONLY_MAX_RETRIES} retries, giving up`,
-      );
+    // R8 finding #1 (2026-04-24): non-retryable provider errors
+    // (401 / invalid_api_key, context-overflow, invalid_request_error,
+    // insufficient_quota, unknown 4xx) are deliberately excluded from
+    // the retry loop (R3 #1). Without this check the success path
+    // would emit `{status:"completed", response:""}` — the original
+    // ml09/ml11 silent-failure pattern in a different shape. Surface
+    // the provider error instead.
+    const terminalError = lastTurnTerminalError(botSession.session, sinceIdx);
+    if (terminalError) {
+      chunks.length = 0;
+      const output = {
+        status: "error",
+        error: `Provider error (non-retryable): ${terminalError}`,
+        retries,
+      };
+      console.log(JSON.stringify(output, null, 2));
+      process.exitCode = 1;
+      return;
     }
 
-    // R5 finding #1: pi-coding-agent swallows most provider errors and
-    // resolves with an error assistant turn. Check the trailing turn after
-    // the retry loop so a swallowed failure rolls the cadence back instead
-    // of silently inflating it.
+    // #24 R5: pi-coding-agent swallows most provider errors and resolves
+    // with an error assistant turn. Check the trailing turn after the
+    // retry loop so a swallowed failure rolls the cadence back instead
+    // of silently inflating it. (#22's terminalError check above already
+    // returned for non-retryable errors; this covers the retryable-
+    // recovered AND the thinking-only-retried-to-success cases.)
     if (lastTurnWasFailure(botSession.session)) {
       botSession.planManager?.decrementTurnsSinceExit();
     }
 
-    const output = { status: "completed", response: chunks.join("") };
+    const output = { status: "completed", response: chunks.join(""), retries };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {
-    // R3 finding #1: roll back the pre-prompt bump so failed turns don't
+    // #24 R3 #1: roll back the pre-prompt bump so failed turns don't
     // inflate the reinjection cadence. Only successful turns count.
+    // #22 R5 #1: fall through to `finally` so the JSON error envelope
+    // flushes cleanly and session cleanup runs (exitCode, not exit).
     botSession.planManager?.decrementTurnsSinceExit();
     const msg = err instanceof Error ? err.message : String(err);
     const output = { status: "error", error: msg };
     console.log(JSON.stringify(output, null, 2));
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     // issue #24: bound the exit-turn swallow flag to one prompt cycle so a
     // rejection/abort after exit_plan_mode can't leak into the next turn.
     botSession.planManager?.consumeExitSwallow();
     unsubscribe();
+    tracker.unsubscribe();
     turnUnsub();
     await botSession.dispose();
   }

@@ -9,6 +9,12 @@ import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
 import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
 import { lastTurnWasFailure } from "./session-status.js";
+import {
+  createTurnActivityTracker,
+  lastTurnTerminalError,
+  runPromptWithThinkingOnlyGuard,
+  THINKING_ONLY_MAX_RETRIES,
+} from "./thinking-only-guard.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
@@ -286,24 +292,111 @@ export async function startRPCServer(opts: {
             },
           });
 
+          const tracker = createTurnActivityTracker(botSession.session);
           try {
-            // Bump BEFORE prompt so transformContext sees the correct turn
-            // number. R2 fix: was after, causing off-by-one.
-            // R4 #1: clear the per-turn reinjection latch so the plan blob
-            // is injected at most ONCE per user turn across all round-trips.
+            // #24 bookkeeping: clear the per-turn reinjection latch + bump
+            // turn counter BEFORE entering the prompt flow so transformContext
+            // sees the correct turn number and the plan blob is injected at
+            // most ONCE per user turn across all round-trips.
             botSession.planManager?.clearRemindedThisTurn();
             botSession.planManager?.incrementTurnsSinceExit();
-            await botSession.session.prompt(message);
-            // R5 finding #1: pi-coding-agent swallows most provider errors
-            // and resolves with an error assistant turn instead of throwing.
-            // Check the trailing turn's stopReason to roll back cadence for
-            // turns that produced no usable output.
+            // #22: defense in depth against thinking-only terminations via
+            // shared guard — see thinking-only-guard.ts.
+            const { retries, stillThinkingOnly, sinceIdx } =
+              await runPromptWithThinkingOnlyGuard(
+                botSession.session,
+                message,
+                tracker,
+                {
+                  onRetry: (attempt, max) => {
+                    // Drop any partial text the failed turn streamed
+                    // before the error stopReason arrived. The client has
+                    // ALREADY received `content_delta` events for those
+                    // chunks, so also emit `thinking_only_reset` to tell
+                    // IDE clients to discard what they displayed for the
+                    // failed attempt.
+                    //
+                    // Event contract: `{ attempt, max, final }`.
+                    // - `final: false` on intermediate resets (this
+                    //   callback) — a retry follows.
+                    // - `final: true` on the exhaustion reset emitted
+                    //   after the loop gives up (R4 finding #2) — no
+                    //   retry follows, the `error` envelope comes next.
+                    // Fires immediately before `thinking_only_reprompt`
+                    // so clients can clear display state and then show
+                    // a retry banner. See code-review finding #1
+                    // (2026-04-23) and finding #2 R4 (2026-04-24).
+                    chunks.length = 0;
+                    sendEvent("thinking_only_reset", {
+                      attempt,
+                      max,
+                      final: false,
+                    });
+                    sendEvent("thinking_only_reprompt", { attempt, max });
+                  },
+                },
+              );
+
+            // R3 finding #2 (2026-04-24): if retries exhausted, the
+            // chunks buffer still holds the last failed attempt's
+            // partial text. Returning it as `completed` masks an
+            // upstream failure — surface the exhaustion instead.
+            if (stillThinkingOnly) {
+              chunks.length = 0;
+              // R4 finding #2 (2026-04-24): also emit a terminal
+              // `thinking_only_reset` so IDE clients can discard the
+              // `content_delta` events from the final failed attempt
+              // — intermediate retries reset their attempts via the
+              // onRetry callback but the last attempt has no retry to
+              // trigger one. `final: true` distinguishes this from
+              // intermediate resets (followed by a retry).
+              sendEvent("thinking_only_reset", {
+                attempt: retries,
+                max: THINKING_ONLY_MAX_RETRIES,
+                final: true,
+              });
+              const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
+              botSession.history.recordError(errMsg);
+              sendEvent("error", { message: errMsg });
+              sendError(req.id, -32000, errMsg);
+              break;
+            }
+
+            // R8 finding #1 (2026-04-24): same non-retryable provider
+            // error check as cli.ts runJSON. Without this the success
+            // path would send `sendResult(..., {status:"completed",
+            // response:""})` and silently return a fake success on
+            // auth / quota / context-overflow.
+            const terminalError = lastTurnTerminalError(
+              botSession.session,
+              sinceIdx,
+            );
+            if (terminalError) {
+              chunks.length = 0;
+              const errMsg = `Provider error (non-retryable): ${terminalError}`;
+              botSession.history.recordError(errMsg);
+              sendEvent("error", { message: errMsg });
+              sendError(req.id, -32000, errMsg);
+              break;
+            }
+
+            // #24 R5: pi-coding-agent swallows most provider errors and
+            // resolves with an error assistant turn instead of throwing.
+            // Check the trailing turn's stopReason to roll back cadence
+            // for turns that produced no usable output. (#22's terminal
+            // check above already returned for non-retryable errors; this
+            // covers retryable-recovered + thinking-only-retried-to-success.)
             if (lastTurnWasFailure(botSession.session)) {
               botSession.planManager?.decrementTurnsSinceExit();
             }
+
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
-            sendResult(req.id, { status: "completed", response: responseText });
+            sendResult(req.id, {
+              status: "completed",
+              response: responseText,
+              retries,
+            });
           } catch (err: unknown) {
             // R3 finding #1: roll back the pre-prompt bump so failed turns
             // don't inflate the reinjection cadence. Only successful turns
@@ -318,6 +411,7 @@ export async function startRPCServer(opts: {
             // cycle so a rejection/abort after exit_plan_mode can't leak.
             botSession.planManager?.consumeExitSwallow();
             unsubscribe();
+            tracker.unsubscribe();
           }
           break;
         }
