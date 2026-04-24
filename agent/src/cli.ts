@@ -358,7 +358,7 @@ async function runJSON(args: CLIArgs): Promise<void> {
 
   try {
     botSession.history.recordPrompt(args.message);
-    const { retries, stillThinkingOnly } = await runPromptWithThinkingOnlyGuard(
+    const { retries, stillThinkingOnly, sinceIdx } = await runPromptWithThinkingOnlyGuard(
       botSession.session,
       args.message,
       tracker,
@@ -409,7 +409,7 @@ async function runJSON(args: CLIArgs): Promise<void> {
     // would emit `{status:"completed", response:""}` — the original
     // ml09/ml11 silent-failure pattern in a different shape. Surface
     // the provider error instead.
-    const terminalError = lastTurnTerminalError(botSession.session);
+    const terminalError = lastTurnTerminalError(botSession.session, sinceIdx);
     if (terminalError) {
       chunks.length = 0;
       const output = {

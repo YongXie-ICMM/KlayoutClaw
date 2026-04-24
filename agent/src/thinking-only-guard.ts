@@ -89,11 +89,18 @@ export interface TurnActivityTracker {
  */
 export function isThinkingOnlyTerminationByMessages(
   session: { messages?: unknown[] },
+  sinceIdx: number = 0,
 ): boolean {
   const msgs = (session.messages ?? []) as any[];
 
+  // R8 finding #2 (2026-04-24): scan is bounded to messages produced
+  // by the CURRENT prompt. In a persistent session (TUI / RPC) the
+  // same `session.messages` accumulates across turns; without a
+  // boundary an extension-handled current turn would read the
+  // PRIOR turn's trailing assistant shape and retry against stale
+  // state. Callers pass the pre-prompt message length.
   let lastAssistantIdx = -1;
-  for (let i = msgs.length - 1; i >= 0; i--) {
+  for (let i = msgs.length - 1; i >= sinceIdx; i--) {
     const m = msgs[i];
     if (!m) continue;
     if (m.role === "assistant") {
@@ -234,11 +241,17 @@ export function isThinkingOnlyTerminationByMessages(
  * status.ts on main) — both helpers walk the trailing assistant turn.
  * Once #22 and #24 both merge, consolidate this into session-status.ts.
  */
-export function lastTurnTerminalError(session: {
-  messages?: unknown[];
-}): string | null {
+export function lastTurnTerminalError(
+  session: { messages?: unknown[] },
+  sinceIdx: number = 0,
+): string | null {
   const msgs = (session.messages ?? []) as any[];
-  for (let i = msgs.length - 1; i >= 0; i--) {
+  // R8 finding #2: same boundary as isThinkingOnlyTerminationByMessages
+  // — only inspect assistant messages pushed by the current prompt.
+  // In persistent sessions (TUI / RPC) the prior turn's errorMessage
+  // is still present in `messages` and would mis-surface on a cleanly
+  // extension-handled current turn.
+  for (let i = msgs.length - 1; i >= sinceIdx; i--) {
     const m = msgs[i];
     if (!m) continue;
     if (m.role !== "assistant") continue;
@@ -289,6 +302,7 @@ export function createTurnActivityTracker(
 export function isThinkingOnlyTermination(
   session: { messages?: unknown[] },
   tracker: TurnActivityTracker,
+  sinceIdx: number = 0,
 ): boolean {
   // After rounds R1–R7 the message-shape detector covers every
   // canonical pi-ai shape that ought to retry (thinking-only stops,
@@ -324,7 +338,7 @@ export function isThinkingOnlyTermination(
   // retained for API stability — callers still wire subscribe /
   // unsubscribe around the guard, which is harmless.
   void tracker;
-  return isThinkingOnlyTerminationByMessages(session);
+  return isThinkingOnlyTerminationByMessages(session, sinceIdx);
 }
 
 export interface PromptWithGuardOptions {
@@ -337,6 +351,13 @@ export interface PromptWithGuardOptions {
 export interface PromptWithGuardResult {
   retries: number;
   stillThinkingOnly: boolean;
+  /**
+   * Pre-prompt message index. Pass to `lastTurnTerminalError` so the
+   * terminal-error check only inspects assistant messages produced by
+   * THIS prompt — otherwise a persistent session could surface a prior
+   * turn's error on a cleanly-handled current turn (R8 finding #2).
+   */
+  sinceIdx: number;
 }
 
 /**
@@ -358,12 +379,21 @@ export async function runPromptWithThinkingOnlyGuard(
   const maxRetries = opts.maxRetries ?? THINKING_ONLY_MAX_RETRIES;
   const continuePrompt = opts.continuePrompt ?? THINKING_ONLY_CONTINUE_PROMPT;
 
+  // R8 finding #2 (2026-04-24): snapshot the pre-prompt message index
+  // so the shape detector and lastTurnTerminalError only consider
+  // assistant messages pushed by THIS prompt. Persistent sessions
+  // (TUI, RPC) accumulate history across turns; without this bound
+  // an extension-handled / no-output current turn would inspect the
+  // prior turn's trailing assistant shape and retry against stale
+  // state.
+  const sinceIdx = session.messages?.length ?? 0;
+
   tracker.reset();
   await session.prompt(message);
 
   let retries = 0;
   while (
-    isThinkingOnlyTermination(session, tracker) &&
+    isThinkingOnlyTermination(session, tracker, sinceIdx) &&
     retries < maxRetries
   ) {
     retries++;
@@ -372,9 +402,13 @@ export async function runPromptWithThinkingOnlyGuard(
     await session.prompt(continuePrompt);
   }
 
-  const stillThinkingOnly = isThinkingOnlyTermination(session, tracker);
+  const stillThinkingOnly = isThinkingOnlyTermination(
+    session,
+    tracker,
+    sinceIdx,
+  );
   if (retries > 0 && stillThinkingOnly) {
     opts.onGiveUp?.(maxRetries);
   }
-  return { retries, stillThinkingOnly };
+  return { retries, stillThinkingOnly, sinceIdx };
 }

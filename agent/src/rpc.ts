@@ -295,7 +295,7 @@ export async function startRPCServer(opts: {
           try {
             // Defense in depth against thinking-only terminations. Same guard
             // as cli.ts runJSON — see thinking-only-guard.ts and issue #22.
-            const { retries, stillThinkingOnly } =
+            const { retries, stillThinkingOnly, sinceIdx } =
               await runPromptWithThinkingOnlyGuard(
                 botSession.session,
                 message,
@@ -360,7 +360,10 @@ export async function startRPCServer(opts: {
             // path would send `sendResult(..., {status:"completed",
             // response:""})` and silently return a fake success on
             // auth / quota / context-overflow.
-            const terminalError = lastTurnTerminalError(botSession.session);
+            const terminalError = lastTurnTerminalError(
+              botSession.session,
+              sinceIdx,
+            );
             if (terminalError) {
               chunks.length = 0;
               const errMsg = `Provider error (non-retryable): ${terminalError}`;

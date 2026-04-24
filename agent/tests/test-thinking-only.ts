@@ -970,3 +970,117 @@ describe("lastTurnTerminalError (R8 finding #1)", () => {
     expect(lastTurnTerminalError({ messages: [makeUser("go")] })).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// R8 finding #2 (2026-04-24): scans must be bounded to the current prompt's
+// assistant messages. In persistent sessions (TUI / RPC) the prior turn's
+// shape must not leak into the current turn's retry decision.
+// ---------------------------------------------------------------------------
+
+describe("sinceIdx boundary (R8 finding #2)", () => {
+  it("prior retryable-error turn + current extension-handled prompt → guard does NOT retry", () => {
+    // Persistent-session shape: prior turn ended in a retryable
+    // transport error (never recovered — kept in history), then a
+    // fresh /extension-command prompt resolved without pushing any
+    // new assistant message. Without sinceIdx the scan walks back
+    // into the prior error and retries it.
+    const priorMessages: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "overloaded",
+      }),
+      makeUser("/extension-command"),
+    ];
+    // sinceIdx = priorMessages.length means "only inspect messages
+    // pushed AFTER this point" — simulates snapshot taken before the
+    // second session.prompt() call. Current prompt pushed nothing.
+    const sinceIdx = priorMessages.length;
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: priorMessages }, sinceIdx),
+    ).toBe(false);
+    expect(
+      lastTurnTerminalError({ messages: priorMessages }, sinceIdx),
+    ).toBeNull();
+  });
+
+  it("prior clean turn + current thinking-only stop → guard DOES retry on current turn", () => {
+    // Ensure bounding doesn't break the retry logic when the CURRENT
+    // turn genuinely needs a retry.
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "clean answer" }],
+      }),
+      makeUser("solve this"),
+    ];
+    const sinceIdx = msgs.length;
+    // Current prompt produced a thinking-only turn.
+    msgs.push(
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "hmm..." },
+        ],
+      }),
+    );
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: msgs }, sinceIdx),
+    ).toBe(true);
+  });
+
+  it("fresh session (sinceIdx=0) retains original behavior — thinking-only retries", () => {
+    const msgs: any[] = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "..." }],
+      }),
+    ];
+    // Default sinceIdx=0 — scans full history, equivalent to old behavior.
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+    expect(
+      isThinkingOnlyTerminationByMessages({ messages: msgs }, 0),
+    ).toBe(true);
+  });
+
+  it("prior terminal error + current extension-handled prompt → lastTurnTerminalError returns null", () => {
+    // Otherwise rpc.ts/cli.ts would surface the PRIOR turn's 401 as
+    // if it were the current prompt's failure.
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+      makeUser("/extension-command handled cleanly"),
+    ];
+    const sinceIdx = msgs.length;
+    expect(lastTurnTerminalError({ messages: msgs }, sinceIdx)).toBeNull();
+  });
+
+  it("current-turn terminal error after prior clean turn → lastTurnTerminalError returns it", () => {
+    const msgs: any[] = [
+      makeUser("first prompt"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "ok" }],
+      }),
+      makeUser("second prompt"),
+    ];
+    const sinceIdx = msgs.length;
+    msgs.push(
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    );
+    expect(lastTurnTerminalError({ messages: msgs }, sinceIdx)).toBe(
+      "401 Invalid API key",
+    );
+  });
+});
