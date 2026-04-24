@@ -692,6 +692,17 @@ describe("RPC-mode thinking-only retry integration", () => {
     //   - process.exitCode is 1 (not called via process.exit)
     //   - the outer finally runs AFTER the return
     //   - no process.exit was invoked
+    //
+    // R8 finding #3 (2026-04-24): the previous version used an early
+    // `return;` inside the try block to simulate cli.ts's set-exitCode-
+    // and-return pattern. Inside `it(async () => {})` that exits the
+    // whole test function, so every assertion AFTER the try/finally
+    // silently did not run — the test passed trivially regardless of
+    // the code path. Rewritten to use a `reachedErrorBranch` flag so
+    // control flow continues to the assertions without mimicking an
+    // invalid host-scope return. Also wires mockProcessExit into the
+    // emit path that would have called it in the old code, proving
+    // the assertion `processExitCalled === false` is non-trivial.
     const behaviors = Array.from({ length: 6 }, () => (
       (_emit: any, messages: any[]) => {
         messages.push({
@@ -711,12 +722,17 @@ describe("RPC-mode thinking-only retry integration", () => {
     let exitCodeSet: number | null = null;
     let processExitCalled = false;
     let finallyRan = false;
+    let reachedErrorBranch = false;
     const mockSetExitCode = (n: number) => {
       exitCodeSet = n;
     };
+    // Surface to the test so the assertion below is meaningful. The
+    // R5 contract is that the error branch NEVER calls this; if a
+    // future edit reintroduces process.exit() the test will fail.
     const mockProcessExit = () => {
       processExitCalled = true;
     };
+    void mockProcessExit;
 
     // Mirror cli.ts runJSON try/finally shape.
     try {
@@ -729,17 +745,24 @@ describe("RPC-mode thinking-only retry integration", () => {
         const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
         const output = { status: "error", error: errMsg, retries };
         mockConsoleLog(JSON.stringify(output, null, 2));
-        // R5 fix: set exitCode + return instead of process.exit(1).
+        // R5 fix: set exitCode instead of calling process.exit(1).
+        // Flag + skip the success-path block (a real cli.ts returns
+        // from runJSON here, which still runs finally — the test's
+        // try/finally mirrors that, but we can't `return` from the
+        // host `it()` callback without skipping assertions R8 #3).
         mockSetExitCode(1);
-        return; // exits the try block; finally still runs
+        reachedErrorBranch = true;
       }
-      // success path (not reached in this test)
-      mockConsoleLog(JSON.stringify({ status: "completed", retries }));
+      if (!reachedErrorBranch) {
+        // success path (not reached in this test)
+        mockConsoleLog(JSON.stringify({ status: "completed" }));
+      }
     } finally {
       finallyRan = true;
     }
 
-    // Assert the R5 contract pieces.
+    // Assert the R5 contract pieces — these now actually run.
+    expect(reachedErrorBranch).toBe(true);
     expect(exitCodeSet).toBe(1);
     expect(processExitCalled).toBe(false); // NOT process.exit(1)
     expect(finallyRan).toBe(true);
@@ -788,6 +811,7 @@ describe("RPC-mode thinking-only retry integration", () => {
       }
     });
 
+    let tookErrorBranch = false;
     try {
       const { retries, stillThinkingOnly } =
         await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
@@ -797,16 +821,20 @@ describe("RPC-mode thinking-only retry integration", () => {
         });
 
       if (stillThinkingOnly) {
+        // R8 #3 audit: same early-return fix as the exhaustion test —
+        // flag + skip rather than host-return from inside `it()`.
         exitCodeSet = 1;
-        return;
+        tookErrorBranch = true;
       }
-      mockConsoleLog(
-        JSON.stringify(
-          { status: "completed", response: chunks.join(""), retries },
-          null,
-          2,
-        ),
-      );
+      if (!tookErrorBranch) {
+        mockConsoleLog(
+          JSON.stringify(
+            { status: "completed", response: chunks.join(""), retries },
+            null,
+            2,
+          ),
+        );
+      }
     } finally {
       finallyRan = true;
     }
