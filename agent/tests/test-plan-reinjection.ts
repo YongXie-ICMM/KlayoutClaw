@@ -1319,15 +1319,17 @@ describe("Wiring check: catch blocks roll back the bump (R3 finding #1)", () => 
     const src = stripComments(readFileSync(p, "utf-8"));
     const body = sliceFnBody(src, "function runJSON");
     expect(body.length).toBeGreaterThan(0);
-    // Catch must run AFTER the prompt and contain the decrement.
+    // R5: runJSON now has TWO decrement sites — the post-prompt
+    // lastTurnWasFailure check (before the catch), and the catch block
+    // itself. Both are required. Assert (a) the catch exists and (b) at
+    // least one decrement follows the catch clause.
     const catchIdx = body.indexOf("catch (err: unknown)");
-    const decIdx = body.indexOf(".decrementTurnsSinceExit(");
     expect(catchIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThan(catchIdx);
-    // Exactly one decrement per entrypoint.
+    const afterCatch = body.slice(catchIdx);
+    expect(afterCatch).toContain(".decrementTurnsSinceExit(");
+    // Both sites present.
     const matches = body.match(/\.decrementTurnsSinceExit\(/g) || [];
-    expect(matches.length).toBe(1);
+    expect(matches.length).toBe(2);
   });
 
   it("agent/src/cli.ts runInteractivePlain rl.on('line') catch calls decrementTurnsSinceExit()", () => {
@@ -1335,15 +1337,19 @@ describe("Wiring check: catch blocks roll back the bump (R3 finding #1)", () => 
     const src = stripComments(readFileSync(p, "utf-8"));
     const fnBody = sliceFnBody(src, "function runInteractivePlain");
     expect(fnBody.length).toBeGreaterThan(0);
-    // The decrement must appear AFTER session.prompt( (in the catch path).
+    // R5: two decrement sites — post-prompt check (inside try) + catch.
     const promptIdx = fnBody.indexOf("session.prompt(");
     const decIdx = fnBody.indexOf(".decrementTurnsSinceExit(");
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(decIdx).toBeGreaterThanOrEqual(0);
     expect(decIdx).toBeGreaterThan(promptIdx);
-    // Exactly one decrement on the user-prompt path.
+    // Catch block must also decrement.
+    const catchIdx = fnBody.indexOf("catch (err: unknown)");
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(fnBody.slice(catchIdx)).toContain(".decrementTurnsSinceExit(");
+    // Exactly two decrement sites on the user-prompt path.
     const matches = fnBody.match(/\.decrementTurnsSinceExit\(/g) || [];
-    expect(matches.length).toBe(1);
+    expect(matches.length).toBe(2);
   });
 
   it('agent/src/rpc.ts case "prompt" catch block calls decrementTurnsSinceExit()', () => {
@@ -1352,31 +1358,36 @@ describe("Wiring check: catch blocks roll back the bump (R3 finding #1)", () => 
     const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
     expect(m).toBeTruthy();
     const body = m![0];
+    // R5: two decrement sites — post-prompt check + catch.
     const catchIdx = body.indexOf("catch (err: unknown)");
-    const decIdx = body.indexOf(".decrementTurnsSinceExit(");
     expect(catchIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThan(catchIdx);
+    expect(body.slice(catchIdx)).toContain(".decrementTurnsSinceExit(");
     const matches = body.match(/\.decrementTurnsSinceExit\(/g) || [];
-    expect(matches.length).toBe(1);
+    expect(matches.length).toBe(2);
   });
 
   it("agent/src/tui/components/App.tsx handleSubmit catch calls decrementTurnsSinceExit()", () => {
     const p = resolve(__dirname, "..", "src", "tui", "components", "App.tsx");
     const src = stripComments(readFileSync(p, "utf-8"));
-    // Anchor on the increment then the surrounding catch — App.tsx has
-    // multiple try/catch blocks so we can't slice naïvely. Just assert
-    // the decrement appears at all and after the increment.
+    // R5: two decrement sites — post-prompt check (try body) + catch.
     const incIdx = src.indexOf(".incrementTurnsSinceExit(");
-    const decIdx = src.indexOf(".decrementTurnsSinceExit(");
     expect(incIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThanOrEqual(0);
-    expect(decIdx).toBeGreaterThan(incIdx);
-    // The decrement must live inside a catch block.
-    const before = src.slice(0, decIdx);
-    const lastCatch = before.lastIndexOf("catch");
-    const lastFinally = before.lastIndexOf("finally");
-    expect(lastCatch).toBeGreaterThan(lastFinally); // decrement is in catch, not finally
+    const matches = src.match(/\.decrementTurnsSinceExit\(/g) || [];
+    expect(matches.length).toBe(2);
+    // At least one of the decrements must live inside a catch block.
+    // Find all decrement positions; for each, check the nearest preceding
+    // keyword is "catch" (not "finally", not just "try").
+    const positions: number[] = [];
+    const re = /\.decrementTurnsSinceExit\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(src)) !== null) positions.push(match.index);
+    const anyInCatch = positions.some((pos) => {
+      const before = src.slice(0, pos);
+      const lastCatch = before.lastIndexOf("catch");
+      const lastFinally = before.lastIndexOf("finally");
+      return lastCatch > lastFinally;
+    });
+    expect(anyInCatch).toBe(true);
   });
 });
 
@@ -1790,5 +1801,239 @@ describe("Settings: plan.reinjectionInterval default + override", () => {
     );
     const config = loadConfig(dir) as any;
     expect(config.plan.reinjectionInterval).toBe(0);
+  });
+});
+
+describe("lastTurnWasFailure + cadence rollback on swallowed errors (R5 finding #1)", () => {
+  // R5: pi-coding-agent + pi-ai's anthropic/openai providers catch
+  // provider errors internally, set stopReason="error"/"aborted", and
+  // resolve the promise cleanly — they don't throw. R3 #1's catch-based
+  // rollback misses these. lastTurnWasFailure inspects the trailing
+  // assistant turn so entrypoints can post-check and roll back the
+  // cadence bump.
+
+  it("lastTurnWasFailure returns true when last assistant turn has stopReason='error'", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "", stopReason: "error", errorMessage: "rate_limit" },
+      ],
+    };
+    expect(lastTurnWasFailure(session)).toBe(true);
+  });
+
+  it("lastTurnWasFailure returns true when last assistant turn has stopReason='aborted'", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "partial...", stopReason: "aborted" },
+      ],
+    };
+    expect(lastTurnWasFailure(session)).toBe(true);
+  });
+
+  it("lastTurnWasFailure returns false for a clean stop (stopReason='stop')", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "ok", stopReason: "stop" },
+      ],
+    };
+    expect(lastTurnWasFailure(session)).toBe(false);
+  });
+
+  it("lastTurnWasFailure returns false when there are no assistant messages", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    expect(lastTurnWasFailure({ messages: [] })).toBe(false);
+    expect(lastTurnWasFailure({ messages: [{ role: "user", content: "hi" }] })).toBe(false);
+    expect(lastTurnWasFailure({})).toBe(false);
+  });
+
+  it("lastTurnWasFailure inspects only the TRAILING assistant turn (earlier failures are history)", async () => {
+    // An earlier failed turn is already accounted for by its own rollback.
+    // The helper only cares about the most recent turn — so an old error
+    // followed by a clean turn does NOT trip the check.
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const session = {
+      messages: [
+        { role: "user", content: "q1" },
+        { role: "assistant", content: "", stopReason: "error" },
+        { role: "user", content: "q2" },
+        { role: "assistant", content: "ok", stopReason: "stop" },
+      ],
+    };
+    expect(lastTurnWasFailure(session)).toBe(false);
+  });
+
+  // --- Cadence rollback behavior with swallowed errors ---
+
+  it("swallowed provider error: pre-bump + post-prompt rollback nets 0 change", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const { pm } = await activatePlanAndExit("plan body");
+
+    // Simulate entrypoint: clear latch, pre-bump, prompt resolves cleanly
+    // but pi-coding-agent left a stopReason="error" assistant turn.
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "", stopReason: "error" },
+      ],
+    };
+    // Post-prompt check (as now wired in the 4 entrypoints).
+    if (lastTurnWasFailure(session as any)) {
+      pm.decrementTurnsSinceExit();
+    }
+    expect(pm.turnsSinceExit).toBe(0);
+    expect(pm.remindedThisTurn).toBe(false);
+  });
+
+  it("swallowed aborted: same rollback path", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const { pm } = await activatePlanAndExit("plan body");
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "partial", stopReason: "aborted" },
+      ],
+    };
+    if (lastTurnWasFailure(session as any)) {
+      pm.decrementTurnsSinceExit();
+    }
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("regression: clean stop leaves counter at N (no rollback)", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const { pm } = await activatePlanAndExit("plan body");
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit();
+    const session = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "answer", stopReason: "stop" },
+      ],
+    };
+    if (lastTurnWasFailure(session as any)) {
+      pm.decrementTurnsSinceExit();
+    }
+    expect(pm.turnsSinceExit).toBe(1);
+  });
+
+  it("regression: true throw path still rolls back via catch (no double-decrement)", async () => {
+    // If prompt() actually throws, the catch block runs and decrements.
+    // The post-prompt lastTurnWasFailure check doesn't run (unreachable
+    // inside try{}). The rollback happens exactly once.
+    const { pm } = await activatePlanAndExit("plan body");
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+    // Simulate throw path: catch block only.
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+    // Counter must not underflow below 0 on repeated decrement attempts.
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("cadence integrity: 2 success + 1 swallowed-error + 1 success → counter=3; interval=3 fires on success #3", async () => {
+    const { lastTurnWasFailure } = await import("../src/session-status.js");
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    const runTurn = async (endingStopReason: "stop" | "error") => {
+      pm.clearRemindedThisTurn();
+      pm.incrementTurnsSinceExit();
+      const session = {
+        messages: [
+          { role: "user", content: "q" },
+          { role: "assistant", content: "x", stopReason: endingStopReason },
+        ],
+      };
+      if (lastTurnWasFailure(session as any)) {
+        pm.decrementTurnsSinceExit();
+      }
+    };
+
+    await runTurn("stop"); // success #1 → counter=1
+    expect(pm.turnsSinceExit).toBe(1);
+
+    await runTurn("stop"); // success #2 → counter=2
+    expect(pm.turnsSinceExit).toBe(2);
+
+    await runTurn("error"); // swallowed failure → net 0 → counter stays 2
+    expect(pm.turnsSinceExit).toBe(2);
+
+    await runTurn("stop"); // success #3 → counter=3
+    expect(pm.turnsSinceExit).toBe(3);
+
+    // On this (the third successful) turn, interval=3 must fire.
+    const out = await phase([{ role: "user", content: "q" }] as any);
+    expect(
+      out.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("Wiring check: entrypoints call lastTurnWasFailure after prompt (R5 finding #1)", () => {
+  // Static grep: every user-prompt entrypoint must import and invoke the
+  // lastTurnWasFailure helper so swallowed provider errors roll back the
+  // cadence bump. Without this, the feature drifts the moment a rate-
+  // limit retry exhausts.
+
+  function sliceFnBody(src: string, fnDecl: string): string {
+    const start = src.indexOf(fnDecl);
+    if (start < 0) return "";
+    const after = src.slice(start + fnDecl.length);
+    const nextFnRel = after.search(/\n(?:export\s+)?(?:async\s+)?function\s+/);
+    return nextFnRel >= 0 ? after.slice(0, nextFnRel) : after;
+  }
+
+  it("agent/src/session-status.ts exports lastTurnWasFailure", () => {
+    const p = resolve(__dirname, "..", "src", "session-status.ts");
+    expect(existsSync(p)).toBe(true);
+    const src = readFileSync(p, "utf-8");
+    expect(src).toMatch(/export\s+function\s+lastTurnWasFailure/);
+  });
+
+  it("agent/src/cli.ts imports and calls lastTurnWasFailure in runJSON and runInteractivePlain", () => {
+    const p = resolve(__dirname, "..", "src", "cli.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    expect(src).toMatch(/from\s+["']\.\/session-status(?:\.js)?["']/);
+    // Both entrypoints invoke the helper.
+    expect(sliceFnBody(src, "function runJSON")).toContain("lastTurnWasFailure(");
+    expect(sliceFnBody(src, "function runInteractivePlain")).toContain(
+      "lastTurnWasFailure(",
+    );
+  });
+
+  it("agent/src/rpc.ts imports and calls lastTurnWasFailure on the prompt path", () => {
+    const p = resolve(__dirname, "..", "src", "rpc.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    expect(src).toMatch(/from\s+["']\.\/session-status(?:\.js)?["']/);
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    expect(m).toBeTruthy();
+    expect(m![0]).toContain("lastTurnWasFailure(");
+  });
+
+  it("agent/src/tui/components/App.tsx imports and calls lastTurnWasFailure", () => {
+    const p = resolve(__dirname, "..", "src", "tui", "components", "App.tsx");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    expect(src).toMatch(/from\s+["']\.\.\/\.\.\/session-status(?:\.js)?["']/);
+    expect(src).toContain("lastTurnWasFailure(");
   });
 });

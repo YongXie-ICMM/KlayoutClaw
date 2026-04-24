@@ -26,6 +26,7 @@ import {
   printVerboseStartup,
   subscribePerTurnStats,
 } from "./verbose-helpers.js";
+import { lastTurnWasFailure } from "./session-status.js";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -329,6 +330,15 @@ async function runInteractivePlain(
       botSession.planManager?.clearRemindedThisTurn();
       botSession.planManager?.incrementTurnsSinceExit();
       await botSession.session.prompt(input);
+      // R5 finding #1: pi-coding-agent swallows most provider errors and
+      // resolves the promise with an error assistant turn instead of
+      // throwing. The catch below only fires for true throws (rare — mostly
+      // prompt_too_long after recovery exhaust). Check the trailing
+      // assistant turn's stopReason to catch swallowed failures and roll
+      // back the cadence bump for turns that produced no usable output.
+      if (lastTurnWasFailure(botSession.session)) {
+        botSession.planManager?.decrementTurnsSinceExit();
+      }
     } catch (err: unknown) {
       // R3 finding #1: roll back the pre-prompt bump so failed turns don't
       // inflate the reinjection cadence. Only successful turns count.
@@ -435,6 +445,14 @@ async function runJSON(args: CLIArgs): Promise<void> {
       console.error(
         `[qlaybot] still thinking-only after ${THINKING_ONLY_MAX_RETRIES} retries, giving up`,
       );
+    }
+
+    // R5 finding #1: pi-coding-agent swallows most provider errors and
+    // resolves with an error assistant turn. Check the trailing turn after
+    // the retry loop so a swallowed failure rolls the cadence back instead
+    // of silently inflating it.
+    if (lastTurnWasFailure(botSession.session)) {
+      botSession.planManager?.decrementTurnsSinceExit();
     }
 
     const output = { status: "completed", response: chunks.join("") };

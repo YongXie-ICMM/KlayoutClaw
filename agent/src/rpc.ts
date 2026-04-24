@@ -8,6 +8,7 @@ import { subscribeToSession } from "./events.js";
 import { getTranscriptMarkerEmitter } from "./events/marker-emitter.js";
 import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
+import { lastTurnWasFailure } from "./session-status.js";
 import { createInterface } from "readline";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
@@ -293,6 +294,13 @@ export async function startRPCServer(opts: {
             botSession.planManager?.clearRemindedThisTurn();
             botSession.planManager?.incrementTurnsSinceExit();
             await botSession.session.prompt(message);
+            // R5 finding #1: pi-coding-agent swallows most provider errors
+            // and resolves with an error assistant turn instead of throwing.
+            // Check the trailing turn's stopReason to roll back cadence for
+            // turns that produced no usable output.
+            if (lastTurnWasFailure(botSession.session)) {
+              botSession.planManager?.decrementTurnsSinceExit();
+            }
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
             sendResult(req.id, { status: "completed", response: responseText });

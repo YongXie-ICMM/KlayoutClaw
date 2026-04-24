@@ -21,6 +21,7 @@ import { shouldAutoCompact } from "../auto-compact.js";
 import type { QlayBotSession } from "../../agent.js";
 import { parseCommand } from "../../commands/index.js";
 import type { CommandContext } from "../../commands/index.js";
+import { lastTurnWasFailure } from "../../session-status.js";
 import { listWorkspaceFiles, checkWorkspaceIntegrity } from "../workspace.js";
 import { loadCommandRecency, saveCommandRecency } from "../hooks/useCommandHistory.js";
 import { getConfigDir, getAllMCPServers } from "../../config.js";
@@ -643,6 +644,13 @@ export function App({ botSession }: AppProps) {
         botSession.planManager?.clearRemindedThisTurn();
         botSession.planManager?.incrementTurnsSinceExit();
         await botSession.session.prompt(text);
+        // R5 finding #1: pi-coding-agent swallows most provider errors and
+        // resolves with an error assistant turn instead of throwing. Check
+        // the trailing turn's stopReason to roll back the cadence bump for
+        // turns that produced no usable output.
+        if (lastTurnWasFailure(botSession.session)) {
+          botSession.planManager?.decrementTurnsSinceExit();
+        }
       } catch (err: unknown) {
         // R3 finding #1: roll back the pre-prompt bump so failed turns
         // don't inflate the reinjection cadence. Only successful turns
