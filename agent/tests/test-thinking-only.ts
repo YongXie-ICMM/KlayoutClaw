@@ -30,8 +30,10 @@
 import { describe, it, expect } from "vitest";
 import {
   createTurnActivityTracker,
+  isRetryableErrorMessage,
   isThinkingOnlyTermination,
   isThinkingOnlyTerminationByMessages,
+  lastTurnTerminalError,
 } from "../src/thinking-only-guard.js";
 
 // ---------------------------------------------------------------------------
@@ -829,5 +831,142 @@ describe("isThinkingOnlyTermination (combined)", () => {
     const tracker = createTurnActivityTracker(s);
     expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R8 finding #1 (2026-04-24): non-retryable provider errors must surface as
+// terminal errors, NOT as silent fake-success completions. Exercises
+// `lastTurnTerminalError` at the unit level; the caller-wired-in tests live
+// in test-thinking-only-rpc.ts under the CLI/RPC mock harnesses.
+// ---------------------------------------------------------------------------
+
+describe("lastTurnTerminalError (R8 finding #1)", () => {
+  it("401 auth failure → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "401 Invalid API key",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBe("401 Invalid API key");
+  });
+
+  it("context-overflow (anthropic 'prompt is too long') → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("oversized"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "prompt is too long: 213462 tokens > 200000 maximum",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /prompt is too long/,
+    );
+  });
+
+  it("insufficient_quota → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-openai", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "insufficient_quota: billing issue",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /insufficient_quota/,
+    );
+  });
+
+  it("invalid_request_error → returns the errorMessage", () => {
+    const msgs = [
+      makeUser("malformed"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: messages.0.content: field required",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toMatch(
+      /invalid_request_error/,
+    );
+  });
+
+  it("refusal (stopReason=error, no errorMessage, text preserved) → null", () => {
+    // Refusals are a legitimate success path — no terminal-error
+    // surface. The text content is the caller's response.
+    const msgs = [
+      makeUser("policy-violating"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [{ type: "text", text: "I can't help with that." }],
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("retryable 429 rate-limit → null (caller already retried)", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"overloaded"}}',
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("retryable 502 upstream → null", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "502 Bad Gateway",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("clean success (stopReason=stop) → null", () => {
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [{ type: "text", text: "hello" }],
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBeNull();
+  });
+
+  it("aborted with errorMessage → returns message (not retryable, surface it)", () => {
+    // An aborted turn that also carries a non-retryable errorMessage
+    // (e.g. user pressed escape during a long request with a
+    // malformed body). Surface it rather than silently ignoring.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "aborted",
+        content: [],
+        errorMessage: "Request was aborted",
+      }),
+    ];
+    // "Request was aborted" doesn't match RETRYABLE_ERROR_PATTERN, so
+    // it surfaces as terminal. If pi-coding-agent's regex ever covers
+    // this phrase, the helper will flip to null — that is acceptable.
+    expect(isRetryableErrorMessage("Request was aborted")).toBe(false);
+    expect(lastTurnTerminalError({ messages: msgs })).toBe("Request was aborted");
+  });
+
+  it("no assistant message at all → null", () => {
+    expect(lastTurnTerminalError({ messages: [makeUser("go")] })).toBeNull();
   });
 });

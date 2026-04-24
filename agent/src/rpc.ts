@@ -10,6 +10,7 @@ import type { TranscriptMarker } from "./events/marker-types.js";
 import { parseCommand, type CommandContext } from "./commands/index.js";
 import {
   createTurnActivityTracker,
+  lastTurnTerminalError,
   runPromptWithThinkingOnlyGuard,
   THINKING_ONLY_MAX_RETRIES,
 } from "./thinking-only-guard.js";
@@ -348,6 +349,21 @@ export async function startRPCServer(opts: {
                 final: true,
               });
               const errMsg = `Retries exhausted after ${retries} attempts — upstream unresponsive or error is non-retryable.`;
+              botSession.history.recordError(errMsg);
+              sendEvent("error", { message: errMsg });
+              sendError(req.id, -32000, errMsg);
+              break;
+            }
+
+            // R8 finding #1 (2026-04-24): same non-retryable provider
+            // error check as cli.ts runJSON. Without this the success
+            // path would send `sendResult(..., {status:"completed",
+            // response:""})` and silently return a fake success on
+            // auth / quota / context-overflow.
+            const terminalError = lastTurnTerminalError(botSession.session);
+            if (terminalError) {
+              chunks.length = 0;
+              const errMsg = `Provider error (non-retryable): ${terminalError}`;
               botSession.history.recordError(errMsg);
               sendEvent("error", { message: errMsg });
               sendError(req.id, -32000, errMsg);

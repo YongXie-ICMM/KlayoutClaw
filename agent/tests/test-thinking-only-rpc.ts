@@ -11,6 +11,7 @@
 import { describe, it, expect } from "vitest";
 import {
   createTurnActivityTracker,
+  lastTurnTerminalError,
   runPromptWithThinkingOnlyGuard,
   THINKING_ONLY_CONTINUE_PROMPT,
 } from "../src/thinking-only-guard.js";
@@ -822,5 +823,333 @@ describe("RPC-mode thinking-only retry integration", () => {
 
     tracker.unsubscribe();
     unsub();
+  });
+
+  // ---------------------------------------------------------------------------
+  // R8 finding #1 (2026-04-24): caller-wired terminal-error path. Verifies
+  // both CLI and RPC shapes emit status=error / sendError rather than silently
+  // returning an empty `status:"completed"` on non-retryable provider errors.
+  // ---------------------------------------------------------------------------
+
+  it("R8 CLI: 401 auth failure → status=error, exitCode=1, no response field", async () => {
+    const session = createMockSession([
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "401 Invalid API key",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const stdoutWrites: string[] = [];
+    const mockConsoleLog = (s: string) => stdoutWrites.push(s);
+    let exitCodeSet: number | null = null;
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+
+    // Mirror cli.ts runJSON with the new lastTurnTerminalError check.
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    let emitted = false;
+    if (stillThinkingOnly) {
+      exitCodeSet = 1;
+      mockConsoleLog(JSON.stringify({ status: "error", retries }));
+      emitted = true;
+    } else {
+      const terminalError = lastTurnTerminalError(session);
+      if (terminalError) {
+        chunks.length = 0;
+        exitCodeSet = 1;
+        mockConsoleLog(
+          JSON.stringify({
+            status: "error",
+            error: `Provider error (non-retryable): ${terminalError}`,
+            retries,
+          }),
+        );
+        emitted = true;
+      } else {
+        mockConsoleLog(
+          JSON.stringify({
+            status: "completed",
+            response: chunks.join(""),
+            retries,
+          }),
+        );
+      }
+    }
+
+    expect(emitted).toBe(true);
+    expect(stillThinkingOnly).toBe(false); // non-retryable is NOT thinking-only
+    expect(retries).toBe(0);
+    expect(exitCodeSet).toBe(1);
+    expect(stdoutWrites.length).toBe(1);
+    const parsed = JSON.parse(stdoutWrites[0]);
+    expect(parsed.status).toBe("error");
+    expect(parsed.error).toMatch(/Provider error.*401 Invalid API key/);
+    expect(parsed.retries).toBe(0);
+    expect(parsed.response).toBeUndefined();
+
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("R8 CLI: context-overflow (prompt_too_long) → status=error", async () => {
+    const session = createMockSession([
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const stdoutWrites: string[] = [];
+    const mockConsoleLog = (s: string) => stdoutWrites.push(s);
+
+    const { stillThinkingOnly } = await runPromptWithThinkingOnlyGuard(
+      session,
+      "go",
+      tracker,
+      { onRetry: () => {} },
+    );
+    expect(stillThinkingOnly).toBe(false);
+
+    const terminalError = lastTurnTerminalError(session);
+    expect(terminalError).toMatch(/prompt is too long/);
+    mockConsoleLog(
+      JSON.stringify({
+        status: "error",
+        error: `Provider error (non-retryable): ${terminalError}`,
+      }),
+    );
+
+    const parsed = JSON.parse(stdoutWrites[0]);
+    expect(parsed.status).toBe("error");
+    expect(parsed.error).toMatch(/prompt is too long/);
+
+    tracker.unsubscribe();
+  });
+
+  it("R8 CLI: quota_exceeded → status=error", async () => {
+    const session = createMockSession([
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "insufficient_quota: billing cap reached",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+
+    const { stillThinkingOnly } = await runPromptWithThinkingOnlyGuard(
+      session,
+      "go",
+      tracker,
+      { onRetry: () => {} },
+    );
+    expect(stillThinkingOnly).toBe(false);
+    expect(lastTurnTerminalError(session)).toMatch(/insufficient_quota/);
+    tracker.unsubscribe();
+  });
+
+  it("R8 RPC: 401 auth failure → sendError called, sendResult NOT called, error event emitted", async () => {
+    const session = createMockSession([
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "401 Invalid API key",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const sentEvents: Array<{ name: string; params: any }> = [];
+    const sendEvent = (name: string, params: any) =>
+      sentEvents.push({ name, params });
+    let sendResultCalled: any = null;
+    let sendErrorCalled: any = null;
+    const sendResult = (id: number, body: any) => {
+      sendResultCalled = { id, body };
+    };
+    const sendError = (id: number, code: number, msg: string) => {
+      sendErrorCalled = { id, code, msg };
+    };
+    const chunks: string[] = [];
+
+    // Mirror rpc.ts prompt handler with the new lastTurnTerminalError check.
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    if (stillThinkingOnly) {
+      const errMsg = `Retries exhausted after ${retries} attempts`;
+      sendEvent("error", { message: errMsg });
+      sendError(1, -32000, errMsg);
+    } else {
+      const terminalError = lastTurnTerminalError(session);
+      if (terminalError) {
+        chunks.length = 0;
+        const errMsg = `Provider error (non-retryable): ${terminalError}`;
+        sendEvent("error", { message: errMsg });
+        sendError(1, -32000, errMsg);
+      } else {
+        sendResult(1, {
+          status: "completed",
+          response: chunks.join(""),
+          retries,
+        });
+      }
+    }
+
+    expect(stillThinkingOnly).toBe(false);
+    expect(sendResultCalled).toBeNull();
+    expect(sendErrorCalled).not.toBeNull();
+    expect(sendErrorCalled.code).toBe(-32000);
+    expect(sendErrorCalled.msg).toMatch(
+      /Provider error.*401 Invalid API key/,
+    );
+    expect(sentEvents.some((e) => e.name === "error")).toBe(true);
+    tracker.unsubscribe();
+  });
+
+  it("R8 regression: refusal (error + no errorMessage + text content) → success path", async () => {
+    const session = createMockSession([
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            delta: "I can't help with that.",
+          },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "I can't help with that." }],
+          stopReason: "error",
+          // No errorMessage — refusal path.
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    expect(stillThinkingOnly).toBe(false);
+    expect(retries).toBe(0);
+    expect(lastTurnTerminalError(session)).toBeNull();
+    expect(chunks.join("")).toBe("I can't help with that.");
+
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("R8 regression: retryable-error-then-recovery → success with retries>0", async () => {
+    const session = createMockSession([
+      (_emit, messages) => {
+        messages.push({
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "overloaded",
+        });
+      },
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "recovered" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "recovered" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const chunks: string[] = [];
+    const unsub = session.subscribe((ev: any) => {
+      if (
+        ev.type === "message_update" &&
+        ev.assistantMessageEvent?.type === "text_delta"
+      ) {
+        chunks.push(ev.assistantMessageEvent.delta);
+      }
+    });
+
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {
+          chunks.length = 0;
+        },
+      });
+
+    expect(stillThinkingOnly).toBe(false);
+    expect(retries).toBe(1);
+    expect(lastTurnTerminalError(session)).toBeNull();
+    expect(chunks.join("")).toBe("recovered");
+    tracker.unsubscribe();
+    unsub();
+  });
+
+  it("R8 regression: clean success → success path, no terminal error", async () => {
+    const session = createMockSession([
+      (emit, messages) => {
+        emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "hello" },
+        });
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "hello" }],
+          stopReason: "stop",
+        });
+      },
+    ]);
+    const tracker = createTurnActivityTracker(session);
+    const { retries, stillThinkingOnly } =
+      await runPromptWithThinkingOnlyGuard(session, "go", tracker, {
+        onRetry: () => {},
+      });
+    expect(stillThinkingOnly).toBe(false);
+    expect(retries).toBe(0);
+    expect(lastTurnTerminalError(session)).toBeNull();
+    tracker.unsubscribe();
   });
 });

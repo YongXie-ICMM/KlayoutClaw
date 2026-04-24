@@ -47,6 +47,16 @@ export const THINKING_ONLY_MAX_RETRIES = 5;
 const RETRYABLE_ERROR_PATTERN =
   /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
 
+/**
+ * Whether an errorMessage looks retryable per pi-coding-agent's
+ * `_isRetryableError`. Context-overflow is NOT considered retryable
+ * here — callers that want both checks should additionally consult
+ * `isContextOverflow`.
+ */
+export function isRetryableErrorMessage(em: string): boolean {
+  return RETRYABLE_ERROR_PATTERN.test(em);
+}
+
 export const THINKING_ONLY_CONTINUE_PROMPT =
   "Continue. You stopped mid-task after a thinking block — keep working.";
 
@@ -139,8 +149,12 @@ export function isThinkingOnlyTerminationByMessages(
     // Only retry errors pi-coding-agent considers retryable. Auth
     // failures, invalid_request_error, insufficient_quota, etc. are
     // surfaced as-is so the caller sees the real error instead of
-    // burning through 5 `Continue...` prompts.
-    if (!RETRYABLE_ERROR_PATTERN.test(em)) {
+    // burning through 5 `Continue...` prompts. Callers use
+    // `lastTurnTerminalError` to distinguish this non-retryable path
+    // from a true success and surface it as status=error. (R3 #1
+    // excluded these from retry; R8 #1 added the separate terminal-
+    // error signal.)
+    if (!isRetryableErrorMessage(em)) {
       return false;
     }
     return true;
@@ -191,6 +205,50 @@ export function isThinkingOnlyTerminationByMessages(
     return false;
   });
   return hasThinking;
+}
+
+/**
+ * Returns the errorMessage of the last assistant turn iff that turn
+ * ended with a non-retryable provider error; null otherwise. Callers
+ * use this AFTER `runPromptWithThinkingOnlyGuard` has finished to
+ * distinguish:
+ *
+ *   (1) `shouldRetry` cases the guard retried: thinking-only,
+ *       aborted, retryable transport errors — these either recover
+ *       (normal success) or hit maxRetries (`stillThinkingOnly`).
+ *   (2) non-retryable terminal errors: 401 / invalid_api_key,
+ *       context-overflow (`prompt_too_long`, `exceeds the context
+ *       window`, …), `invalid_request_error`, `insufficient_quota`,
+ *       unknown 4xx, etc. These are NOT retried and NOT
+ *       thinking-only — `isThinkingOnlyTermination` returns false,
+ *       so callers that only branch on `stillThinkingOnly` would
+ *       fall through to the success path and emit
+ *       `status: "completed"` with an empty response. That is the
+ *       original ml09/ml11 silent-failure pattern in a different
+ *       shape (R8 finding #1, 2026-04-24).
+ *   (3) refusals: `stopReason="error"` with no `errorMessage`, text
+ *       content preserved from the provider. Those are a legitimate
+ *       success and this helper returns null.
+ *
+ * Mirror of issue #24's `lastTurnWasFailure` (agent/src/session-
+ * status.ts on main) — both helpers walk the trailing assistant turn.
+ * Once #22 and #24 both merge, consolidate this into session-status.ts.
+ */
+export function lastTurnTerminalError(session: {
+  messages?: unknown[];
+}): string | null {
+  const msgs = (session.messages ?? []) as any[];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m) continue;
+    if (m.role !== "assistant") continue;
+    if (m.stopReason !== "error" && m.stopReason !== "aborted") return null;
+    const em = typeof m.errorMessage === "string" ? m.errorMessage : "";
+    if (em.length === 0) return null; // refusal with preserved content
+    if (isRetryableErrorMessage(em)) return null; // caller already retried
+    return em; // non-retryable terminal error
+  }
+  return null;
 }
 
 /**

@@ -29,6 +29,7 @@ import {
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import {
   createTurnActivityTracker,
+  lastTurnTerminalError,
   runPromptWithThinkingOnlyGuard,
 } from "./thinking-only-guard.js";
 
@@ -396,6 +397,26 @@ async function runJSON(args: CLIArgs): Promise<void> {
       chunks.length = 0;
       const errMsg = `Session stopped producing output after ${retries} retry attempts — upstream may be failing, rate-limited, or the error is non-retryable.`;
       const output = { status: "error", error: errMsg, retries };
+      console.log(JSON.stringify(output, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+
+    // R8 finding #1 (2026-04-24): non-retryable provider errors
+    // (401 / invalid_api_key, context-overflow, invalid_request_error,
+    // insufficient_quota, unknown 4xx) are deliberately excluded from
+    // the retry loop (R3 #1). Without this check the success path
+    // would emit `{status:"completed", response:""}` — the original
+    // ml09/ml11 silent-failure pattern in a different shape. Surface
+    // the provider error instead.
+    const terminalError = lastTurnTerminalError(botSession.session);
+    if (terminalError) {
+      chunks.length = 0;
+      const output = {
+        status: "error",
+        error: `Provider error (non-retryable): ${terminalError}`,
+        retries,
+      };
       console.log(JSON.stringify(output, null, 2));
       process.exitCode = 1;
       return;
