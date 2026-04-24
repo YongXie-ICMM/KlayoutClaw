@@ -84,29 +84,30 @@ export function isThinkingOnlyTerminationByMessages(
   // pi-ai's provider normalization:
   //
   //   - Transport / rate-limit / catch-block errors: anthropic.js:318
-  //     and openai-completions.js:257 set `errorMessage` and leave
-  //     `content: []` (the ml09/ml11 shape — 429 rate-limits).
+  //     and openai-completions.js:257 set `errorMessage` AND stopReason
+  //     ="error" together. `content` may be empty (ml09/ml11 429s that
+  //     die before any text streamed) OR contain partial text (mid-
+  //     stream disconnect after 30s of streaming — the signature that
+  //     broke R1's `!hasAnyText` gate).
   //   - Deliberate provider refusals / safety filters: anthropic.js:689
   //     ("refusal"), :695 ("sensitive"), openai-completions.js:646
   //     ("content_filter"). These pass through the normal stream path
-  //     so any refusal text emitted before the stop is preserved in
-  //     `content`, and `errorMessage` is NOT set.
+  //     with `mapStopReason` setting `stopReason="error"` but `error
+  //     Message` is NOT set (only the catch block sets it).
   //
-  // Retrying a refusal up to 5 times wastes requests and can replace a
-  // clean refusal with nonsensical follow-up text. Only retry when the
-  // error has no preserved content — that is the transport-error
-  // signature.
+  // `errorMessage` (pi-ai AssistantMessage.errorMessage, types.d.ts:120)
+  // is the definitive signal. Gate retry on its presence, not on
+  // content shape — see R2 finding #1 (2026-04-24).
   if (last.stopReason === "error") {
-    const content = Array.isArray(last.content) ? last.content : [];
-    const hasAnyText = content.some(
-      (c: any) =>
-        c?.type === "text" &&
-        typeof c.text === "string" &&
-        c.text.trim().length > 0,
-    );
-    // No text content → transport/rate-limit pattern → retry.
-    // Has text content → refusal-like → do NOT retry, preserve the stop.
-    return !hasAnyText;
+    if (
+      typeof last.errorMessage === "string" &&
+      last.errorMessage.length > 0
+    ) {
+      return true;
+    }
+    // No errorMessage: refusal / content_filter (preserve), or the
+    // rare refusal-with-suppressed-text case. Either way, don't retry.
+    return false;
   }
 
   // Stalled tool-use: the model emitted a tool call but the loop never

@@ -203,11 +203,11 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
   });
 
   it("refusal with content text (stopReason=error + 'I can't help') → false", () => {
-    // Finding #3 (2026-04-23). pi-ai collapses anthropic "refusal"/
-    // "sensitive" and openai "content_filter" into stopReason="error".
-    // Transport errors leave content=[] and set errorMessage; refusals
-    // preserve the refusal text in content. Only retry when content
-    // has no text.
+    // R2 finding #1 (2026-04-24): the definitive refusal signal is
+    // ABSENCE of `errorMessage`, not content-shape. pi-ai's
+    // mapStopReason paths (anthropic "refusal"/"sensitive", openai
+    // "content_filter") set stopReason="error" but never touch
+    // errorMessage — only the provider catch block does.
     const msgs = [
       makeUser("do something policy-violating"),
       makeAssistant("custom-anthropic", {
@@ -220,8 +220,7 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
 
   it("content-filter (stopReason=error + refusal + thinking) → false", () => {
     // openai-completions content_filter: thinking block may still be
-    // present alongside the refusal text. The refusal text is the
-    // signal we should honour.
+    // present alongside the refusal text. No errorMessage → no retry.
     const msgs = [
       makeUser("banned request"),
       makeAssistant("custom-openai", {
@@ -230,6 +229,40 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
           { type: "thinking", thinking: "Considering policy..." },
           { type: "text", text: "I won't do that." },
         ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R2: mid-stream transport error (stopReason=error + errorMessage + partial text) → true", () => {
+    // The regression R1's !hasAnyText gate introduced. A transport
+    // error that strikes AFTER some text streamed leaves partial text
+    // AND errorMessage on the final assistant message — pi-ai's
+    // catch block (anthropic.js:318, openai-completions.js:257) sets
+    // both. The previous gate classified this as a refusal and
+    // silently returned the truncated answer.
+    const msgs = [
+      makeUser("write a long essay"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [
+          { type: "text", text: "Once upon a time there was a long-running..." },
+        ],
+        errorMessage: "Connection reset by peer",
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+  });
+
+  it("R2: error with no errorMessage and empty content → false (refusal-with-suppressed-text)", () => {
+    // Rare: stopReason="error" with neither errorMessage nor any
+    // preserved text. Treat as refusal-like — the SDK chose to end
+    // the turn deliberately, so preserve the stop rather than loop.
+    const msgs = [
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
       }),
     ];
     expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
