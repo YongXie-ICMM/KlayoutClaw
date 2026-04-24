@@ -169,6 +169,41 @@ describe("PlanManager: reinjection support", () => {
     expect(pm.turnsSinceExit).toBe(3);
   });
 
+  // R4 finding #1 (2026-04-24): per-user-turn latch on the reinjector.
+  it("remindedThisTurn defaults to false, mark/clear toggle it", async () => {
+    const { pm } = await activatePlanAndExit("step 1");
+    expect(pm.remindedThisTurn).toBe(false);
+    pm.markRemindedThisTurn();
+    expect(pm.remindedThisTurn).toBe(true);
+    pm.clearRemindedThisTurn();
+    expect(pm.remindedThisTurn).toBe(false);
+  });
+
+  it("activating a new plan resets remindedThisTurn to false", async () => {
+    const { pm } = await activatePlanAndExit("step 1");
+    pm.markRemindedThisTurn();
+    expect(pm.remindedThisTurn).toBe(true);
+    const p2 = pm.enterPlanMode("Second plan");
+    expect(p2).not.toBeNull();
+    // _activatePlan is the reset point for all per-plan state.
+    expect(pm.remindedThisTurn).toBe(false);
+  });
+
+  it("decrementTurnsSinceExit clears remindedThisTurn (R4 rollback symmetry)", async () => {
+    // R4 #1: if the prompt fails after the reinjector set the latch, the
+    // next successful turn should be free to re-inject. The entrypoint's
+    // start-of-turn clear covers this too, but decrement also clears so
+    // counter + latch invariants stay symmetric (both roll back together).
+    const { pm } = await activatePlanAndExit("step 1");
+    pm.incrementTurnsSinceExit();
+    pm.markRemindedThisTurn();
+    expect(pm.turnsSinceExit).toBe(1);
+    expect(pm.remindedThisTurn).toBe(true);
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+    expect(pm.remindedThisTurn).toBe(false);
+  });
+
   it("markVerified sets verificationCompleted and emits plan_verified event", async () => {
     const { pm } = await activatePlanAndExit("body");
     const events: any[] = [];
@@ -384,6 +419,12 @@ describe("createPlanReinjector: cadence (interval=3)", () => {
     };
 
     for (let turn = 1; turn <= 9; turn++) {
+      // R4 #1: the entrypoint clears the per-turn latch at the start of
+      // each user turn, paired with incrementTurnsSinceExit. Simulate
+      // that contract here so the cadence test covers multi-turn
+      // behavior (without this clear, after turn 3 fires the latch would
+      // block subsequent eligible turns).
+      pm.clearRemindedThisTurn();
       pm.incrementTurnsSinceExit();
       expect(pm.turnsSinceExit).toBe(turn);
       const msgs = [{ role: "user", content: `prompt-${turn}` }];
@@ -406,15 +447,126 @@ describe("createPlanReinjector: cadence (interval=3)", () => {
     const { pm } = await activatePlanAndExit("plan");
     const phase = createPlanReinjector(pm, { interval: 10 });
     for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    // turn 3: interval=10 → not eligible. Latch stays clear.
     let out = await phase([{ role: "user", content: "x" }] as any);
     expect(out.length).toBe(1);
+    expect(pm.remindedThisTurn).toBe(false);
 
     for (let i = 3; i < 10; i++) pm.incrementTurnsSinceExit();
     expect(pm.turnsSinceExit).toBe(10);
+    // Simulate the entrypoint's start-of-turn latch clear (R4 #1) —
+    // turn 10 is a fresh user turn; the single-file test here doesn't
+    // model per-turn boundaries otherwise.
+    pm.clearRemindedThisTurn();
     out = await phase([{ role: "user", content: "x" }] as any);
     expect(out.length).toBe(2);
     // Reminder at index 0 (before the terminal user message at index 1).
     expect((out[0].content as string)).toContain(PLAN_REINJECTION_OPEN);
+  });
+});
+
+describe("createPlanReinjector: per-turn latch (R4 finding #1)", () => {
+  // transformContext runs on EVERY provider round-trip, not just once
+  // per user turn. Without the latch, a tool-heavy reminder turn re-
+  // injects the full plan blob on every round-trip, which both multiplies
+  // billed context tokens and risks prompt_too_long failures on the
+  // reminder turn itself. The latch short-circuits subsequent calls
+  // within the same turn.
+
+  it("fires ONCE per user turn: 5 round-trips → 1 injection, 4 skips", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("# plan\nstep 1\nstep 2");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    // Entrypoint has already run for this "turn" — clear + increment.
+    pm.clearRemindedThisTurn();
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(3);
+
+    const containsReminder = (out: any[]) =>
+      out.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      );
+
+    // Round-trip 1: injects.
+    const out1 = await phase([{ role: "user", content: "q" }] as any);
+    expect(containsReminder(out1)).toBe(true);
+    expect(pm.remindedThisTurn).toBe(true);
+
+    // Round-trips 2-5 (simulated): same turn, same counter, latch set.
+    // transformContext is called again per round-trip; must NOT re-inject.
+    for (let i = 0; i < 4; i++) {
+      const out = await phase([{ role: "user", content: "q" }] as any);
+      expect(containsReminder(out)).toBe(false);
+    }
+  });
+
+  it("new user turn clears the latch → next eligible turn fires again", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    const containsReminder = (out: any[]) =>
+      out.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      );
+
+    // Turn 3: entrypoint clear + increment, phase fires.
+    pm.clearRemindedThisTurn();
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(true);
+    expect(pm.remindedThisTurn).toBe(true);
+
+    // Turns 4, 5: not eligible; phase called anyway (multiple round-trips
+    // per turn); latch doesn't matter for a non-eligible turn but
+    // entrypoint still clears it at each turn boundary.
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit(); // turn 4
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(false);
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit(); // turn 5
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(false);
+
+    // Turn 6: eligible again. Fresh turn → latch clear → fires.
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(6);
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(true);
+  });
+
+  it("failed turn: decrement clears the latch so next successful turn re-fires", async () => {
+    // R3 #1 + R4 #1 interaction: if the prompt fails after the reinjector
+    // set the latch, both counter and latch must roll back together so
+    // the next successful turn re-injects.
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    const containsReminder = (out: any[]) =>
+      out.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      );
+
+    // Turn 3 fires but prompt FAILS after injection.
+    pm.clearRemindedThisTurn();
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(true);
+    expect(pm.remindedThisTurn).toBe(true);
+    pm.decrementTurnsSinceExit(); // catch path: rolls counter AND latch
+    expect(pm.turnsSinceExit).toBe(2);
+    expect(pm.remindedThisTurn).toBe(false);
+
+    // Retry: the user re-prompts. Fresh turn: clear + increment → turn 3 again.
+    pm.clearRemindedThisTurn();
+    pm.incrementTurnsSinceExit(); // turn 3
+    expect(pm.turnsSinceExit).toBe(3);
+    expect(containsReminder(await phase([{ role: "user", content: "q" }] as any))).toBe(true);
   });
 });
 
@@ -987,6 +1139,64 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     // Exactly-once inside the `case "prompt"` block.
     const matches = body.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
+  });
+});
+
+describe("Wiring check: entrypoints clear remindedThisTurn latch (R4 finding #1)", () => {
+  // Each user-prompt entrypoint must call clearRemindedThisTurn() before
+  // session.prompt(), so the reinjector can fire at most once per user
+  // turn across all provider round-trips.
+  function sliceFnBody(src: string, fnDecl: string): string {
+    const start = src.indexOf(fnDecl);
+    if (start < 0) return "";
+    const after = src.slice(start + fnDecl.length);
+    const nextFnRel = after.search(/\n(?:export\s+)?(?:async\s+)?function\s+/);
+    return nextFnRel >= 0 ? after.slice(0, nextFnRel) : after;
+  }
+
+  it("agent/src/cli.ts runJSON clears latch BEFORE session.prompt(", () => {
+    const p = resolve(__dirname, "..", "src", "cli.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const body = sliceFnBody(src, "function runJSON");
+    const clearIdx = body.indexOf(".clearRemindedThisTurn(");
+    const primaryIdx = body.indexOf(".prompt(args.message)");
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(primaryIdx).toBeGreaterThanOrEqual(0);
+    expect(clearIdx).toBeLessThan(primaryIdx);
+  });
+
+  it("agent/src/cli.ts runInteractivePlain clears latch BEFORE session.prompt(", () => {
+    const p = resolve(__dirname, "..", "src", "cli.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const fnBody = sliceFnBody(src, "function runInteractivePlain");
+    const clearIdx = fnBody.indexOf(".clearRemindedThisTurn(");
+    const promptIdx = fnBody.indexOf("session.prompt(");
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(clearIdx).toBeLessThan(promptIdx);
+  });
+
+  it('agent/src/rpc.ts case "prompt" clears latch BEFORE session.prompt(', () => {
+    const p = resolve(__dirname, "..", "src", "rpc.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    expect(m).toBeTruthy();
+    const body = m![0];
+    const clearIdx = body.indexOf(".clearRemindedThisTurn(");
+    const promptIdx = body.indexOf("session.prompt(");
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(clearIdx).toBeLessThan(promptIdx);
+  });
+
+  it("agent/src/tui/components/App.tsx handleSubmit clears latch BEFORE session.prompt(", () => {
+    const p = resolve(__dirname, "..", "src", "tui", "components", "App.tsx");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const clearIdx = src.indexOf(".clearRemindedThisTurn(");
+    const promptIdx = src.indexOf("session.prompt(");
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(clearIdx).toBeLessThan(promptIdx);
   });
 });
 

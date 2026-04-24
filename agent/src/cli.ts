@@ -324,6 +324,9 @@ async function runInteractivePlain(
       botSession.history.recordPrompt(input);
       // Bump BEFORE prompt so transformContext (running inside prompt) sees
       // the correct turn number. R2 fix: was after, causing off-by-one.
+      // R4 #1: clear the per-turn latch so the reinjector can fire at
+      // most ONCE per user turn across all round-trips.
+      botSession.planManager?.clearRemindedThisTurn();
       botSession.planManager?.incrementTurnsSinceExit();
       await botSession.session.prompt(input);
     } catch (err: unknown) {
@@ -408,6 +411,9 @@ async function runJSON(args: CLIArgs): Promise<void> {
     // Bump BEFORE prompt so transformContext sees the correct turn number.
     // Placed outside the thinking-only retry loop: one user turn = one bump.
     // R2 fix: was after, causing off-by-one.
+    // R4 #1: clear the per-turn reinjection latch so the plan blob is
+    // injected at most ONCE per user turn across all round-trips.
+    botSession.planManager?.clearRemindedThisTurn();
     botSession.planManager?.incrementTurnsSinceExit();
     await botSession.session.prompt(args.message);
 

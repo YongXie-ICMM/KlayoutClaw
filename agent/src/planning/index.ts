@@ -57,6 +57,21 @@ export class PlanManager {
    * exit-turn itself doesn't count as post-exit turn 1. Reset on activate.
    */
   private _exitedInThisTurn = false;
+  /**
+   * R4 finding #1 (2026-04-24): per-user-turn latch for the reinjector.
+   * `transformContext` runs on EVERY provider round-trip, not just once
+   * per user turn. Without this latch a tool-heavy reminder turn re-bills
+   * the full plan blob on every round-trip (15 tool calls → 15 plan
+   * injections), which both multiplies cost and risks prompt_too_long
+   * non-retryable failures on the reminder turn itself.
+   *
+   * Lifecycle: set by the reinjector the first time it injects in a
+   * turn; cleared at the start of each user turn (paired with
+   * `incrementTurnsSinceExit`); also cleared on prompt failure via
+   * `decrementTurnsSinceExit` so a failed turn doesn't suppress the next
+   * successful turn's reminder.
+   */
+  private _remindedThisTurn = false;
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
@@ -106,6 +121,18 @@ export class PlanManager {
     return this._verificationCompleted;
   }
 
+  get remindedThisTurn(): boolean {
+    return this._remindedThisTurn;
+  }
+
+  markRemindedThisTurn(): void {
+    this._remindedThisTurn = true;
+  }
+
+  clearRemindedThisTurn(): void {
+    this._remindedThisTurn = false;
+  }
+
   incrementTurnsSinceExit(): void {
     if (!this._currentPlan || this._inPlanMode) return;
     if (this._exitedInThisTurn) {
@@ -127,10 +154,17 @@ export class PlanManager {
    * cadence. Symmetric with `incrementTurnsSinceExit` — same gates, but
    * does NOT touch the exit-turn-swallow flag (`consumeExitSwallow` owns
    * that one-shot independently).
+   *
+   * R4 finding #1: also clears the per-turn "reminded" latch. If this
+   * turn's reinjector fired but the prompt failed, the next successful
+   * turn should be free to re-inject. The entrypoint's start-of-turn
+   * clear would do it anyway, but doing it here keeps the counter /
+   * latch invariants symmetric (both roll back on failure).
    */
   decrementTurnsSinceExit(): void {
     if (!this._currentPlan || this._inPlanMode) return;
     if (this._turnsSinceExit > 0) this._turnsSinceExit--;
+    this._remindedThisTurn = false;
   }
 
   markVerified(): void {
@@ -358,6 +392,7 @@ export class PlanManager {
     this._turnsSinceExit = 0;
     this._verificationCompleted = false;
     this._exitedInThisTurn = false;
+    this._remindedThisTurn = false;
     this.capturePrePlanMode();
     this._stateMachine?.setState(this._sessionKey, "plan_drafting");
     this._emit({

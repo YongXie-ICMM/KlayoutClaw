@@ -638,6 +638,9 @@ export function App({ botSession }: AppProps) {
       try {
         // Bump BEFORE prompt so transformContext sees the correct turn number.
         // R2 fix: was after, causing off-by-one.
+        // R4 #1: clear the per-turn reinjection latch so the plan blob is
+        // injected at most ONCE per user turn across all round-trips.
+        botSession.planManager?.clearRemindedThisTurn();
         botSession.planManager?.incrementTurnsSinceExit();
         await botSession.session.prompt(text);
       } catch (err: unknown) {

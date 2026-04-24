@@ -39,6 +39,14 @@ export function createPlanReinjector(
     if (planManager.inPlanMode) return messages;
     if (planManager.verificationCompleted) return messages;
 
+    // R4 finding #1 (2026-04-24): per-user-turn latch. transformContext
+    // runs on every provider round-trip, so without this gate a reminder-
+    // eligible tool-heavy turn re-injects the full plan blob on every
+    // round-trip. The latch is set below after a successful insert, and
+    // cleared by entrypoints at the start of each user turn (paired with
+    // incrementTurnsSinceExit) + by decrementTurnsSinceExit on failure.
+    if (planManager.remindedThisTurn) return messages;
+
     const turn = planManager.turnsSinceExit;
     if (turn === 0) return messages;
     if (turn % config.interval !== 0) return messages;
@@ -69,6 +77,11 @@ export function createPlanReinjector(
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]?.role === "user") { lastUserIdx = i; break; }
     }
+    // R4 finding #1: set the per-turn latch AFTER we commit to returning
+    // the reminder, so a failed gate check doesn't arm it. Subsequent
+    // round-trips within the same user turn will short-circuit above.
+    planManager.markRemindedThisTurn();
+
     if (lastUserIdx < 0) {
       return [{ role: "user", content: reminderText, isMeta: true }, ...messages];
     }
