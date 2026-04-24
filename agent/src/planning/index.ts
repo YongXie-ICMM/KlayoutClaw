@@ -120,6 +120,19 @@ export class PlanManager {
     this._turnsSinceExit++;
   }
 
+  /**
+   * R3 finding #1 (2026-04-24): roll back the pre-prompt bump when
+   * `session.prompt()` throws (abort, network error, model 5xx, tool
+   * failure). Only successful turns should count toward the reinjection
+   * cadence. Symmetric with `incrementTurnsSinceExit` — same gates, but
+   * does NOT touch the exit-turn-swallow flag (`consumeExitSwallow` owns
+   * that one-shot independently).
+   */
+  decrementTurnsSinceExit(): void {
+    if (!this._currentPlan || this._inPlanMode) return;
+    if (this._turnsSinceExit > 0) this._turnsSinceExit--;
+  }
+
   markVerified(): void {
     this._verificationCompleted = true;
     this._emit({

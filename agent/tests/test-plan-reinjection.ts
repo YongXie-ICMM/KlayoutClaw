@@ -95,6 +95,80 @@ describe("PlanManager: reinjection support", () => {
     expect(pm.turnsSinceExit).toBe(0);
   });
 
+  // R3 finding #1 (2026-04-24): decrementTurnsSinceExit rolls back the
+  // pre-prompt bump on failed prompts so the cadence isn't inflated by
+  // turns that didn't actually produce a model response.
+  it("decrementTurnsSinceExit rolls back a single bump (success +1, fail net 0)", async () => {
+    const { pm } = await activatePlanAndExit("step 1");
+    expect(pm.turnsSinceExit).toBe(0);
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("decrementTurnsSinceExit clamps at 0 (never goes negative)", async () => {
+    const { pm } = await activatePlanAndExit("step 1");
+    expect(pm.turnsSinceExit).toBe(0);
+    pm.decrementTurnsSinceExit();
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("decrementTurnsSinceExit is a no-op while inPlanMode (mirrors increment gate)", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const pm = new PlanManager(makeWorkspace());
+    pm.enterPlanMode("Draft");
+    expect(pm.inPlanMode).toBe(true);
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("decrementTurnsSinceExit is a no-op when no plan is active", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const pm = new PlanManager(makeWorkspace());
+    expect(pm.currentPlan).toBeNull();
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(0);
+  });
+
+  it("decrementTurnsSinceExit does NOT re-arm the exit-turn-swallow flag", async () => {
+    // The exit-turn-swallow is a one-shot flag with a different lifecycle
+    // (consumeExitSwallow owns it). Decrement must not touch it. Trace:
+    //  Turn A: agent exits plan mode mid-prompt → swallow armed.
+    //  Same turn's prompt then FAILS. Decrement runs, but the swallow flag
+    //  is already armed and consumeExitSwallow() in finally will clear it.
+    //  Decrement must not flip the flag back on or off.
+    const { pm } = await activatePlanAndExit("step 1");
+    pm.markExitedInThisTurn();
+    pm.incrementTurnsSinceExit(); // swallow consumes the bump
+    expect(pm.turnsSinceExit).toBe(0);
+    pm.decrementTurnsSinceExit();
+    // Counter clamped at 0 (no bump to roll back).
+    expect(pm.turnsSinceExit).toBe(0);
+    // The swallow was already cleared by the increment call. A subsequent
+    // increment should now bump normally.
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+  });
+
+  it("mix: 2 success + 1 fail + 1 success → counter = 3 (R3 #1 trace)", async () => {
+    const { pm } = await activatePlanAndExit("step 1");
+    // Success 1
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(1);
+    // Success 2
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(2);
+    // Failed turn: bumped, then rolled back in catch.
+    pm.incrementTurnsSinceExit();
+    pm.decrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(2);
+    // Success 3
+    pm.incrementTurnsSinceExit();
+    expect(pm.turnsSinceExit).toBe(3);
+  });
+
   it("markVerified sets verificationCompleted and emits plan_verified event", async () => {
     const { pm } = await activatePlanAndExit("body");
     const events: any[] = [];
@@ -802,6 +876,86 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     // Exactly-once inside the `case "prompt"` block.
     const matches = body.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
+  });
+});
+
+describe("Wiring check: catch blocks roll back the bump (R3 finding #1)", () => {
+  // Static grep tests confirming each user-prompt entrypoint calls
+  // decrementTurnsSinceExit() in its catch block. Without rollback, a
+  // failed prompt advances the counter for a turn that didn't produce a
+  // model response, so the documented cadence drifts — exactly the
+  // off-by-one R2 #1 fixed, in the opposite direction.
+  function sliceFnBody(src: string, fnDecl: string): string {
+    const start = src.indexOf(fnDecl);
+    if (start < 0) return "";
+    const after = src.slice(start + fnDecl.length);
+    const nextFnRel = after.search(/\n(?:export\s+)?(?:async\s+)?function\s+/);
+    return nextFnRel >= 0 ? after.slice(0, nextFnRel) : after;
+  }
+
+  it("agent/src/cli.ts runJSON catch block calls decrementTurnsSinceExit()", () => {
+    const p = resolve(__dirname, "..", "src", "cli.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const body = sliceFnBody(src, "function runJSON");
+    expect(body.length).toBeGreaterThan(0);
+    // Catch must run AFTER the prompt and contain the decrement.
+    const catchIdx = body.indexOf("catch (err: unknown)");
+    const decIdx = body.indexOf(".decrementTurnsSinceExit(");
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThan(catchIdx);
+    // Exactly one decrement per entrypoint.
+    const matches = body.match(/\.decrementTurnsSinceExit\(/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  it("agent/src/cli.ts runInteractivePlain rl.on('line') catch calls decrementTurnsSinceExit()", () => {
+    const p = resolve(__dirname, "..", "src", "cli.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const fnBody = sliceFnBody(src, "function runInteractivePlain");
+    expect(fnBody.length).toBeGreaterThan(0);
+    // The decrement must appear AFTER session.prompt( (in the catch path).
+    const promptIdx = fnBody.indexOf("session.prompt(");
+    const decIdx = fnBody.indexOf(".decrementTurnsSinceExit(");
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThan(promptIdx);
+    // Exactly one decrement on the user-prompt path.
+    const matches = fnBody.match(/\.decrementTurnsSinceExit\(/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  it('agent/src/rpc.ts case "prompt" catch block calls decrementTurnsSinceExit()', () => {
+    const p = resolve(__dirname, "..", "src", "rpc.ts");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    const m = src.match(/case\s+"prompt"\s*:\s*\{[\s\S]*?\bbreak;/);
+    expect(m).toBeTruthy();
+    const body = m![0];
+    const catchIdx = body.indexOf("catch (err: unknown)");
+    const decIdx = body.indexOf(".decrementTurnsSinceExit(");
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThan(catchIdx);
+    const matches = body.match(/\.decrementTurnsSinceExit\(/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  it("agent/src/tui/components/App.tsx handleSubmit catch calls decrementTurnsSinceExit()", () => {
+    const p = resolve(__dirname, "..", "src", "tui", "components", "App.tsx");
+    const src = stripComments(readFileSync(p, "utf-8"));
+    // Anchor on the increment then the surrounding catch — App.tsx has
+    // multiple try/catch blocks so we can't slice naïvely. Just assert
+    // the decrement appears at all and after the increment.
+    const incIdx = src.indexOf(".incrementTurnsSinceExit(");
+    const decIdx = src.indexOf(".decrementTurnsSinceExit(");
+    expect(incIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThanOrEqual(0);
+    expect(decIdx).toBeGreaterThan(incIdx);
+    // The decrement must live inside a catch block.
+    const before = src.slice(0, decIdx);
+    const lastCatch = before.lastIndexOf("catch");
+    const lastFinally = before.lastIndexOf("finally");
+    expect(lastCatch).toBeGreaterThan(lastFinally); // decrement is in catch, not finally
   });
 });
 

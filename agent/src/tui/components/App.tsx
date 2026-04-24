@@ -641,6 +641,10 @@ export function App({ botSession }: AppProps) {
         botSession.planManager?.incrementTurnsSinceExit();
         await botSession.session.prompt(text);
       } catch (err: unknown) {
+        // R3 finding #1: roll back the pre-prompt bump so failed turns
+        // don't inflate the reinjection cadence. Only successful turns
+        // count.
+        botSession.planManager?.decrementTurnsSinceExit();
         const msg = err instanceof Error ? err.message : String(err);
         dispatch({ type: "SESSION_ERROR", error: msg });
         botSession.history.recordError(msg);

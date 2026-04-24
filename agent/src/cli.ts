@@ -327,6 +327,9 @@ async function runInteractivePlain(
       botSession.planManager?.incrementTurnsSinceExit();
       await botSession.session.prompt(input);
     } catch (err: unknown) {
+      // R3 finding #1: roll back the pre-prompt bump so failed turns don't
+      // inflate the reinjection cadence. Only successful turns count.
+      botSession.planManager?.decrementTurnsSinceExit();
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`\nError: ${msg}`);
     } finally {
@@ -431,6 +434,9 @@ async function runJSON(args: CLIArgs): Promise<void> {
     const output = { status: "completed", response: chunks.join("") };
     console.log(JSON.stringify(output, null, 2));
   } catch (err: unknown) {
+    // R3 finding #1: roll back the pre-prompt bump so failed turns don't
+    // inflate the reinjection cadence. Only successful turns count.
+    botSession.planManager?.decrementTurnsSinceExit();
     const msg = err instanceof Error ? err.message : String(err);
     const output = { status: "error", error: msg };
     console.log(JSON.stringify(output, null, 2));
