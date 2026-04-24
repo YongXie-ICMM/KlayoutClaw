@@ -1296,3 +1296,194 @@ describe("R2 finding #2: placeholder shows effective role, not raw args", () => 
     expect(fields!.role).toBe("general-purpose");
   });
 });
+
+// ---------------------------------------------------------------------------
+// R3 finding #2 — delegate validation failures must clear their placeholder.
+// The reducer handles SUBAGENT_CANCEL_PLACEHOLDER; the delegate tool emits
+// a `cancelled` event on validation failure; App.tsx bridges the two.
+// ---------------------------------------------------------------------------
+describe("R3 finding #2: SUBAGENT_CANCEL_PLACEHOLDER reducer action", () => {
+  it("removes the placeholder matching toolCallId when START hasn't run", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-bad",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-bad",
+      reason: "missing_prompt",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("does NOT remove a subagent entry that has already transitioned to START", () => {
+    // Place a valid entry then SUBAGENT_START to remap id. A stray cancel
+    // for the SAME toolCallId must NOT touch the live run.
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-live",
+      role: "designer",
+      task: "design",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_START",
+      subagentId: "sa-real",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents[0].id).toBe("sa-real");
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].id).toBe("sa-real");
+  });
+
+  it("is a no-op for an unknown toolCallId", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-existing",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    const before = state.subagents.length;
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-nonexistent",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(before);
+  });
+
+  it("end-to-end: placeholder → cancel → panel has no phantom row", () => {
+    let state: any = initialState;
+    // 1. tool_execution_start arrives, places placeholder
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-missing-prompt",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].status).toBe("running");
+
+    // 2. delegate.execute rejects for missing prompt, emits `cancelled`
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-missing-prompt",
+      reason: "missing_prompt",
+    } as TUIAction);
+
+    // 3. Panel is clean — no phantom "running" row
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("multiple placeholders: cancel only removes the targeted one", () => {
+    let state: any = initialState;
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-a",
+      role: "general-purpose",
+      task: "a",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-b",
+      role: "designer",
+      task: "b",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(2);
+
+    state = tuiReducer(state, {
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-a",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].toolCallId).toBe("tc-b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3 finding #2 — integration: delegate.execute emits `cancelled` on the
+// validation branches so App.tsx's bridge can dispatch the cleanup action.
+// ---------------------------------------------------------------------------
+describe("R3 finding #2: delegate emits `cancelled` on validation failures", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  async function makeEnv() {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), {
+      run: vi.fn(async () => ({
+        role: "general-purpose", task: "x", status: "completed",
+        findings: [], warnings: [], dataPaths: [],
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, turns: 0 },
+        transcriptPath: "",
+      })),
+    });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    return { runner, tool: createDelegateTool(runner as any, cfg) };
+  }
+
+  it("missing prompt → emits `cancelled` with toolCallId + reason", async () => {
+    const { runner, tool } = await makeEnv();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    const result = await (tool as any).execute("tc-missing", {
+      description: "no prompt",
+    });
+
+    expect(result.details.error).toBe(true);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-missing");
+    expect(events[0].reason).toBe("missing_prompt");
+  });
+
+  it("valid call → does NOT emit `cancelled`", async () => {
+    const { runner, tool } = await makeEnv();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    await (tool as any).execute("tc-ok", {
+      description: "ok",
+      prompt: "do it",
+    });
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(0);
+  });
+
+  it("plan-mode restricted → emits `cancelled` with reason=plan_mode_restricted", async () => {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), { run: vi.fn() });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    const planManager = { inPlanMode: true } as any;
+    const tool = createDelegateTool(runner as any, cfg, planManager);
+
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    const result = await (tool as any).execute("tc-plan", {
+      description: "x",
+      prompt: "blocked",
+    });
+
+    expect(result.details.planModeRestricted).toBe(true);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-plan");
+    expect(events[0].reason).toBe("plan_mode_restricted");
+  });
+});

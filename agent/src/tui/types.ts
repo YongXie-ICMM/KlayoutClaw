@@ -186,6 +186,7 @@ export type TUIAction =
   // v0.4 Phase G: subagent actions
   | { type: "TOGGLE_SUBAGENT_PANEL" }
   | { type: "SUBAGENT_PLACEHOLDER"; toolCallId: string; role: string; task: string }
+  | { type: "SUBAGENT_CANCEL_PLACEHOLDER"; toolCallId: string; reason?: string }
   | { type: "SUBAGENT_START"; subagentId: string; toolCallId: string }
   | { type: "SUBAGENT_THINKING"; subagentId: string; text: string }
   | { type: "SUBAGENT_TEXT"; subagentId: string; text: string }

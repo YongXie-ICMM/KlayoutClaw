@@ -319,12 +319,24 @@ export function App({ botSession }: AppProps) {
         errorMessage: ev.errorMessage,
       });
 
+    // R3 finding #2: delegate's tool-level validation branches (plan-mode
+    // restricted, missing prompt) return before runner.run — no started /
+    // completed fires. The placeholder created by tool_execution_start
+    // would stay "running" forever. On `cancelled`, drop the placeholder.
+    const onCancelled = (ev: any) =>
+      dispatch({
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      });
+
     runner.on("started", onStarted);
     runner.on("thinking", onThinking);
     runner.on("text", onText);
     runner.on("tool_start", onToolStart);
     runner.on("tool_end", onToolEnd);
     runner.on("completed", onCompleted);
+    runner.on("cancelled", onCancelled);
 
     return () => {
       runner.off("started", onStarted);
@@ -333,6 +345,7 @@ export function App({ botSession }: AppProps) {
       runner.off("tool_start", onToolStart);
       runner.off("tool_end", onToolEnd);
       runner.off("completed", onCompleted);
+      runner.off("cancelled", onCancelled);
     };
   }, [botSession.subagentRunner]);
 

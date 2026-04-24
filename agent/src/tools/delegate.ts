@@ -20,6 +20,22 @@ import { GENERAL_PURPOSE_ROLE_NAME } from "../subagent/built-in/generalPurposeRo
 const DELEGATE_GUIDANCE = `Delegate a task to a subagent. Brief it like a smart colleague who just walked in — it hasn't seen this conversation, doesn't know what you've tried. Explain what you're trying to accomplish, what you've learned, and what specifically to do. Include file paths and line numbers. Never delegate understanding — don't write "based on your findings, implement it." Write prompts that prove you understood.`;
 
 /**
+ * Emit the `cancelled` lifecycle event on the runner when a delegate call
+ * is rejected at the tool layer BEFORE runner.run (R3 finding #2). The
+ * TUI's App.tsx subscribes to this event and clears the placeholder the
+ * SubagentPanel created from tool_execution_start.
+ *
+ * Guarded so SubagentRunner mocks in tests (that may not extend EventEmitter)
+ * still work.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function emitCancelled(runner: any, toolCallId: string, reason: string): void {
+  if (typeof runner?.emit === "function") {
+    runner.emit("cancelled", { toolCallId, reason });
+  }
+}
+
+/**
  * Format a single role entry for the catalog. Kept consistent with the
  * effective-general-purpose line so both paths render identically.
  */
@@ -92,6 +108,10 @@ export function createDelegateTool(
       // Plan-mode gate (spec §9 step 8): block subagent dispatch when the
       // parent is in plan mode so subagents cannot escape the sandbox.
       if (parentPlanManager?.inPlanMode === true) {
+        // R3 finding #2: the TUI already created a placeholder from
+        // tool_execution_start. Emit `cancelled` so App.tsx can clear it —
+        // otherwise the panel shows a phantom "running" row forever.
+        emitCancelled(runner, toolCallId, "plan_mode_restricted");
         return {
           content: [{
             type: "text" as const,
@@ -112,6 +132,8 @@ export function createDelegateTool(
       const legacyRoleUsed = params.subagent_type === undefined && params.role !== undefined;
 
       if (!effectivePrompt || typeof effectivePrompt !== "string" || effectivePrompt.trim().length === 0) {
+        // R3 finding #2: same phantom-placeholder concern as above.
+        emitCancelled(runner, toolCallId, "missing_prompt");
         return {
           content: [{
             type: "text" as const,
