@@ -8,13 +8,25 @@
  * the new schema (`subagent_type` / `prompt`) and legacy (`role` / `task`);
  * prefer the new names but fall back so legacy callers still produce a
  * meaningful placeholder.
+ *
+ * R2 finding #2: the `role` field must be the EFFECTIVE name the runner
+ * will run with, not the raw string the agent passed. Unknown
+ * subagent_type values fall back to "general-purpose" in the runner; the
+ * TUI must show the same thing. Translation goes through
+ * resolveEffectiveRoleName so the UI and the runner agree.
  */
+import type { SubagentConfig } from "../types/v04-contracts.js";
+import { resolveEffectiveRoleName } from "../subagent/role-resolver.js";
+
 export interface DelegatePlaceholderFields {
   role: string;
   task: string;
 }
 
-export function parseDelegatePlaceholder(args: unknown): DelegatePlaceholderFields | null {
+export function parseDelegatePlaceholder(
+  args: unknown,
+  config: SubagentConfig,
+): DelegatePlaceholderFields | null {
   let parsed: Record<string, unknown>;
   try {
     if (typeof args === "string") {
@@ -28,15 +40,18 @@ export function parseDelegatePlaceholder(args: unknown): DelegatePlaceholderFiel
     return null;
   }
 
-  const role =
+  const requestedRole =
     typeof parsed.subagent_type === "string" ? parsed.subagent_type :
     typeof parsed.role === "string" ? parsed.role :
-    "general-purpose";
+    "";
 
   const task =
     typeof parsed.prompt === "string" ? parsed.prompt :
     typeof parsed.task === "string" ? parsed.task :
     "";
 
-  return { role, task };
+  return {
+    role: resolveEffectiveRoleName(requestedRole, config),
+    task,
+  };
 }

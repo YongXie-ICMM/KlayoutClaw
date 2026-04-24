@@ -1112,22 +1112,43 @@ describe("Group 9: Inspect Window Key Routing", () => {
 // legacy args. The reducer's SUBAGENT_PLACEHOLDER is idempotent, so the
 // fields written on the first tool_execution_start must be correct; if they
 // aren't, the panel shows "unknown / empty" forever.
+//
+// R2 finding #2 — parseDelegatePlaceholder now also resolves the effective
+// role name (so unknown subagent_type values display as "general-purpose",
+// matching what the runner actually runs).
 // ---------------------------------------------------------------------------
 import { parseDelegatePlaceholder } from "../src/tui/delegate-placeholder.js";
+import type { SubagentConfig } from "../src/types/v04-contracts.js";
+
+function makePlaceholderCfg(overrides?: Partial<SubagentConfig>): SubagentConfig {
+  return {
+    enabled: true, logDir: "/tmp", maxLogFiles: 10,
+    roles: {
+      designer: {
+        label: "Designer", promptFile: "subagent/designer.md", workspaceFiles: [],
+        baseTools: ["read", "write"], customTools: ["submit_result"],
+        mcpAccess: "full", maxTurns: 100, maxTokens: 200000,
+      },
+    },
+    ...overrides,
+  };
+}
 
 describe("Finding 1: parseDelegatePlaceholder", () => {
-  it("new schema: {subagent_type, prompt} → role=subagent_type, task=prompt", () => {
+  it("new schema: {subagent_type, prompt} (known role) → role=subagent_type, task=prompt", () => {
     const fields = parseDelegatePlaceholder(
-      JSON.stringify({ subagent_type: "general-purpose", prompt: "read README" }),
+      JSON.stringify({ subagent_type: "designer", prompt: "design a Hall bar" }),
+      makePlaceholderCfg(),
     );
     expect(fields).not.toBeNull();
-    expect(fields!.role).toBe("general-purpose");
-    expect(fields!.task).toBe("read README");
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design a Hall bar");
   });
 
-  it("legacy schema: {role, task} → role=role, task=task", () => {
+  it("legacy schema: {role, task} (known role) → role=role, task=task", () => {
     const fields = parseDelegatePlaceholder(
       JSON.stringify({ role: "designer", task: "design a Hall bar" }),
+      makePlaceholderCfg(),
     );
     expect(fields).not.toBeNull();
     expect(fields!.role).toBe("designer");
@@ -1135,6 +1156,16 @@ describe("Finding 1: parseDelegatePlaceholder", () => {
   });
 
   it("new schema preferred over legacy when both present", () => {
+    const cfg = makePlaceholderCfg({
+      roles: {
+        designer: makePlaceholderCfg().roles.designer,
+        scout: {
+          label: "Scout", promptFile: "", workspaceFiles: [],
+          baseTools: ["read"], customTools: ["submit_result"],
+          mcpAccess: "shared-readonly", maxTurns: 50, maxTokens: 100000,
+        },
+      },
+    });
     const fields = parseDelegatePlaceholder(
       JSON.stringify({
         subagent_type: "scout",
@@ -1142,30 +1173,38 @@ describe("Finding 1: parseDelegatePlaceholder", () => {
         role: "designer",
         task: "designer task",
       }),
+      cfg,
     );
     expect(fields!.role).toBe("scout");
     expect(fields!.task).toBe("scout task");
   });
 
   it("neither field present → falls back to general-purpose / empty", () => {
-    const fields = parseDelegatePlaceholder(JSON.stringify({ description: "oops" }));
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ description: "oops" }),
+      makePlaceholderCfg(),
+    );
     expect(fields!.role).toBe("general-purpose");
     expect(fields!.task).toBe("");
   });
 
   it("already-object args (not a JSON string) are accepted", () => {
-    const fields = parseDelegatePlaceholder({ subagent_type: "analyst", prompt: "analyze" });
-    expect(fields!.role).toBe("analyst");
+    const fields = parseDelegatePlaceholder(
+      { subagent_type: "designer", prompt: "analyze" },
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("designer");
     expect(fields!.task).toBe("analyze");
   });
 
   it("malformed JSON string returns null (caller falls back to 'started' event)", () => {
-    expect(parseDelegatePlaceholder("{not json")).toBeNull();
+    expect(parseDelegatePlaceholder("{not json", makePlaceholderCfg())).toBeNull();
   });
 
   it("dispatching placeholder built from new-schema args yields correct panel entry", () => {
     const fields = parseDelegatePlaceholder(
       JSON.stringify({ subagent_type: "general-purpose", prompt: "read README" }),
+      makePlaceholderCfg(),
     )!;
     let state = initialState;
     state = tuiReducer(state, {
@@ -1184,6 +1223,7 @@ describe("Finding 1: parseDelegatePlaceholder", () => {
   it("legacy placeholder remains correct end-to-end (regression)", () => {
     const fields = parseDelegatePlaceholder(
       JSON.stringify({ role: "designer", task: "legacy task" }),
+      makePlaceholderCfg(),
     )!;
     let state = initialState;
     state = tuiReducer(state, {
@@ -1195,5 +1235,64 @@ describe("Finding 1: parseDelegatePlaceholder", () => {
     const subs = (state as any).subagents as SubagentTUIEntry[];
     expect(subs[0].role).toBe("designer");
     expect(subs[0].task).toBe("legacy task");
+  });
+});
+
+describe("R2 finding #2: placeholder shows effective role, not raw args", () => {
+  it("new schema, unknown subagent_type → placeholder shows 'general-purpose'", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "totally-made-up", prompt: "do something" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("do something");
+  });
+
+  it("legacy schema, unknown role → placeholder shows 'general-purpose'", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ role: "nonexistent", task: "legacy unknown" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("legacy unknown");
+  });
+
+  it("new schema, omitted role → placeholder shows 'general-purpose' (matches delegate default)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ description: "no role given", prompt: "do thing" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("general-purpose");
+    expect(fields!.task).toBe("do thing");
+  });
+
+  it("new schema, known role → placeholder shows the known role (regression)", () => {
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "designer", prompt: "design" }),
+      makePlaceholderCfg(),
+    );
+    expect(fields!.role).toBe("designer");
+    expect(fields!.task).toBe("design");
+  });
+
+  it("unknown-role fallback + custom 'general-purpose' config → still shows 'general-purpose'", () => {
+    const cfg = makePlaceholderCfg({
+      roles: {
+        "general-purpose": {
+          label: "Custom GP", promptFile: "", workspaceFiles: [],
+          baseTools: ["read"], customTools: ["submit_result"],
+          mcpAccess: "shared-readonly", maxTurns: 5, maxTokens: 10000,
+        },
+      },
+    });
+    const fields = parseDelegatePlaceholder(
+      JSON.stringify({ subagent_type: "typo-role", prompt: "x" }),
+      cfg,
+    );
+    // Effective NAME is still "general-purpose" — resolver picks the config
+    // override under that name when the runner runs it. The panel label is
+    // computed from the runtime RoleConfig later; here we only assert the
+    // name lines up with what the runner will actually run.
+    expect(fields!.role).toBe("general-purpose");
   });
 });

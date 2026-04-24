@@ -134,10 +134,16 @@ export function App({ botSession }: AppProps) {
         // Two-phase ID mapping: create placeholder entry for delegate tool.
         // The reducer's SUBAGENT_PLACEHOLDER is idempotent — once an entry
         // exists for this toolCallId it is NOT overwritten, so the fields
-        // must be correct on the first dispatch. Field-name translation is
-        // done in parseDelegatePlaceholder (see delegate-placeholder.ts).
+        // must be correct on the first dispatch. Field-name translation +
+        // effective-name resolution (R2 finding #2) is done in
+        // parseDelegatePlaceholder so the TUI matches what the runner runs.
         if (toolName === "delegate") {
-          const fields = parseDelegatePlaceholder(args);
+          // subagent may be disabled in config; fall back to an empty-roles
+          // stub so the parser still resolves the effective general-purpose.
+          const subagentCfg = botSession.config.subagent ?? {
+            enabled: false, logDir: "", maxLogFiles: 0, roles: {},
+          };
+          const fields = parseDelegatePlaceholder(args, subagentCfg);
           if (fields) {
             dispatch({
               type: "SUBAGENT_PLACEHOLDER",
