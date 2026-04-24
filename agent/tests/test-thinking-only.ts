@@ -174,12 +174,25 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
     expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
   });
 
-  it("stalled toolUse — toolCall emitted but no trailing toolResult → true", () => {
-    // Shape observed at
-    //   ~/.qlaybot/sessions/2026-04-23T06-58-19-676Z_...jsonl LAST entry.
-    // After the SDK's auto-retry shuffled state, `prompt()` resolved
-    // leaving the tool call un-executed. The original detector returned
-    // FALSE here because hasToolCall=true.
+  it("R4: stalled toolUse — toolCall with no trailing toolResult → false (NOT retried)", () => {
+    // Shape observed at the LAST entry of both
+    //   ~/.qlaybot/sessions/2026-04-23T06-53-24-810Z_...jsonl
+    //   ~/.qlaybot/sessions/2026-04-23T06-58-19-676Z_...jsonl
+    // — stopReason="toolUse" + toolCall content + no trailing toolResult.
+    //
+    // Commit b48b062 classified this as thinking-only and sent a
+    // "Continue..." user message. R4 finding #1 (2026-04-24) showed
+    // that path is harmful: pi-ai's transform-messages.js:125-141
+    // injects a synthetic `"No result provided"` toolResult for the
+    // orphan toolCall before any user message, so the model continues
+    // under the confidently-wrong premise that the tool errored.
+    //
+    // Option A (chosen): the guard abstains — `hasToolCall` falls
+    // through to `if (hasText || hasToolCall) return false;`. Caller
+    // sees stillThinkingOnly=false and returns a clean (possibly
+    // empty-text) completion. Stalled-toolUse recovery, if ever
+    // implemented, belongs in the agent-loop layer where the original
+    // toolCall can be re-dispatched — not here.
     const msgs = [
       makeUser("start work"),
       makeAssistant("kimi-coding", {
@@ -199,7 +212,42 @@ describe("kimi-coding (k2p6) — real ml09/ml11 failure modes", () => {
         ],
       }),
     ];
-    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(true);
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
+  });
+
+  it("R4: ml09/ml11 exact trace tail (429 error turn + orphan toolUse turn) → false", () => {
+    // Full reproduction of the final three messages in both ml09 and
+    // ml11 real sessions: toolResult from a prior tool call, then a
+    // 429 error turn pi-coding-agent's auto-retry pushed, then the
+    // retry's toolCall that was never executed. The guard must NOT
+    // classify this trailing orphan as retryable.
+    const msgs = [
+      makeUser("design the device"),
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "read the spec" },
+          { type: "toolCall", id: "t1", name: "read", arguments: { path: "spec.md" } },
+        ],
+      }),
+      makeToolResult("t1", "spec contents..."),
+      makeAssistant("kimi-coding", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          '429 {"error":{"type":"rate_limit_error","message":"overloaded"}}',
+      }),
+      // Orphan retry turn — toolCall never executed. THIS must NOT
+      // trigger a Continue-prompt.
+      makeAssistant("kimi-coding", {
+        stopReason: "toolUse",
+        content: [
+          { type: "thinking", thinking: "retrying..." },
+          { type: "toolCall", id: "t2", name: "write", arguments: { path: "out.md" } },
+        ],
+      }),
+    ];
+    expect(isThinkingOnlyTerminationByMessages({ messages: msgs })).toBe(false);
   });
 
   it("refusal with content text (stopReason=error + 'I can't help') → false", () => {
@@ -587,7 +635,12 @@ describe("createTurnActivityTracker", () => {
 });
 
 describe("isThinkingOnlyTermination (combined)", () => {
-  it("shape catches the kimi stalled-toolUse regardless of tracker state", () => {
+  it("R4: stalled kimi-toolUse does NOT retry (Continue-prompt would corrupt tool state)", () => {
+    // Rewritten from the b48b062 version that asserted retry=true.
+    // R4 finding #1: the Continue path triggers pi-ai's synthetic
+    // "No result provided" toolResult injection
+    // (transform-messages.js:125-141). Asserting no-retry here locks
+    // in the Option A choice.
     const s = mockSession([
       makeUser("go"),
       makeAssistant("kimi-coding", {
@@ -599,8 +652,6 @@ describe("isThinkingOnlyTermination (combined)", () => {
       }),
     ]);
     const tracker = createTurnActivityTracker(s);
-    // Simulate the "toolcall emitted but not executed" event stream —
-    // toolcall_start/end but no tool_execution_start.
     s.emit({
       type: "message_update",
       assistantMessageEvent: { type: "thinking_delta", delta: "..." },
@@ -613,7 +664,7 @@ describe("isThinkingOnlyTermination (combined)", () => {
       type: "message_update",
       assistantMessageEvent: { type: "toolcall_end", contentIndex: 1 },
     });
-    expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
   });
 

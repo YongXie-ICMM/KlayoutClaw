@@ -144,22 +144,19 @@ describe("RPC-mode thinking-only retry integration", () => {
     tracker.unsubscribe();
   });
 
-  it("kimi-coding ml09 pattern: stalled toolUse (no toolResult) triggers re-prompt", async () => {
-    // Mirrors the real ml09 failure: the final assistant turn has
-    // stopReason=toolUse + a toolCall, but the tool was never executed
-    // (no toolResult appended). The original detector returned false
-    // because hasToolCall=true. The new stopReason-aware detector
-    // catches it.
+  it("R4: kimi-coding ml09 orphan toolUse does NOT trigger re-prompt", async () => {
+    // Rewritten for R4 finding #1 (2026-04-24). The b48b062 version
+    // asserted retries=1 via the stalled-toolUse branch; that branch
+    // has been dropped because its "Continue..." prompt corrupts
+    // tool-call state via pi-ai's synthetic toolResult injection.
+    // The guard now abstains for this shape — caller returns a clean
+    // completion with whatever text was emitted.
     const sentEvents: Array<{ name: string; params: any }> = [];
     const sendEvent = (name: string, params: any) =>
       sentEvents.push({ name, params });
 
     const session = createMockSession([
-      // Turn 1: the real ml09 shape — stopReason=toolUse, has toolCall,
-      // but the mock never appends a toolResult afterwards.
       (emit, messages) => {
-        // tool content-block events fire (toolcall_start/end), but
-        // tool_execution_start does NOT — the loop short-circuited.
         emit({
           type: "message_update",
           assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
@@ -182,18 +179,6 @@ describe("RPC-mode thinking-only retry integration", () => {
           stopReason: "toolUse",
         });
       },
-      // Turn 2: after the continue-prompt, the model produces text.
-      (emit, messages) => {
-        emit({
-          type: "message_update",
-          assistantMessageEvent: { type: "text_delta", delta: "recovered" },
-        });
-        messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: "recovered" }],
-          stopReason: "stop",
-        });
-      },
     ]);
 
     const tracker = createTurnActivityTracker(session);
@@ -207,11 +192,10 @@ describe("RPC-mode thinking-only retry integration", () => {
       },
     );
 
-    expect(result.retries).toBe(1);
+    expect(result.retries).toBe(0);
     expect(result.stillThinkingOnly).toBe(false);
-    expect(sentEvents).toEqual([
-      { name: "thinking_only_reprompt", params: { attempt: 1, max: 5 } },
-    ]);
+    expect(sentEvents).toEqual([]);
+    expect(session.promptCalls).toEqual(["design the device"]);
     tracker.unsubscribe();
   });
 

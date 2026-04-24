@@ -2,7 +2,7 @@
  * Early-exit termination detector + activity-stream fallback.
  *
  * Despite the "thinking-only" naming (kept for issue-#22 continuity), this
- * guard catches several modes of `session.prompt()` returning before the
+ * guard catches two modes of `session.prompt()` returning before the
  * agent actually finished:
  *
  *   1. Pure thinking-only turn (stop after a reasoning block, no text /
@@ -10,11 +10,21 @@
  *   2. Terminal `stopReason: "error"` or `"aborted"` — e.g. k2p6 429
  *      rate-limit where pi-coding-agent's auto-retry exhausted. Content
  *      is typically `[]`, making the message-shape detector useless.
- *   3. Terminal `stopReason: "toolUse"` with a pending tool call that
- *      was never executed (no trailing `toolResult`) — observed in
- *      ml09/ml11 after the SDK's retry path short-circuited.
  *
- * The message-shape detector covers (1) and (3) and as much of (2) as is
+ * NOT HANDLED HERE: stalled tool-use (stopReason="toolUse" with no
+ * trailing toolResult). The ml09/ml11 traces DO show this shape, but
+ * the obvious fix — sending a `"Continue..."` user message — is
+ * actively harmful. pi-ai's `transform-messages.js:125-141` injects a
+ * synthetic toolResult of `"No result provided"` (with isError=true)
+ * whenever a user message follows an orphan toolCall, so the model
+ * keeps going under the confidently-wrong premise that the tool
+ * returned that error. That is strictly worse than returning an empty
+ * completion and letting the caller deal with it (R4 finding #1,
+ * 2026-04-24). If stalled-toolUse recovery is worth doing, it belongs
+ * in the agent-loop layer where the original toolCall can be re-
+ * dispatched — not here.
+ *
+ * The message-shape detector covers (1) and as much of (2) as is
  * possible to see (content: []). The activity-stream fallback is a
  * belt-and-suspenders guard for malformed shapes and "no terminal
  * assistant message at all" cases. See
@@ -56,10 +66,12 @@ export interface TurnActivityTracker {
  * to the most recent assistant turn and classifies it as an early-exit
  * termination. Returns true when any of these holds:
  *
- *   - stopReason is "error" or "aborted" (rate-limits, upstream disconnect)
- *   - stopReason is "toolUse" but no `toolResult` follows (pi-coding-agent
- *     retry path left the tool call dangling)
+ *   - stopReason is "aborted" (upstream disconnect / signal)
+ *   - stopReason is "error" with a retryable errorMessage
  *   - Content is reasoning-only with no text and no tool call
+ *
+ * Stalled toolUse (stopReason="toolUse" with no trailing toolResult) is
+ * intentionally NOT matched here — see the file-header comment.
  *
  * Also matches legacy / hypothetical shapes (thinking_block, reasoning,
  * tool_use, tool_call) as a defensive measure against future SDK changes —
@@ -71,16 +83,12 @@ export function isThinkingOnlyTerminationByMessages(
   const msgs = (session.messages ?? []) as any[];
 
   let lastAssistantIdx = -1;
-  let sawToolResultAfterAssistant = false;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (!m) continue;
     if (m.role === "assistant") {
       lastAssistantIdx = i;
       break;
-    }
-    if (m.role === "toolResult") {
-      sawToolResultAfterAssistant = true;
     }
   }
   if (lastAssistantIdx === -1) return false;
@@ -138,12 +146,11 @@ export function isThinkingOnlyTerminationByMessages(
     return true;
   }
 
-  // Stalled tool-use: the model emitted a tool call but the loop never
-  // ran executeToolCalls on it (no trailing toolResult), so `prompt()`
-  // resolved mid-turn.
-  if (last.stopReason === "toolUse" && !sawToolResultAfterAssistant) {
-    return true;
-  }
+  // Stalled toolUse is intentionally NOT handled here — the obvious
+  // retry path (send "Continue..." user message) is actively harmful
+  // because pi-ai synthesises a fake toolResult for the orphan call.
+  // See file-header comment. Fall through to the content-shape check
+  // below; the toolCall-present branch at `hasToolCall` will abstain.
 
   if (!Array.isArray(last.content)) return false;
 
