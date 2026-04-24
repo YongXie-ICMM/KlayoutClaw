@@ -258,6 +258,15 @@ export function lastTurnTerminalError(
     if (m.stopReason !== "error" && m.stopReason !== "aborted") return null;
     const em = typeof m.errorMessage === "string" ? m.errorMessage : "";
     if (em.length === 0) return null; // refusal with preserved content
+    // R8.2 final (gpt-5.5 xhigh): context-overflow check must come BEFORE
+    // the retryable regex. pi-coding-agent's _isRetryableError does this
+    // ordering (agent-session.js:1666-1672) and the shape detector above
+    // mirrors it (see `isContextOverflow(last)` at :153). Otherwise a
+    // context-overflow message like "prompt is too long: 250000 tokens"
+    // would hit the retryable regex (`/500/` matches "250000") and
+    // silently return null → caller takes success path with empty
+    // response → same silent-failure class as the original ml09/ml11.
+    if (isContextOverflow(m)) return em; // non-retryable terminal
     if (isRetryableErrorMessage(em)) return null; // caller already retried
     return em; // non-retryable terminal error
   }

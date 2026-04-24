@@ -1133,6 +1133,24 @@ describe("sinceIdx compaction safety (R8.1 finding — gpt-5.5 xhigh final)", ()
     // (errorMessage "overloaded_error" is retryable, so it returns null)
   });
 
+  it("context-overflow msg with retryable-looking token count → surfaces as terminal (R8.2 final)", () => {
+    // Non-retryable context-overflow error whose errorMessage contains
+    // "250000" (so /500/ in isRetryableErrorMessage matches). Without the
+    // isContextOverflow-first ordering, this would silently return null
+    // and the caller would write status:"completed" with empty response.
+    const msgs = [
+      makeUser("too much context"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "prompt is too long: 250000 tokens > 200000 maximum",
+      }),
+    ];
+    expect(lastTurnTerminalError({ messages: msgs })).toBe(
+      "prompt is too long: 250000 tokens > 200000 maximum",
+    );
+  });
+
   it("no compaction → sinceIdx preserved, boundary respected (R8 #2 regression)", async () => {
     const priorHistory = [
       makeUser("prior user"),
