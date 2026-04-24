@@ -462,6 +462,22 @@ export function App({ botSession }: AppProps) {
           return;
         }
 
+        // issue #24: /plan status shows current plan state without entering plan mode.
+        if (taskDesc === "status") {
+          if (!pm.currentPlan) return void dispatch({ type: "SYSTEM_MESSAGE", text: "No active plan." });
+          const lines = [
+            `Plan: ${pm.currentPlan.title}`,
+            `  id:             ${pm.currentPlan.id}`,
+            `  status:         ${pm.currentPlan.status}`,
+            `  inPlanMode:     ${pm.inPlanMode}`,
+            `  file:           ${pm.currentPlan.filePath}`,
+            `  turnsSinceExit: ${pm.turnsSinceExit}`,
+            `  verified:       ${pm.verificationCompleted}`,
+          ];
+          dispatch({ type: "SYSTEM_MESSAGE", text: lines.join("\n") });
+          return;
+        }
+
         // issue #24: /plan verify short-circuits the re-injection cadence.
         // Must live inside this /plan block so the intercept at the top of
         // handleSubmit catches it before the CommandRegistry sees it.

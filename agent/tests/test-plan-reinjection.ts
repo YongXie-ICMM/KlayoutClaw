@@ -1037,6 +1037,56 @@ describe("Wiring check: /plan verify slash command invokes markVerified()", () =
   });
 });
 
+describe("Wiring check: /plan status TUI intercept (Finding 3)", () => {
+  // Static grep tests matching the /plan verify pattern. Behavioral tests
+  // would require booting the Ink TUI; static checks prove the intercept
+  // exists and has the correct structure.
+  const appSrcPath = resolve(
+    __dirname,
+    "..",
+    "src",
+    "tui",
+    "components",
+    "App.tsx",
+  );
+
+  it("App.tsx /plan status branch dispatches SYSTEM_MESSAGE and returns without creating a plan", () => {
+    const src = stripComments(readFileSync(appSrcPath, "utf-8"));
+    const m = src.match(
+      /(?:else\s+)?if\s*\([^)]*["']status["'][^)]*\)\s*\{[\s\S]*?\n\s{4,10}\}/,
+    );
+    expect(m).toBeTruthy();
+    const branch = m![0];
+    // Must dispatch a SYSTEM_MESSAGE (not create a plan).
+    expect(branch).toMatch(/SYSTEM_MESSAGE/);
+    // Must return early so it doesn't fall through to plan-creation code.
+    expect(branch).toMatch(/\breturn\b/);
+  });
+
+  it("App.tsx /plan status branch handles the no-plan case with 'No active plan.' message", () => {
+    const src = stripComments(readFileSync(appSrcPath, "utf-8"));
+    const m = src.match(
+      /(?:else\s+)?if\s*\([^)]*["']status["'][^)]*\)\s*\{[\s\S]*?\n\s{4,10}\}/,
+    );
+    expect(m).toBeTruthy();
+    const branch = m![0];
+    expect(branch).toContain("No active plan.");
+  });
+
+  it("App.tsx /plan status branch includes plan title, id, and status in the active-plan case", () => {
+    const src = stripComments(readFileSync(appSrcPath, "utf-8"));
+    const m = src.match(
+      /(?:else\s+)?if\s*\([^)]*["']status["'][^)]*\)\s*\{[\s\S]*?\n\s{4,10}\}/,
+    );
+    expect(m).toBeTruthy();
+    const branch = m![0];
+    expect(branch).toMatch(/pm\.currentPlan/);
+    expect(branch).toMatch(/\.status/);
+    expect(branch).toMatch(/\.title/);
+    expect(branch).toMatch(/\.id/);
+  });
+});
+
 describe("Settings: plan.reinjectionInterval default + override", () => {
   // loadConfig() produces the effective config after merging settings.json.
   // We cast to `any` so the test compiles before the Executor adds the
