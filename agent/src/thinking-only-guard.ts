@@ -232,36 +232,41 @@ export function isThinkingOnlyTermination(
   session: { messages?: unknown[] },
   tracker: TurnActivityTracker,
 ): boolean {
-  if (isThinkingOnlyTerminationByMessages(session)) return true;
-
-  // Fallback gating (R2 finding #2, 2026-04-24): only fire when there
-  // is NO terminal assistant message. If the shape detector abstained
-  // AND a terminal assistant message exists, trust the stop — this
-  // catches legitimate empty completions (stopReason="stop" +
-  // content=[], e.g. the user asked for no output, or a tool-only
-  // turn that emitted no follow-up text). Firing `Continue...`
-  // against those would corrupt a clean stop.
+  // After rounds R1–R7 the message-shape detector covers every
+  // canonical pi-ai shape that ought to retry (thinking-only stops,
+  // retryable transport errors, aborts). The original activity-based
+  // fallback existed as belt-and-suspenders for unseen shapes, but
+  // every concrete case it could fire on today is either wrong or
+  // harmful:
   //
-  // GOTCHA for future callers: `AgentSession.prompt()` has three
-  // early-return-without-assistant-event paths (agent-session.js:500-538):
-  //   1. extension command handled (`/foo` routed to _tryExecuteExtensionCommand)
-  //   2. input handler returned action="handled" (_extensionRunner.emitInput)
-  //   3. already-streaming followUp/steer queue
-  // qlaybot does NOT pass `extensionRunnerRef` to AgentSession (see
-  // agent.ts:397) and slash commands are routed BEFORE `prompt()` by
-  // the CommandRegistry, so paths 1 and 2 are unreachable. Path 3
-  // throws without `streamingBehavior` — also unreachable silently.
-  // This fallback exists to catch those theoretical paths AND any
-  // future case where `prompt()` resolves without adding a message.
-  // See docs/code-review-issue-22-finding2-investigation.md.
-  const msgs = (session.messages ?? []) as any[];
-  const hasTerminalAssistant = msgs.some(
-    (m: any) => m?.role === "assistant" && typeof m.stopReason === "string",
-  );
-  if (hasTerminalAssistant) return false;
-
-  const a = tracker.current();
-  return !a.sawText && !a.sawToolCall;
+  //   - Extension-handled prompts (R7 finding #1, 2026-04-24):
+  //     pi-coding-agent autoloads _extensionRunner whenever
+  //     customTools are passed (agent-session.js:1583-1586) — qlaybot
+  //     always passes them (agent.ts:397), so
+  //     `_tryExecuteExtensionCommand` (agent-session.js:500-505) and
+  //     `_extensionRunner.emitInput` (:510-514) can resolve prompt()
+  //     cleanly with no assistant message and no stream activity.
+  //     The previous R4 #2 gate correctly returned false for this
+  //     case; an inverted "require terminal assistant with stopReason
+  //     + no activity" gate would still mis-fire on (2) and (3) below.
+  //   - Orphan toolUse (R4 finding #1, 2026-04-24): terminal
+  //     assistant with stopReason="toolUse" + a toolCall that the
+  //     agent loop never executed. Shape detector abstains
+  //     (hasToolCall trusts the stop). A Continue-prompt retry here
+  //     would trigger pi-ai's synthetic `"No result provided"`
+  //     toolResult injection (transform-messages.js:125-141) and the
+  //     model would produce confidently-wrong output grounded in a
+  //     fake tool error.
+  //   - Legitimate empty completion (R2 finding #2, 2026-04-24):
+  //     stopReason="stop" + content=[]. Retrying the stop corrupts a
+  //     clean finish.
+  //
+  // No remaining case requires the fallback to fire. Delegate
+  // entirely to the shape detector. The `tracker` parameter is
+  // retained for API stability — callers still wire subscribe /
+  // unsubscribe around the guard, which is harmless.
+  void tracker;
+  return isThinkingOnlyTerminationByMessages(session);
 }
 
 export interface PromptWithGuardOptions {

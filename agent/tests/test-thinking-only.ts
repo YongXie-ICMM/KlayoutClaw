@@ -682,10 +682,19 @@ describe("isThinkingOnlyTermination (combined)", () => {
     tracker.unsubscribe();
   });
 
-  it("fallback catches 'no terminal assistant + no activity'", () => {
+  it("R7: no terminal assistant + no activity → false (extension-handled path, NOT retried)", () => {
+    // R7 finding #1 (2026-04-24) inverted this gate. pi-coding-agent
+    // autoloads extensions whenever customTools is passed
+    // (agent-session.js:1583-1586), and qlaybot always passes
+    // customTools (agent.ts:397). `_tryExecuteExtensionCommand` and
+    // `_extensionRunner.emitInput` can resolve prompt() cleanly with
+    // no assistant message + no stream activity. Treating that as
+    // thinking-only caused spurious 5x retries against handled
+    // commands. The gate now requires a terminal assistant with
+    // stopReason before the activity check runs.
     const s = mockSession([makeUser("go")]);
     const tracker = createTurnActivityTracker(s);
-    expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
   });
 
@@ -775,14 +784,50 @@ describe("isThinkingOnlyTermination (combined)", () => {
     tracker.unsubscribe();
   });
 
-  it("R2: no terminal assistant + no activity still retries (preserves theoretical gotcha)", () => {
-    // The documented theoretical path: `AgentSession.prompt()`
-    // resolves without appending any assistant message AND no
-    // text/tool events fired. This is what the fallback exists to
-    // catch — the narrowing must not break it.
-    const s = mockSession([makeUser("go")]);
+  it("R7: extension-command-handled path (prompt() returns cleanly, no assistant, no events) → false", () => {
+    // Concretely simulates pi-coding-agent's _tryExecuteExtensionCommand
+    // (agent-session.js:500-505 / :612-637): qlaybot sends a
+    // `/extension-cmd` message, pi routes it to an extension handler
+    // which completes synchronously without invoking the model.
+    // session.messages is unchanged from before the call, no stream
+    // events fire. Before R7 this classified as thinking-only and
+    // triggered up to 5 billed model calls via the Continue-prompt.
+    const s = mockSession([makeUser("/my-extension-command arg1 arg2")]);
     const tracker = createTurnActivityTracker(s);
-    expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R7: input-handler-handled path (emitInput returned handled) → false", () => {
+    // agent-session.js:510-514: an input handler short-circuits the
+    // agent loop before prompt() reaches the model. Same shape as the
+    // extension-command case from the guard's perspective — no
+    // assistant message, no activity — must NOT retry.
+    const s = mockSession([makeUser("plain text the input handler consumed")]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R7: unknown future content shape with stopReason + no activity → false (trust the stop)", () => {
+    // The activity-based fallback is now disabled entirely — see the
+    // R7 comment on isThinkingOnlyTermination. An unrecognised future
+    // SDK content block arriving alongside stopReason is trusted: the
+    // model said it finished, so a Continue-prompt would be at least
+    // as likely to corrupt state as to recover anything (cf. the R4
+    // orphan-toolUse synthetic-result injection). If a future pi-ai
+    // change actually requires recovery here, the shape detector is
+    // the right layer to extend.
+    const s = mockSession([
+      makeUser("go"),
+      {
+        role: "assistant",
+        content: [{ type: "future_unknown_block", payload: "x" } as any],
+        stopReason: "stop",
+      } as any,
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
   });
 });
