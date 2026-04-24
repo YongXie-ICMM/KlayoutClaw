@@ -34,6 +34,8 @@ export function createPlanReinjector(
   return async function planReinjector(messages: any[]): Promise<any[]> {
     if (config.interval <= 0) return messages;
     if (!planManager.currentPlan) return messages;
+    if (planManager.currentPlan.status === "abandoned") return messages;
+    if (planManager.currentPlan.status === "completed") return messages;
     if (planManager.inPlanMode) return messages;
     if (planManager.verificationCompleted) return messages;
 

@@ -590,6 +590,75 @@ describe("prunePlanReinjections", () => {
   });
 });
 
+describe("createPlanReinjector: abandoned/completed plan status (Finding 2)", () => {
+  it("plan marked abandoned does not trigger reinjection even when cadence and all other gates pass", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const pm = new PlanManager(makeWorkspace());
+    pm.enterPlanMode("Test plan");
+    pm.writePlanContent("plan body");
+    pm.exitPlanMode(false); // abandoned
+    expect(pm.currentPlan?.status).toBe("abandoned");
+    expect(pm.inPlanMode).toBe(false);
+
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const msgs = [{ role: "user", content: "q" }];
+    const out = await phase(msgs as any);
+    expect(out).toEqual(msgs);
+    expect(
+      out.every(
+        (m: any) => typeof m.content !== "string" || !m.content.includes(PLAN_REINJECTION_OPEN),
+      ),
+    ).toBe(true);
+  });
+
+  it("plan marked completed does not trigger reinjection even when cadence and all other gates pass", async () => {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const pm = new PlanManager(makeWorkspace());
+    pm.enterPlanMode("Test plan");
+    pm.writePlanContent("plan body");
+    pm.closePlanMode("completed");
+    expect(pm.currentPlan?.status).toBe("completed");
+    expect(pm.inPlanMode).toBe(false);
+
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const msgs = [{ role: "user", content: "q" }];
+    const out = await phase(msgs as any);
+    expect(out).toEqual(msgs);
+    expect(
+      out.every(
+        (m: any) => typeof m.content !== "string" || !m.content.includes(PLAN_REINJECTION_OPEN),
+      ),
+    ).toBe(true);
+  });
+
+  it("plan with active/approved status still triggers reinjection normally", async () => {
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    // exitPlanMode(true) sets status to "approved".
+    expect(pm.currentPlan?.status).toBe("approved");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const msgs = [{ role: "user", content: "q" }];
+    const out = await phase(msgs as any);
+    expect(out.length).toBe(msgs.length + 1);
+    expect(
+      out.some(
+        (m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN),
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
   // We assert the literal CALL syntax `.incrementTurnsSinceExit(` (trailing
   // open-paren) so that a stray comment, dead import, or bare identifier
