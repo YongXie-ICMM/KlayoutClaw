@@ -82,34 +82,52 @@ export function createPlanReinjector(
     // round-trips within the same user turn will short-circuit above.
     planManager.markRemindedThisTurn();
 
+    // R4 finding #2: tag the synthetic message with a sentinel field so
+    // the pruner keys on the flag, not substring-matching PLAN_REINJECTION
+    // _OPEN inside content. The old substring pruner would silently drop
+    // legitimate user/assistant messages that happened to mention the
+    // `<plan-reinjection>` tag (e.g. someone asking what it means).
+    const syntheticMsg = {
+      role: "user",
+      content: reminderText,
+      isMeta: true,
+      _planReinjection: true,
+    };
+
     if (lastUserIdx < 0) {
-      return [{ role: "user", content: reminderText, isMeta: true }, ...messages];
+      return [syntheticMsg, ...messages];
     }
     return [
       ...messages.slice(0, lastUserIdx),
-      { role: "user", content: reminderText, isMeta: true },
+      syntheticMsg,
       ...messages.slice(lastUserIdx),
     ];
   };
 }
 
 /**
- * Pruner-side de-duplication. Keeps only the MOST RECENT
- * `<plan-reinjection>` block; earlier ones are dropped so the context
- * doesn't grow unboundedly. Non-reinjection messages are preserved in
- * original order. Messages with non-string content are never filtered.
+ * Pruner-side de-duplication. Keeps only the MOST RECENT synthetic
+ * reinjection message; earlier ones are dropped so the context doesn't
+ * grow unboundedly. Non-reinjection messages (including any legitimate
+ * user/assistant content that mentions the `<plan-reinjection>` tag
+ * literally) are preserved.
+ *
+ * R4 finding #2 (2026-04-24): keys on the `_planReinjection: true`
+ * sentinel field set by `createPlanReinjector`. The old implementation
+ * substring-matched `PLAN_REINJECTION_OPEN` inside `content`, which
+ * silently dropped conversation messages that happened to mention the
+ * marker string.
  */
 export function prunePlanReinjections(messages: any[]): any[] {
   let lastReinjectionIdx = -1;
   messages.forEach((m, i) => {
-    if (typeof m?.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN)) {
+    if (m?._planReinjection === true) {
       lastReinjectionIdx = i;
     }
   });
   if (lastReinjectionIdx < 0) return messages;
   return messages.filter((m, i) => {
-    if (typeof m?.content !== "string") return true;
-    if (!m.content.includes(PLAN_REINJECTION_OPEN)) return true;
+    if (m?._planReinjection !== true) return true;
     return i === lastReinjectionIdx;
   });
 }

@@ -833,6 +833,7 @@ describe("prunePlanReinjections", () => {
     const mkInjection = (n: number) => ({
       role: "user",
       isMeta: true,
+      _planReinjection: true,
       content: `${PLAN_REINJECTION_OPEN}\nReinjection #${n}\nplan body v${n}\n${PLAN_REINJECTION_CLOSE}`,
     });
 
@@ -889,6 +890,7 @@ describe("prunePlanReinjections", () => {
     const injection = {
       role: "user",
       isMeta: true,
+      _planReinjection: true,
       content: `${PLAN_REINJECTION_OPEN}\nonly\n${PLAN_REINJECTION_CLOSE}`,
     };
     const messages = [structured, injection, structured];
@@ -913,6 +915,104 @@ describe("prunePlanReinjections", () => {
     ];
     const out = prunePlanReinjections(messages as any);
     expect(out).toEqual(messages);
+  });
+
+  // R4 finding #2 (2026-04-24): pruner must key on the synthetic sentinel
+  // field, not substring-match content. The old substring pruner silently
+  // dropped legitimate user/assistant messages that mentioned the
+  // <plan-reinjection> tag literally.
+  it("does NOT drop legitimate messages that mention <plan-reinjection> literally (R4 #2 repro)", async () => {
+    const { prunePlanReinjections } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    // Codex's exact repro from the review doc: no sentinel fields on
+    // these messages — they're organic conversation content.
+    const messages = [
+      { role: "user", content: "what does <plan-reinjection> mean?" },
+      {
+        role: "assistant",
+        content: "It is the tag <plan-reinjection> used for reminders.",
+      },
+      { role: "user", content: "next question" },
+    ];
+    const out = prunePlanReinjections(messages as any);
+    // All three messages preserved — no sentinel means no pruning.
+    expect(out).toEqual(messages);
+  });
+
+  it("keys on _planReinjection sentinel: synthetic reminder + legitimate mention both survive", async () => {
+    const { prunePlanReinjections, PLAN_REINJECTION_OPEN, PLAN_REINJECTION_CLOSE } =
+      await import("../src/compaction/plan-reinjector.js");
+    const syntheticReminder = {
+      role: "user",
+      isMeta: true,
+      _planReinjection: true,
+      content: `${PLAN_REINJECTION_OPEN}\nplan body\n${PLAN_REINJECTION_CLOSE}`,
+    };
+    const legitMention = {
+      role: "user",
+      content: `the marker looks like ${PLAN_REINJECTION_OPEN} in the reminder`,
+    };
+    const messages = [legitMention, syntheticReminder];
+    const out = prunePlanReinjections(messages as any);
+    // Both survive: legitimate mention has no sentinel, synthetic has it.
+    expect(out.length).toBe(2);
+    expect(out[0]).toBe(legitMention);
+    expect(out[1]).toBe(syntheticReminder);
+  });
+
+  it("combined: two synthetic reminders + a legitimate mention between them → keeps most recent synthetic + legitimate", async () => {
+    const { prunePlanReinjections, PLAN_REINJECTION_OPEN, PLAN_REINJECTION_CLOSE } =
+      await import("../src/compaction/plan-reinjector.js");
+    const mkSynthetic = (n: number) => ({
+      role: "user",
+      isMeta: true,
+      _planReinjection: true,
+      content: `${PLAN_REINJECTION_OPEN}\nv${n}\n${PLAN_REINJECTION_CLOSE}`,
+    });
+    const legitMention = {
+      role: "user",
+      content: `what does ${PLAN_REINJECTION_OPEN} mean?`,
+    };
+    const messages = [mkSynthetic(1), legitMention, mkSynthetic(2)];
+    const out = prunePlanReinjections(messages as any);
+    // Old pruner dropped legitMention because its content includes the
+    // marker. New pruner keys on sentinel → legitMention survives.
+    expect(out.length).toBe(2);
+    expect(out[0]).toBe(legitMention);
+    expect((out[1] as any)._planReinjection).toBe(true);
+    expect((out[1] as any).content).toContain("v2");
+  });
+
+  it("does not prune the sentinel from live reinjector output end-to-end", async () => {
+    // Integration: the real reinjector sets the sentinel, the real pruner
+    // removes older ones and keeps only the newest, and leaves organic
+    // content alone.
+    const { createPlanReinjector, prunePlanReinjections, PLAN_REINJECTION_OPEN } =
+      await import("../src/compaction/plan-reinjector.js");
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    pm.clearRemindedThisTurn();
+    for (let i = 0; i < 3; i++) pm.incrementTurnsSinceExit();
+    const out = await phase([
+      { role: "user", content: "asking about <plan-reinjection>" },
+    ] as any);
+    // Reinjector returned synthetic + user message.
+    expect(out.length).toBe(2);
+    // Find the synthetic: must carry the sentinel.
+    const synth = out.find((m: any) => m._planReinjection === true);
+    expect(synth).toBeDefined();
+    expect((synth as any).content).toContain(PLAN_REINJECTION_OPEN);
+    // Run the pruner: must keep both (one synthetic, one organic mention).
+    const pruned = prunePlanReinjections(out);
+    expect(pruned.length).toBe(2);
+    expect(pruned.find((m: any) => m._planReinjection === true)).toBe(synth);
+    expect(
+      pruned.find(
+        (m: any) => m.content === "asking about <plan-reinjection>",
+      ),
+    ).toBeDefined();
   });
 });
 
