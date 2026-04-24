@@ -398,3 +398,80 @@ describe("R3 finding #1: delegate registration gate", () => {
     expect(parsed.status).toBe("completed");
   });
 });
+
+// ---------------------------------------------------------------------------
+// R4 finding #1: schema contract matches runtime contract.
+//
+// Option B (Type.Union) is not viable on the anthropic-messages translator
+// (it strips unions to {properties:{}, required:[]}), so we use Option C:
+// keep both `prompt` and `task` optional at the schema but surface the
+// either-or runtime requirement in the field descriptions. execute() remains
+// the single source of truth for the actual validation.
+// ---------------------------------------------------------------------------
+describe("R4 finding #1: delegate schema surfaces runtime contract", () => {
+  it("schema: `prompt` description explicitly says REQUIRED (Option C)", () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    const props = (tool.parameters as any).properties;
+    expect(props.prompt).toBeDefined();
+    expect(props.prompt.description).toMatch(/REQUIRED/i);
+    expect(props.prompt.description).toMatch(/task/i);
+  });
+
+  it("schema: `task` description marks it deprecated + fallback-only for either-or contract", () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    const props = (tool.parameters as any).properties;
+    expect(props.task).toBeDefined();
+    expect(props.task.description).toMatch(/deprecated/i);
+    expect(props.task.description).toMatch(/prompt/i);
+  });
+
+  it("runtime regression: new schema {description, prompt} still succeeds", async () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    await tool.execute("tc-R4F1-new", {
+      description: "read a file",
+      prompt: "Read README.md and report the first line.",
+    } as any);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(runner.run.mock.calls[0][0].task).toContain("README");
+  });
+
+  it("runtime regression: legacy {role, task} still succeeds with deprecation warning", async () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    const result = await tool.execute("tc-R4F1-legacy", {
+      role: "designer",
+      task: "Legacy call style.",
+    } as any);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    const parsed = parseResult(result);
+    expect(parsed.warnings.some((w: string) => /deprecated/i.test(w))).toBe(true);
+  });
+
+  it("runtime regression: both missing → clear missing_prompt error, no runner.run call", async () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    const result = await tool.execute("tc-R4F1-missing", {
+      description: "broken",
+    } as any);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(result.details.error).toBe(true);
+    expect(result.content[0].text).toMatch(/missing required parameter.*prompt/i);
+  });
+
+  it("root schema is Type.Object (not Type.Union) so anthropic-messages translator can serialise it", () => {
+    const runner = makeMockRunner();
+    const tool = createDelegateTool(runner, makeSubagentCfg());
+    const schema: any = tool.parameters;
+    // The root must be a plain object schema with `properties` so that
+    // anthropic.js's convertTools (line 669-678) produces a non-empty
+    // input_schema. A Type.Union at the root would surface as `anyOf` and
+    // get stripped to {properties:{}, required:[]} by the translator.
+    expect(schema.type).toBe("object");
+    expect(schema.properties).toBeDefined();
+    expect(schema.anyOf).toBeUndefined();
+    expect(schema.oneOf).toBeUndefined();
+  });
+});

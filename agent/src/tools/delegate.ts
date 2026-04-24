@@ -92,13 +92,33 @@ export function createDelegateTool(
     name: "delegate",
     label: "delegate",
     description: buildDelegateDescription(config),
+    // R4 finding #1: `prompt` is runtime-required (execute() rejects calls
+    // without prompt OR task), but the on-the-wire JSON Schema still marks
+    // every field optional. Option B (Type.Union at the root) was rejected
+    // after verifying that the anthropic-messages translator
+    // (node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js:669-678)
+    // extracts only `.properties` and `.required` from the root object and
+    // drops unions — a `Type.Union` root would be serialised as `{type:
+    // "object", properties: {}, required: []}`, which is worse than today.
+    // Option A (mark `prompt` required at the schema) would break legacy
+    // `{role, task}` callers during the deprecation window.
+    // Going with Option C: keep both optional, surface the runtime contract
+    // in the field descriptions so parent models reading the schema learn
+    // what's expected. execute() remains the single source of truth for the
+    // either-or constraint.
     parameters: Type.Object({
       description: Type.Optional(Type.String({ description: "A short (3-5 word) description of the task" })),
-      prompt: Type.Optional(Type.String({ description: "The task briefing for the subagent. Brief it like a smart colleague who just walked in — include file paths, line numbers, what specifically to do." })),
+      prompt: Type.Optional(Type.String({
+        description:
+          "REQUIRED (unless the deprecated `task` field is provided). The task briefing for the subagent. Brief it like a smart colleague who just walked in — include file paths, line numbers, what specifically to do.",
+      })),
       subagent_type: Type.Optional(Type.String({ description: "Specialized subagent role. Omit for 'general-purpose'." })),
       model: Type.Optional(Type.String({ description: "Optional model override. Format: provider/model-id." })),
-      role: Type.Optional(Type.String({ description: "(Deprecated) Use subagent_type." })),
-      task: Type.Optional(Type.String({ description: "(Deprecated) Use prompt." })),
+      role: Type.Optional(Type.String({ description: "(Deprecated) Use `subagent_type`. Accepted as a fallback if `subagent_type` is absent." })),
+      task: Type.Optional(Type.String({
+        description:
+          "(Deprecated) Use `prompt` instead. Accepted as a fallback only when `prompt` is absent; the delegate call requires either `prompt` or `task`.",
+      })),
       context: Type.Optional(Type.String({ description: "Optional extra context" })),
     }),
     async execute(
