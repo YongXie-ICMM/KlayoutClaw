@@ -13,6 +13,7 @@ import { tasksCommand } from "./tasks.js";
 import { helpCommand } from "./help.js";
 import { exitCommand } from "./exit.js";
 import { compactCommand } from "./compact.js";
+import { planCommand } from "./plan.js";
 
 export interface CommandContext {
   session: QlayBotSession;
@@ -92,6 +93,7 @@ export function createCommandRegistry(): CommandRegistry {
   registry.register(memoryCommand);
   registry.register(tasksCommand);
   registry.register(compactCommand);
+  registry.register(planCommand);
   registry.register(helpCommand);
   registry.register(exitCommand);
   return registry;
@@ -100,5 +102,5 @@ export function createCommandRegistry(): CommandRegistry {
 /** All command names for CLI detection */
 export const COMMAND_NAMES = [
   "model", "mcp", "config", "context", "memory",
-  "tasks", "compact", "help", "exit",
+  "tasks", "compact", "plan", "help", "exit",
 ];

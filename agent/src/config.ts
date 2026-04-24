@@ -12,6 +12,7 @@ import type {
   SubagentConfig,
   SearchConfig,
   EmbeddingConfig,
+  PlanConfig,
 } from "./types/v04-contracts.js";
 
 const QLAYBOT_DIR = join(homedir(), ".qlaybot");
@@ -70,6 +71,7 @@ export interface QlayBotConfig {
   subagent: SubagentConfig;
   search: SearchConfig;
   embedding: EmbeddingConfig;
+  plan: PlanConfig;
   /**
    * §4.4 runtime-ephemeral flag. Controls --verbose behavior (disable
    * transcript truncation, print assembled system prompt, per-turn stats,
@@ -163,6 +165,12 @@ function defaultEmbeddingConfig(): EmbeddingConfig {
   };
 }
 
+function defaultPlanConfig(): PlanConfig {
+  return {
+    reinjectionInterval: 3,
+  };
+}
+
 function defaultConfig(): QlayBotConfig {
   return {
     agent: {
@@ -237,6 +245,7 @@ function defaultConfig(): QlayBotConfig {
     subagent: defaultSubagentConfig(),
     search: defaultSearchConfig(),
     embedding: defaultEmbeddingConfig(),
+    plan: defaultPlanConfig(),
     verbose: false,
     autoApprovePlans: true,
   };
@@ -365,6 +374,9 @@ export function loadConfig(configDir?: string): QlayBotConfig {
       if (settings.embedding) {
         config.embedding = { ...defaultEmbeddingConfig(), ...settings.embedding };
       }
+      if (settings.plan) {
+        config.plan = { ...defaultPlanConfig(), ...settings.plan };
+      }
       if (typeof settings.autoApprovePlans === "boolean") {
         config.autoApprovePlans = settings.autoApprovePlans;
       }
@@ -428,6 +440,7 @@ export function saveSettingsConfig(config: QlayBotConfig, configDir?: string): v
     subagent: config.subagent,
     search: config.search,
     embedding: config.embedding,
+    plan: config.plan,
     autoApprovePlans: config.autoApprovePlans,
   };
   writeFileSync(join(cfgDir, "settings.json"), JSON.stringify(data, null, 2));
@@ -596,6 +609,7 @@ export function initializeUserDir(templateDir: string, baseDir?: string): void {
       subagent: defaults.subagent,
       search: defaults.search,
       embedding: defaults.embedding,
+      plan: defaults.plan,
       autoApprovePlans: defaults.autoApprovePlans,
     }, null, 2));
   }

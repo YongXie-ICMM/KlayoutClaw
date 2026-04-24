@@ -53,8 +53,14 @@ Create `agent/tests/unit/test-plan-reinjection.ts`. Tests required:
 
 **Test Lock:**
 ```
-SHA-256(agent/tests/unit/test-plan-reinjection.ts) = <fill in at end of Phase 1>
+SHA-256(agent/tests/test-plan-reinjection.ts) = e44904892d28b057c818e297845256cc5a76764d75a9f1549922062634f2d84e
+SHA-256(agent/vitest.files.ts) = ea90fa90d9a4de3ac37f5b3596e5cae5f57353b602846f2e7dd19e064c16073e
 ```
+
+Note: test file was placed at `agent/tests/test-plan-reinjection.ts` (flat convention) rather than the originally-specified `agent/tests/unit/` subdir, and registered in `agent/vitest.files.ts` under `unitFiles`. Phase-1 also tightened several ordering / scope invariants (see Appendix B in `.tmp/trd-state.json`):
+- `transformContext` phase order is `prunePlanReinjections → pruner → autoRecall → stateLoader → planReinjector`. autoRecall must precede stateLoader (preserves tier1 bug #8: autoRecall queries on the user's last message, which stateLoader would otherwise push back). planReinjector runs last so its appended plan blob never leaks into either the recall query or the state extraction.
+- Exactly-once `.incrementTurnsSinceExit(` invariant per turn scope (runJSON, rl.on("line"), rpc case prompt, and either agent.ts promptWithRecovery wrapper OR App.tsx handleSubmit).
+- `await`-assignment pattern required for both `planReinjector` and `prunePlanReinjections` in `transformContext`.
 
 All 8 tests should run RED against the current codebase (no implementation yet).
 

@@ -47,6 +47,16 @@ export class PlanManager {
   private _prePlanMode: PlanPermissionMode | null = null;
   private _stateMachine: PlanStateMachineLike | null = null;
   private _approvalMode: PlanApprovalMode = "deferred";
+  private _turnsSinceExit = 0;
+  private _verificationCompleted = false;
+  /**
+   * Set when the agent exits plan mode during an in-flight prompt turn
+   * (e.g. via the `exit_plan_mode` tool). The next
+   * `incrementTurnsSinceExit()` call — which fires on the same turn's
+   * success path in cli / rpc / App.tsx — MUST be swallowed so that the
+   * exit-turn itself doesn't count as post-exit turn 1. Reset on activate.
+   */
+  private _exitedInThisTurn = false;
 
   constructor(workspaceDir: string) {
     this._plansDir = join(workspaceDir, "plans");
@@ -86,6 +96,37 @@ export class PlanManager {
 
   get headless(): boolean {
     return this._approvalMode === "headless";
+  }
+
+  get turnsSinceExit(): number {
+    return this._turnsSinceExit;
+  }
+
+  get verificationCompleted(): boolean {
+    return this._verificationCompleted;
+  }
+
+  incrementTurnsSinceExit(): void {
+    if (!this._currentPlan || this._inPlanMode) return;
+    if (this._exitedInThisTurn) {
+      // Swallow the bump for the turn the agent actually exited plan mode
+      // in. Without this, the exit-turn becomes post-exit turn 1 and the
+      // "turnsSinceExit === 0 means haven't taken a real turn yet" contract
+      // breaks for any interval<=1 or any test that calls exit then a
+      // single increment.
+      this._exitedInThisTurn = false;
+      return;
+    }
+    this._turnsSinceExit++;
+  }
+
+  markVerified(): void {
+    this._verificationCompleted = true;
+    this._emit({
+      type: "plan_verified",
+      planId: this._currentPlan?.id ?? "",
+      timestamp: Date.now(),
+    });
   }
 
   bindSession(session: object): void {
@@ -209,6 +250,34 @@ export class PlanManager {
     return this._currentPlan;
   }
 
+  /**
+   * Arm the one-shot "exit-turn swallow" for the next bump. Called by the
+   * runtime `exit_plan_mode` tool handler when plan mode exits mid-turn
+   * (via a tool call inside an in-flight `session.prompt()`). The next
+   * `incrementTurnsSinceExit()` call is swallowed so the exit-turn itself
+   * doesn't count as post-exit turn 1.
+   *
+   * Kept as a separate method (rather than armed automatically inside
+   * `exitPlanMode`/`closePlanMode`) because the test contract exercises
+   * those methods directly, with an immediate synchronous bump, and
+   * expects the bump to count. Only the mid-turn tool path should arm
+   * the swallow.
+   */
+  markExitedInThisTurn(): void {
+    this._exitedInThisTurn = true;
+  }
+
+  /**
+   * Clear the one-shot exit-turn swallow flag without touching the turn
+   * counter. Use on code paths that run a prompt-cycle but don't own a
+   * matching `incrementTurnsSinceExit()` call — e.g., the TUI `/plan <task>`
+   * auto-submit. Prevents a lingering armed flag from eating the next real
+   * user turn.
+   */
+  consumeExitSwallow(): void {
+    this._exitedInThisTurn = false;
+  }
+
   reenterPlanMode(): Plan | null {
     if (this._inPlanMode) return this._currentPlan;
     if (!this._currentPlan) return null;
@@ -273,6 +342,9 @@ export class PlanManager {
     }
 
     this._currentPlan = plan;
+    this._turnsSinceExit = 0;
+    this._verificationCompleted = false;
+    this._exitedInThisTurn = false;
     this.capturePrePlanMode();
     this._stateMachine?.setState(this._sessionKey, "plan_drafting");
     this._emit({

@@ -303,9 +303,16 @@ async function runInteractivePlain(
     try {
       botSession.history.recordPrompt(input);
       await botSession.session.prompt(input);
+      // Bump plan-reinjection turn counter on the successful user-turn path
+      // (issue #24). The getter no-ops when no plan is active.
+      botSession.planManager?.incrementTurnsSinceExit();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`\nError: ${msg}`);
+    } finally {
+      // issue #24: bound the exit-turn swallow flag to one prompt cycle so
+      // a rejection/abort after exit_plan_mode can't leak into the next turn.
+      botSession.planManager?.consumeExitSwallow();
     }
     rl.prompt();
   });
@@ -376,6 +383,10 @@ async function runJSON(args: CLIArgs): Promise<void> {
   try {
     botSession.history.recordPrompt(args.message);
     await botSession.session.prompt(args.message);
+    // Bump plan-reinjection turn counter on the successful user-turn path
+    // (issue #24). Getter no-ops when no plan is active. Placed here (NOT
+    // inside the thinking-only retry loop) so one user turn = one bump.
+    botSession.planManager?.incrementTurnsSinceExit();
 
     // Guard against premature termination: if the model stopped after a
     // thinking-only response (no text, no tool call), re-prompt to continue.
@@ -405,6 +416,9 @@ async function runJSON(args: CLIArgs): Promise<void> {
     console.log(JSON.stringify(output, null, 2));
     process.exit(1);
   } finally {
+    // issue #24: bound the exit-turn swallow flag to one prompt cycle so a
+    // rejection/abort after exit_plan_mode can't leak into the next turn.
+    botSession.planManager?.consumeExitSwallow();
     unsubscribe();
     turnUnsub();
     await botSession.dispose();

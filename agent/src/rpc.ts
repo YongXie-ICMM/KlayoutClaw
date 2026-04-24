@@ -287,6 +287,9 @@ export async function startRPCServer(opts: {
 
           try {
             await botSession.session.prompt(message);
+            // Bump plan-reinjection turn counter on success (issue #24).
+            // Getter no-ops when no plan is active.
+            botSession.planManager?.incrementTurnsSinceExit();
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
             sendResult(req.id, { status: "completed", response: responseText });
@@ -296,6 +299,9 @@ export async function startRPCServer(opts: {
             sendEvent("error", { message: msg });
             sendError(req.id, -32000, `Prompt failed: ${msg}`);
           } finally {
+            // issue #24: bound the exit-turn swallow flag to one prompt
+            // cycle so a rejection/abort after exit_plan_mode can't leak.
+            botSession.planManager?.consumeExitSwallow();
             unsubscribe();
           }
           break;

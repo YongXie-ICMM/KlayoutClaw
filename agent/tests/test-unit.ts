@@ -177,16 +177,18 @@ describe("CommandRegistry", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("has all 9 commands registered (v0.4.3: /plan removed, handled by App.tsx slash intercept)", () => {
-    // v0.4.3 Group 3 step 10 deleted `src/commands/plan.ts` and its
-    // registration — the `/plan` slash is now intercepted by App.tsx
-    // before the CommandRegistry (spec §1.8.1). COMMAND_NAMES therefore
-    // does NOT contain "plan", and the registry does not register a
-    // plan command.
+  it("has all 10 commands registered (issue #24 reinstates /plan for shared CLI/RPC/TUI handling)", () => {
+    // Issue #24 reversed v0.4.3 group-3 step 10's removal of the /plan
+    // command. /plan verify (the reinjection stop) needs a shared slash-
+    // command handler reachable from CLI, RPC, AND TUI. App.tsx still
+    // intercepts /plan inline for the modal UI flow, but the registry
+    // now also carries a plan handler so non-TUI frontends can dispatch
+    // it. This test was originally pinned at 9 commands with "plan"
+    // explicitly absent — inverted per issue #24.
     const registry = createCommandRegistry();
-    expect(COMMAND_NAMES.length).toBe(9);
-    expect(COMMAND_NAMES).not.toContain("plan");
-    expect(registry.has("plan")).toBe(false);
+    expect(COMMAND_NAMES.length).toBe(10);
+    expect(COMMAND_NAMES).toContain("plan");
+    expect(registry.has("plan")).toBe(true);
     for (const name of COMMAND_NAMES) {
       expect(registry.has(name)).toBe(true);
     }

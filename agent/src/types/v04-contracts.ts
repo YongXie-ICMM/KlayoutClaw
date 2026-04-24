@@ -242,6 +242,18 @@ export interface EmbeddingConfig {
   similarityThreshold: number;
 }
 
+// ---------------------------------------------------------------------------
+// Plan (issue #24)
+// ---------------------------------------------------------------------------
+
+export interface PlanConfig {
+  /**
+   * Number of post-exit turns between plan re-injections. 0 disables
+   * re-injection entirely. Default: 3.
+   */
+  reinjectionInterval: number;
+}
+
 export interface Embedder {
   embed(text: string): Promise<Float32Array>;
   embedBatch(texts: string[]): Promise<Float32Array[]>;

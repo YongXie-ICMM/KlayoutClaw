@@ -15,7 +15,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "config", description: "Show or update configuration", subcommands: ["show", "set", "reset", "setup"] },
   { name: "context", description: "Show agent context" },
   { name: "memory", description: "Show and search memory", subcommands: ["show", "search", "clear"] },
-  { name: "plan", description: "Enter or exit plan mode", subcommands: ["enter", "exit", "status"] },
+  { name: "plan", description: "Enter or exit plan mode; /plan verify stops re-injection reminders", subcommands: ["enter", "exit", "status", "verify"] },
   { name: "tasks", description: "Show background tasks" },
   { name: "compact", description: "Compact conversation context" },
   { name: "help", description: "Show available commands" },

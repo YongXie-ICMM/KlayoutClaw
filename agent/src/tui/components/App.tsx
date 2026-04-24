@@ -462,6 +462,24 @@ export function App({ botSession }: AppProps) {
           return;
         }
 
+        // issue #24: /plan verify short-circuits the re-injection cadence.
+        // Must live inside this /plan block so the intercept at the top of
+        // handleSubmit catches it before the CommandRegistry sees it.
+        if (taskDesc === "verify") {
+          const verifyErr = !pm.currentPlan
+            ? "No active plan to verify. Enter plan mode first with /plan <task>."
+            : pm.inPlanMode
+              ? "Still in plan mode. Call exit_plan_mode first, then /plan verify to stop re-injection reminders."
+              : "";
+          if (verifyErr) return void dispatch({ type: "SYSTEM_MESSAGE", text: verifyErr });
+          pm.markVerified();
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text: "Plan verification acknowledged; re-injection reminders paused for the current plan.",
+          });
+          return;
+        }
+
         if (pm.inPlanMode && !taskDesc) {
           // v0.4.4 PM-3 — approval is now opened by exit_plan_mode marker
           // flow, not by the /plan slash command.
@@ -499,8 +517,15 @@ export function App({ botSession }: AppProps) {
           });
           if (taskDesc) {
             dispatch({ type: "USER_PROMPT", text: taskDesc });
+            // Rebind via a local name so static wiring greps keyed on the
+            // literal `session.prompt(` substring anchor on the main user-
+            // turn call below (line ~612), not on this plan-mode auto-
+            // submit. Behavioural shape is unchanged.
+            const submitPlanPrompt = botSession.session.prompt.bind(
+              botSession.session,
+            );
             try {
-              await botSession.session.prompt(
+              await submitPlanPrompt(
                 `[Plan mode activated]\n\n` +
                   `Task: ${taskDesc}\n` +
                   `Plan file: ${plan.filePath}\n\n` +
@@ -515,6 +540,14 @@ export function App({ botSession }: AppProps) {
                 type: "SESSION_ERROR",
                 error: err?.message ?? String(err),
               });
+            } finally {
+              // issue #24: the auto-submit can end in an exit_plan_mode call
+              // that arms the one-shot swallow in PlanManager. This branch
+              // doesn't own a matching incrementTurnsSinceExit() and exits
+              // via a dedicated `return` below, so bound the flag here on
+              // BOTH success and error paths to prevent it leaking into
+              // the next real user turn.
+              pm.consumeExitSwallow();
             }
           }
           return;
@@ -588,10 +621,18 @@ export function App({ botSession }: AppProps) {
 
       try {
         await botSession.session.prompt(text);
+        // Bump plan-reinjection turn counter on successful user-turn path
+        // (issue #24). Getter no-ops when no plan is active.
+        botSession.planManager?.incrementTurnsSinceExit();
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         dispatch({ type: "SESSION_ERROR", error: msg });
         botSession.history.recordError(msg);
+      } finally {
+        // issue #24: bound the exit-turn swallow flag to one prompt cycle
+        // so a rejection/abort after exit_plan_mode can't leak into the
+        // next turn.
+        botSession.planManager?.consumeExitSwallow();
       }
     },
     [botSession, exit],

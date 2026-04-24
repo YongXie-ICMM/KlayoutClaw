@@ -176,6 +176,10 @@ export function createExitPlanModeTool(
         if (!plan) {
           return ok({ status: "error", message: "Failed to exit plan mode." });
         }
+        // Issue #24: arm the one-shot exit-turn swallow so the in-flight
+        // prompt's success-path bump doesn't count the exit-turn itself
+        // as post-exit turn 1.
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_abandoned",
           plan_id: plan.id,
@@ -188,6 +192,7 @@ export function createExitPlanModeTool(
         if (!legacyPlan) {
           return ok({ status: "error", message: "Failed to exit plan mode." });
         }
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_approved",
           plan_id: legacyPlan.id,
@@ -249,6 +254,7 @@ export function createExitPlanModeTool(
           },
         );
         planManager.closePlanMode("abandoned");
+        planManager.markExitedInThisTurn();
         return ok({
           status: "plan_abandoned",
           plan_id: plan.id,
@@ -277,6 +283,7 @@ export function createExitPlanModeTool(
               return integrityViolation();
             }
             planManager.closePlanMode("approved");
+            planManager.markExitedInThisTurn();
             stateMachine.transition(
               planManager.sessionKey,
               "plan_approved",
@@ -306,6 +313,7 @@ export function createExitPlanModeTool(
               { auto: false, executeAfterApproval: false },
             );
             planManager.closePlanMode("approved");
+            planManager.markExitedInThisTurn();
             return ok({
               status: "plan_approved",
               plan_id: plan.id,
@@ -347,6 +355,7 @@ export function createExitPlanModeTool(
           );
           planSlugCache.delete(planManager.sessionKey);
           planManager.exitPlanMode(false);
+          planManager.markExitedInThisTurn();
           return ok({
             status: "plan_abandoned",
             plan_id: plan.id,
@@ -366,6 +375,7 @@ export function createExitPlanModeTool(
           );
           planSlugCache.delete(planManager.sessionKey);
           planManager.exitPlanMode(false);
+          planManager.markExitedInThisTurn();
           return ok({
             status: "plan_abandoned",
             reason: "caller_disconnected",
@@ -388,6 +398,7 @@ export function createExitPlanModeTool(
           return integrityViolation();
         }
         planManager.closePlanMode("approved");
+        planManager.markExitedInThisTurn();
         stateMachine.transition(
           planManager.sessionKey,
           "plan_approved",
