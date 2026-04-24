@@ -636,10 +636,10 @@ export function App({ botSession }: AppProps) {
       botSession.history.recordPrompt(text);
 
       try {
-        await botSession.session.prompt(text);
-        // Bump plan-reinjection turn counter on successful user-turn path
-        // (issue #24). Getter no-ops when no plan is active.
+        // Bump BEFORE prompt so transformContext sees the correct turn number.
+        // R2 fix: was after, causing off-by-one.
         botSession.planManager?.incrementTurnsSinceExit();
+        await botSession.session.prompt(text);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         dispatch({ type: "SESSION_ERROR", error: msg });

@@ -286,10 +286,10 @@ export async function startRPCServer(opts: {
           });
 
           try {
-            await botSession.session.prompt(message);
-            // Bump plan-reinjection turn counter on success (issue #24).
-            // Getter no-ops when no plan is active.
+            // Bump BEFORE prompt so transformContext sees the correct turn
+            // number. R2 fix: was after, causing off-by-one.
             botSession.planManager?.incrementTurnsSinceExit();
+            await botSession.session.prompt(message);
             const responseText = chunks.join("");
             botSession.history.recordResponse(responseText);
             sendResult(req.id, { status: "completed", response: responseText });

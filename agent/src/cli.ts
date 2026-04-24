@@ -302,10 +302,10 @@ async function runInteractivePlain(
 
     try {
       botSession.history.recordPrompt(input);
-      await botSession.session.prompt(input);
-      // Bump plan-reinjection turn counter on the successful user-turn path
-      // (issue #24). The getter no-ops when no plan is active.
+      // Bump BEFORE prompt so transformContext (running inside prompt) sees
+      // the correct turn number. R2 fix: was after, causing off-by-one.
       botSession.planManager?.incrementTurnsSinceExit();
+      await botSession.session.prompt(input);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`\nError: ${msg}`);
@@ -382,11 +382,11 @@ async function runJSON(args: CLIArgs): Promise<void> {
 
   try {
     botSession.history.recordPrompt(args.message);
-    await botSession.session.prompt(args.message);
-    // Bump plan-reinjection turn counter on the successful user-turn path
-    // (issue #24). Getter no-ops when no plan is active. Placed here (NOT
-    // inside the thinking-only retry loop) so one user turn = one bump.
+    // Bump BEFORE prompt so transformContext sees the correct turn number.
+    // Placed outside the thinking-only retry loop: one user turn = one bump.
+    // R2 fix: was after, causing off-by-one.
     botSession.planManager?.incrementTurnsSinceExit();
+    await botSession.session.prompt(args.message);
 
     // Guard against premature termination: if the model stopped after a
     // thinking-only response (no text, no tool call), re-prompt to continue.

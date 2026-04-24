@@ -344,6 +344,67 @@ describe("createPlanReinjector: cadence (interval=3)", () => {
   });
 });
 
+describe("createPlanReinjector: cadence correctness (R2 finding #1)", () => {
+  it("with interval=3: fires on turn 3 (not 4), absent on turns 1-2", async () => {
+    // Explicit regression for the off-by-one bug (R2 F1). With pre-increment
+    // semantics (bump BEFORE transformContext runs), turnsSinceExit=3 on turn
+    // 3 → 3%3=0 → fire. Previously the increment was post-prompt so
+    // transformContext saw turnsSinceExit=2 on turn 3 and fired on turn 4.
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const { pm } = await activatePlanAndExit("plan body");
+    const phase = createPlanReinjector(pm, { interval: 3 });
+
+    const userMsg = () => [{ role: "user", content: "prompt" }];
+
+    pm.incrementTurnsSinceExit(); // turn 1
+    let out = await phase(userMsg() as any);
+    expect(out.some((m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN))).toBe(false);
+
+    pm.incrementTurnsSinceExit(); // turn 2
+    out = await phase(userMsg() as any);
+    expect(out.some((m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN))).toBe(false);
+
+    pm.incrementTurnsSinceExit(); // turn 3
+    expect(pm.turnsSinceExit).toBe(3);
+    out = await phase(userMsg() as any);
+    expect(out.some((m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN))).toBe(true);
+  });
+
+  it("exit-turn swallow: pre-prompt increment is a no-op while inPlanMode; first real post-exit turn fires at interval=1", async () => {
+    // With Option A (pre-prompt increment), the bump for the exit turn is
+    // naturally suppressed by the _inPlanMode guard — incrementTurnsSinceExit
+    // is a no-op when inPlanMode=true. After consumeExitSwallow clears the
+    // flag, the first real post-exit turn's increment fires normally.
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { createPlanReinjector, PLAN_REINJECTION_OPEN } = await import(
+      "../src/compaction/plan-reinjector.js"
+    );
+    const pm = new PlanManager(makeWorkspace());
+    pm.enterPlanMode("Task");
+    pm.writePlanContent("step 1\nstep 2");
+
+    // Simulate pre-prompt increment on the exit turn (plan mode is still active).
+    pm.incrementTurnsSinceExit(); // no-op: inPlanMode=true
+    expect(pm.turnsSinceExit).toBe(0); // counter unchanged
+
+    // Simulate exit_plan_mode tool call inside the prompt.
+    pm.exitPlanMode(true);         // _inPlanMode → false
+    pm.markExitedInThisTurn();     // arm the swallow flag
+    pm.consumeExitSwallow();       // clear flag (no counter change needed)
+    expect(pm.turnsSinceExit).toBe(0); // exit turn still not counted ✓
+
+    // First real post-exit turn.
+    const phase = createPlanReinjector(pm, { interval: 1 });
+    pm.incrementTurnsSinceExit(); // now active, bumps to 1
+    expect(pm.turnsSinceExit).toBe(1);
+    const out = await phase([{ role: "user", content: "next?" }] as any);
+    // interval=1 → fires on turn 1.
+    expect(out.some((m: any) => typeof m.content === "string" && m.content.includes(PLAN_REINJECTION_OPEN))).toBe(true);
+  });
+});
+
 describe("createPlanReinjector: content shape", () => {
   it("inserts a meta user message BEFORE the terminal user message with plan content, markers, and verification instruction", async () => {
     const {
@@ -680,15 +741,10 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     return nextFnRel >= 0 ? after.slice(0, nextFnRel) : after;
   }
 
-  it("agent/src/cli.ts runJSON bumps counter on the primary user-prompt success path", () => {
-    // runJSON has TWO prompt sites: the primary user prompt
-    // `session.prompt(args.message)` (cli.ts:378) and a thinking-only
-    // retry `session.prompt("Continue. ...")` (cli.ts:391). A loose
-    // "increment after some session.prompt(" check passes even if the
-    // increment only fires on retry — wrong semantics (one turn = one
-    // bump, on the user's message). Anchor to the primary prompt and
-    // bound the increment BEFORE the retry prompt / catch clause so it
-    // must live on the success path for the user's message.
+  it("agent/src/cli.ts runJSON bumps counter BEFORE the primary prompt so transformContext sees the correct turn (R2 fix)", () => {
+    // R2 fix: increment must be BEFORE session.prompt so transformContext
+    // (running inside prompt) sees the already-incremented counter. Was
+    // after, causing cadence to fire one turn later than documented.
     const p = resolve(__dirname, "..", "src", "cli.ts");
     expect(existsSync(p)).toBe(true);
     const src = stripComments(readFileSync(p, "utf-8"));
@@ -696,33 +752,18 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     expect(body.length).toBeGreaterThan(0);
     const primaryIdx = body.indexOf(".prompt(args.message)");
     expect(primaryIdx).toBeGreaterThanOrEqual(0);
-    const retryIdx = body.indexOf("session.prompt(", primaryIdx + 1);
-    const catchIdx = body.indexOf("} catch");
-    const boundary = Math.min(
-      retryIdx >= 0 ? retryIdx : Number.MAX_SAFE_INTEGER,
-      catchIdx >= 0 ? catchIdx : Number.MAX_SAFE_INTEGER,
-    );
-    expect(boundary).toBeLessThan(Number.MAX_SAFE_INTEGER);
     const incIdx = body.indexOf(".incrementTurnsSinceExit(");
     expect(incIdx).toBeGreaterThanOrEqual(0);
-    expect(incIdx).toBeGreaterThan(primaryIdx);
-    expect(incIdx).toBeLessThan(boundary);
-    // Exactly-once invariant: one user turn = one bump. If a second
-    // increment exists (e.g. after the thinking-only retry loop), the
-    // counter would double-count on retries and skew cadence.
+    // Increment must appear BEFORE the primary prompt call.
+    expect(incIdx).toBeLessThan(primaryIdx);
+    // Exactly-once invariant: one user turn = one bump.
     const matches = body.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
   });
 
-  it("agent/src/cli.ts runInteractivePlain rl.on('line') handler bumps counter on success path after session.prompt(", () => {
-    // Scope tighter than the whole runInteractivePlain function: the real
-    // user-turn path is only inside the `rl.on("line", async (...) => { ... })`
-    // callback (cli.ts:289). A stray `.incrementTurnsSinceExit(` in the
-    // `rl.on("close", ...)` or SIGINT handler must NOT satisfy this test.
-    // First slice runInteractivePlain, then extract the rl.on("line")
-    // arrow-function body. Bound the increment BEFORE the `} catch` so a
-    // placement inside the error handler fails the test — we only want to
-    // bump the counter when the user's turn actually succeeded.
+  it("agent/src/cli.ts runInteractivePlain rl.on('line') handler bumps counter BEFORE session.prompt( (R2 fix)", () => {
+    // R2 fix: increment must be BEFORE session.prompt so transformContext
+    // sees the correct turn number. Previously after, causing off-by-one.
     const p = resolve(__dirname, "..", "src", "cli.ts");
     const src = stripComments(readFileSync(p, "utf-8"));
     const fnBody = sliceFnBody(src, "function runInteractivePlain");
@@ -733,28 +774,19 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     expect(lineHandler).toBeTruthy();
     const body = lineHandler![0];
     const promptIdx = body.indexOf("session.prompt(");
-    const catchIdx = body.indexOf("} catch");
-    const boundary =
-      catchIdx >= 0 ? catchIdx : Number.MAX_SAFE_INTEGER;
-    expect(boundary).toBeLessThan(Number.MAX_SAFE_INTEGER);
     const incIdx = body.indexOf(".incrementTurnsSinceExit(");
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(incIdx).toBeGreaterThanOrEqual(0);
-    expect(incIdx).toBeGreaterThan(promptIdx);
-    expect(incIdx).toBeLessThan(boundary);
+    // Increment must appear BEFORE the prompt call.
+    expect(incIdx).toBeLessThan(promptIdx);
     // Exactly-once inside the line handler.
     const matches = body.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
   });
 
-  it('agent/src/rpc.ts case "prompt" block bumps counter on success path after session.prompt(', () => {
-    // Scope to the actual `case "prompt": { ... break; }` block inside
-    // startRPCServer. A file-wide ordering check would pass even if the
-    // increment landed in an unrelated case (e.g. "initialize" or
-    // "get_session_info"). Lazy-match from `case "prompt":` to the first
-    // `break;` — unambiguous because the block's try/catch/finally do not
-    // contain `break;` themselves. Then bound the increment BEFORE the
-    // `} catch` so a placement inside the error handler fails.
+  it('agent/src/rpc.ts case "prompt" block bumps counter BEFORE session.prompt( (R2 fix)', () => {
+    // R2 fix: increment must be BEFORE session.prompt so transformContext
+    // sees the correct turn number.
     const p = resolve(__dirname, "..", "src", "rpc.ts");
     expect(existsSync(p)).toBe(true);
     const src = stripComments(readFileSync(p, "utf-8"));
@@ -762,15 +794,11 @@ describe("Wiring check: cli.ts and rpc.ts call incrementTurnsSinceExit", () => {
     expect(m).toBeTruthy();
     const body = m![0];
     const promptIdx = body.indexOf("session.prompt(");
-    const catchIdx = body.indexOf("} catch");
-    const boundary =
-      catchIdx >= 0 ? catchIdx : Number.MAX_SAFE_INTEGER;
-    expect(boundary).toBeLessThan(Number.MAX_SAFE_INTEGER);
     const incIdx = body.indexOf(".incrementTurnsSinceExit(");
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(incIdx).toBeGreaterThanOrEqual(0);
-    expect(incIdx).toBeGreaterThan(promptIdx);
-    expect(incIdx).toBeLessThan(boundary);
+    // Increment must appear BEFORE the prompt call.
+    expect(incIdx).toBeLessThan(promptIdx);
     // Exactly-once inside the `case "prompt"` block.
     const matches = body.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
@@ -817,7 +845,9 @@ describe("Wiring check: TUI prompt path bumps counter", () => {
     return m ? m[0] : null;
   }
 
-  it("either agent.ts promptWithRecovery OR App.tsx handleSubmit bumps counter on user-turn success path", () => {
+  it("either agent.ts promptWithRecovery OR App.tsx handleSubmit bumps counter BEFORE the prompt (R2 fix)", () => {
+    // R2 fix: increment must be BEFORE the prompt call so transformContext
+    // (running inside session.prompt) sees the already-incremented counter.
     const agentSrc = stripComments(readFileSync(agentTsPath, "utf-8"));
     const appSrc = stripComments(readFileSync(appTsxPath, "utf-8"));
     const wrapperBody = extractPromptWrapperBody(agentSrc);
@@ -833,33 +863,20 @@ describe("Wiring check: TUI prompt path bumps counter", () => {
     // At least one location must instrument the TUI turn.
     expect(agentHasBump || appHasBump).toBe(true);
 
-    // Whichever scope has the bump must also satisfy the
-    // success-path ordering + exactly-once invariant.
+    // Whichever scope has the bump must satisfy the before-prompt ordering.
     const chosen = agentHasBump ? wrapperBody! : submitBody!;
     const promptIdx = chosen.indexOf("session.prompt(") >= 0
       ? chosen.indexOf("session.prompt(")
       : chosen.search(/\brawPrompt\s*\(/);
-    // agent.ts wrapper uses rawPrompt(text, options); App.tsx uses
-    // botSession.session.prompt(text). Either anchor is acceptable.
     expect(promptIdx).toBeGreaterThanOrEqual(0);
-    // Find the `} catch` that PAIRS with the user-turn try block. A prior
-    // version searched from the top of `chosen` and matched the FIRST
-    // `} catch`, which in handleSubmit is the nested /compact try/catch
-    // (or any other nested error handler preceding the user-turn try).
-    // That forced the Executor to rewrite /compact with promise .then/
-    // .catch/.finally to move its `} catch` out of the way — a test-
-    // driven hack. Fix: search for `} catch` STARTING FROM the prompt
-    // anchor, not from the top, so nested earlier catches are ignored.
-    const catchIdx = chosen.indexOf("} catch", promptIdx);
-    const boundary = catchIdx >= 0 ? catchIdx : Number.MAX_SAFE_INTEGER;
+
     const incIdx = chosen.indexOf(".incrementTurnsSinceExit(");
     expect(incIdx).toBeGreaterThanOrEqual(0);
-    expect(incIdx).toBeGreaterThan(promptIdx);
-    expect(incIdx).toBeLessThan(boundary);
+    // R2 fix: increment must be BEFORE the prompt call.
+    expect(incIdx).toBeLessThan(promptIdx);
 
     // Exactly-once inside whichever scope owns the bump.
-    const matches =
-      chosen.match(/\.incrementTurnsSinceExit\(/g) || [];
+    const matches = chosen.match(/\.incrementTurnsSinceExit\(/g) || [];
     expect(matches.length).toBe(1);
   });
 });
