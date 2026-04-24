@@ -603,4 +603,61 @@ describe("isThinkingOnlyTermination (combined)", () => {
     expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
     tracker.unsubscribe();
   });
+
+  // ---------------------------------------------------------------------------
+  // R2 finding #2 (2026-04-24): the activity fallback must not fire when a
+  // terminal assistant message is present. Only the "no terminal assistant at
+  // all" case falls through to the activity signals.
+  // ---------------------------------------------------------------------------
+
+  it("R2: legitimate empty completion (stopReason=stop, content=[], no activity) → false", () => {
+    // User asked for no output, or a tool-only turn that emitted no
+    // follow-up text. Shape detector abstains (no text, no toolCall,
+    // no thinking). Before the R2 gate, the fallback saw !sawText &&
+    // !sawToolCall and fired a spurious `Continue...` retry.
+    const s = mockSession([
+      makeUser("respond with nothing"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R2: legitimate empty completion with streaming (sawText=true, final content=[]) → false", () => {
+    // Edge case: streaming happened but pi-ai normalized away the
+    // (possibly whitespace-only) text blocks, leaving final content=[]
+    // + stopReason="stop". Shape detector abstains. Fallback must not
+    // fire because a terminal assistant message is present.
+    const s = mockSession([
+      makeUser("go"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "stop",
+        content: [],
+      }),
+    ]);
+    const tracker = createTurnActivityTracker(s);
+    s.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "something" },
+    });
+    // sawText=true, but shape abstains; with terminal assistant the
+    // gate short-circuits before even consulting the tracker.
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(false);
+    tracker.unsubscribe();
+  });
+
+  it("R2: no terminal assistant + no activity still retries (preserves theoretical gotcha)", () => {
+    // The documented theoretical path: `AgentSession.prompt()`
+    // resolves without appending any assistant message AND no
+    // text/tool events fired. This is what the fallback exists to
+    // catch — the narrowing must not break it.
+    const s = mockSession([makeUser("go")]);
+    const tracker = createTurnActivityTracker(s);
+    expect(isThinkingOnlyTermination(s, tracker)).toBe(true);
+    tracker.unsubscribe();
+  });
 });

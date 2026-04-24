@@ -198,8 +198,14 @@ export function isThinkingOnlyTermination(
   tracker: TurnActivityTracker,
 ): boolean {
   if (isThinkingOnlyTerminationByMessages(session)) return true;
-  const a = tracker.current();
-  // Fallback: no text, no tool execution → treat as early-exit.
+
+  // Fallback gating (R2 finding #2, 2026-04-24): only fire when there
+  // is NO terminal assistant message. If the shape detector abstained
+  // AND a terminal assistant message exists, trust the stop — this
+  // catches legitimate empty completions (stopReason="stop" +
+  // content=[], e.g. the user asked for no output, or a tool-only
+  // turn that emitted no follow-up text). Firing `Continue...`
+  // against those would corrupt a clean stop.
   //
   // GOTCHA for future callers: `AgentSession.prompt()` has three
   // early-return-without-assistant-event paths (agent-session.js:500-538):
@@ -210,10 +216,16 @@ export function isThinkingOnlyTermination(
   // agent.ts:397) and slash commands are routed BEFORE `prompt()` by
   // the CommandRegistry, so paths 1 and 2 are unreachable. Path 3
   // throws without `streamingBehavior` — also unreachable silently.
-  // If qlaybot ever wires up pi extensions or concurrent prompts,
-  // narrow this fallback to require a terminal assistant message with
-  // `stopReason` present (proof the agent loop actually ran).
+  // This fallback exists to catch those theoretical paths AND any
+  // future case where `prompt()` resolves without adding a message.
   // See docs/code-review-issue-22-finding2-investigation.md.
+  const msgs = (session.messages ?? []) as any[];
+  const hasTerminalAssistant = msgs.some(
+    (m: any) => m?.role === "assistant" && typeof m.stopReason === "string",
+  );
+  if (hasTerminalAssistant) return false;
+
+  const a = tracker.current();
   return !a.sawText && !a.sawToolCall;
 }
 
