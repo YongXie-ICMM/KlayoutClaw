@@ -31,7 +31,17 @@ const DELEGATE_GUIDANCE = `Delegate a task to a subagent. Brief it like a smart 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function emitCancelled(runner: any, toolCallId: string, reason: string): void {
   if (typeof runner?.emit === "function") {
-    runner.emit("cancelled", { toolCallId, reason });
+    // R6 finding #1: pi-agent-core delivers `tool_execution_start` on an async
+    // EventStream, but execute() runs synchronously. A synchronous cancel
+    // emission races ahead of the start subscriber — App.tsx dispatches
+    // SUBAGENT_CANCEL_PLACEHOLDER for an id that hasn't been created yet
+    // (no-op), then SUBAGENT_PLACEHOLDER lands and the row stays "running"
+    // forever. Defer to the next microtask so the start event creates the
+    // placeholder first; queueMicrotask is preferred over setImmediate
+    // (predictable, runs before I/O, no event-loop tick).
+    queueMicrotask(() => {
+      runner.emit("cancelled", { toolCallId, reason });
+    });
   }
 }
 

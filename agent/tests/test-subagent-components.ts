@@ -1487,3 +1487,152 @@ describe("R3 finding #2: delegate emits `cancelled` on validation failures", () 
     expect(events[0].reason).toBe("plan_mode_restricted");
   });
 });
+
+// ---------------------------------------------------------------------------
+// R6 finding #1 — emitCancelled must defer to a microtask so pi-agent-core's
+// async `tool_execution_start` subscriber lands the placeholder BEFORE the
+// cancel arrives. Synchronous emission raced ahead of the start event,
+// leaving the placeholder created (after the cancel was a no-op) stuck in
+// "running" forever.
+// ---------------------------------------------------------------------------
+describe("R6 finding #1: emitCancelled defers to next microtask", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  async function makeDelegate() {
+    const { createDelegateTool } = await import("../src/tools/delegate.js");
+    const { EventEmitter } = await import("events");
+    const runner = Object.assign(new EventEmitter(), { run: vi.fn() });
+    const cfg: SubagentConfig = { enabled: true, logDir: "/tmp", maxLogFiles: 10, roles: {} };
+    return { runner, tool: createDelegateTool(runner as any, cfg) };
+  }
+
+  it("contract: cancelled event does NOT fire synchronously inside execute()", async () => {
+    const { runner, tool } = await makeDelegate();
+    const events: any[] = [];
+    runner.on("cancelled", (ev) => events.push(ev));
+
+    // Kick off execute but do NOT await — capture the synchronous post-state.
+    const pending = (tool as any).execute("tc-sync", { description: "no prompt" });
+
+    // Inside execute(), the missing-prompt branch ran synchronously and
+    // queued the cancel via queueMicrotask. The microtask has NOT drained
+    // yet, so no listener has seen the event.
+    expect(events).toHaveLength(0);
+
+    await pending;
+    // After awaiting, microtasks have drained — cancel arrived.
+    expect(events).toHaveLength(1);
+    expect(events[0].toolCallId).toBe("tc-sync");
+  });
+
+  it("codex timing scenario: pre-queued placeholder lands BEFORE the cancel — final state is clean", async () => {
+    // Models the real production timing where pi-agent-core queues
+    // tool_execution_start (subscriber callback) BEFORE calling execute().
+    // The subscriber sits in the microtask queue; execute() runs sync; if
+    // emitCancelled fired sync it would race ahead of the subscriber.
+    const { runner, tool } = await makeDelegate();
+
+    // Wire the runner's `cancelled` to dispatch into the reducer (mirrors
+    // App.tsx onCancelled). Wire the simulated start subscriber to dispatch
+    // SUBAGENT_PLACEHOLDER.
+    let state: any = initialState;
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // Pre-queue the placeholder dispatch on the microtask queue (this is
+    // what pi-agent-core's EventStream subscriber would do for
+    // tool_execution_start, queued BEFORE execute() is called).
+    Promise.resolve().then(() => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_PLACEHOLDER",
+        toolCallId: "tc-race",
+        role: "general-purpose",
+        task: "",
+      } as TUIAction);
+    });
+
+    // Now run execute() — the cancel microtask is queued AFTER the
+    // pre-queued placeholder microtask above.
+    await (tool as any).execute("tc-race", { description: "no prompt" });
+
+    // Drain any straggling microtasks (defensive).
+    await Promise.resolve();
+
+    // FIFO microtask order: placeholder created first, then cancel removed
+    // it. No phantom row.
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("regression: synchronous start-then-cancel ordering still cleans up (R3 path unchanged)", async () => {
+    const { runner, tool } = await makeDelegate();
+    let state: any = initialState;
+
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // The placeholder is dispatched synchronously BEFORE execute is called
+    // (alternative timing where the subscriber wins immediately).
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-sync-order",
+      role: "general-purpose",
+      task: "",
+    } as TUIAction);
+    expect(state.subagents).toHaveLength(1);
+
+    await (tool as any).execute("tc-sync-order", { description: "no prompt" });
+    await Promise.resolve();
+
+    expect(state.subagents).toHaveLength(0);
+  });
+
+  it("live-run safety: if SUBAGENT_START remaps the id before cancel arrives, the live entry survives", async () => {
+    // Defends against a hypothetical race where the runner actually started
+    // (SUBAGENT_START fired between placeholder and a stale cancel). The
+    // reducer's existing guard (R3 finding #2 reducer test) keeps the live
+    // entry — confirm end-to-end with the new microtask-deferred emit.
+    const { runner, tool } = await makeDelegate();
+    let state: any = initialState;
+
+    runner.on("cancelled", (ev) => {
+      state = tuiReducer(state, {
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      } as TUIAction);
+    });
+
+    // Pre-existing live run for this toolCallId.
+    state = tuiReducer(state, {
+      type: "SUBAGENT_PLACEHOLDER",
+      toolCallId: "tc-live",
+      role: "designer",
+      task: "design",
+    } as TUIAction);
+    state = tuiReducer(state, {
+      type: "SUBAGENT_START",
+      subagentId: "sa-real",
+      toolCallId: "tc-live",
+    } as TUIAction);
+    expect(state.subagents[0].id).toBe("sa-real");
+
+    // A stale cancel for tc-live arrives via the deferred emit.
+    await (tool as any).execute("tc-live", { description: "no prompt" });
+    await Promise.resolve();
+
+    expect(state.subagents).toHaveLength(1);
+    expect(state.subagents[0].id).toBe("sa-real");
+  });
+});
