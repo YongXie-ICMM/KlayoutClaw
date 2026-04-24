@@ -65,7 +65,7 @@ Then just ask:
 
 An autonomous run of the full vdW heterostructure pipeline — load a GDS template, overlay flake-detection results, generate a Hall bar, route every pin to bonding pads — from a single prompt.
 
-https://github.com/user-attachments/assets/8d615606-082a-4204-b7ef-fff0b4a1a830
+https://github.com/user-attachments/assets/f51d5649-e69b-4885-b17f-f849277a05a6
 
 <sub>Video not rendering? Uncompressed copy at [`docs/Demo.mp4`](docs/Demo.mp4).</sub>
 
