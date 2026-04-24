@@ -1219,6 +1219,35 @@ describe("sinceIdx compaction safety (R8.1 finding — gpt-5.5 xhigh final)", ()
     );
   });
 
+  it("invalid_request with numeric limit (max_tokens <= 5000) not mis-classified as retryable (R8.4 final)", () => {
+    // Codex R8.4: bare `500` alternation would match "5000" in
+    // "max_tokens must be <= 5000" → classified retryable → wastes 5
+    // Continue retries + masks the actionable error. Word-boundaried
+    // alternations prevent the false positive.
+    const msgs = [
+      makeUser("bad request"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage:
+          "invalid_request_error: max_tokens must be <= 5000 for this model",
+      }),
+    ];
+    // Should be treated as non-retryable terminal (not retried).
+    expect(isRetryableErrorMessage(msgs[1].errorMessage)).toBe(false);
+    expect(lastTurnTerminalError({ messages: msgs })).toBe(
+      "invalid_request_error: max_tokens must be <= 5000 for this model",
+    );
+  });
+
+  it("genuine 500 server error still matches retryable (R8.4 regression)", () => {
+    expect(
+      isRetryableErrorMessage("HTTP 500: upstream server error"),
+    ).toBe(true);
+    expect(isRetryableErrorMessage("status 500")).toBe(true);
+    expect(isRetryableErrorMessage("got 500 from provider")).toBe(true);
+  });
+
   it("context-overflow msg with retryable-looking token count → surfaces as terminal (R8.2 final)", () => {
     // Non-retryable context-overflow error whose errorMessage contains
     // "250000" (so /500/ in isRetryableErrorMessage matches). Without the

@@ -44,8 +44,11 @@ export const THINKING_ONLY_MAX_RETRIES = 5;
  * `isContextOverflow` because it has its own provider-specific patterns.
  * Keep this regex in sync if pi-coding-agent updates theirs.
  */
+// HTTP status codes are bounded with \b so bare "500" doesn't match
+// "5000" inside e.g. `max_tokens must be <= 5000` (non-retryable 4xx
+// validation errors). R8.4 final (gpt-5.5 xhigh).
 const RETRYABLE_ERROR_PATTERN =
-  /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
+  /overloaded|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
 
 /**
  * Whether an errorMessage looks retryable per pi-coding-agent's
