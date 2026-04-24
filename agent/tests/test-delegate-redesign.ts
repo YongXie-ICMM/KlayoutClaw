@@ -475,3 +475,145 @@ describe("R4 finding #1: delegate schema surfaces runtime contract", () => {
     expect(schema.oneOf).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// R5 finding #1: plan_drafted freeze must NOT wrap delegate. Delegate's own
+// execute() handles plan-mode (returns plan_mode_restricted + emits
+// `cancelled` to clear the TUI placeholder). The generic freeze wrapper
+// short-circuits before execute runs, so the cancelled event never fires and
+// the SUBAGENT_PLACEHOLDER placeholder leaks forever.
+//
+// Combined with R3 finding #1 (delegate registered on enabled:true regardless
+// of roles), the pre-R5 code path wrapped delegate in plan mode and returned
+// {"error":"plan_state_frozen"} — silently leaking the placeholder.
+// ---------------------------------------------------------------------------
+describe("R5 finding #1: plan_drafted freeze carves out delegate", () => {
+  async function setupAssembledToolMap() {
+    const { PlanManager } = await import("../src/planning/index.js");
+    const { PlanStateMachine } = await import("../src/planning/state-machine.js");
+    const { TranscriptMarkerEmitter } = await import("../src/events/marker-emitter.js");
+    const os = await import("node:os");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "qlaybot-r5-"));
+    const planManager = new PlanManager(workspaceDir);
+    const stateMachine = new PlanStateMachine(new TranscriptMarkerEmitter());
+    planManager.attachStateMachine(stateMachine);
+    planManager.enterPlanMode("R5 probe");
+    stateMachine.setState(planManager.sessionKey, "plan_drafted");
+
+    const subagent: SubagentConfig = {
+      enabled: true,
+      logDir: "/tmp/qlaybot-r5-logs",
+      maxLogFiles: 10,
+      roles: {},
+    };
+
+    const { toolMap, runner } = assembleTools({
+      config: {
+        subagent,
+        agent: { defaultModel: "custom-anthropic/claude-sonnet-4-6", thinkingLevel: "medium" },
+      },
+      mcpManager: {
+        allTools: () => [],
+        callTool: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+      },
+      memoryManager: { save: async () => {}, search: async () => [] },
+      cwd: workspaceDir,
+      workspaceDir,
+      annotations: TOOL_ANNOTATIONS,
+      getApiKey: async () => "test-key",
+      defaultModel: "custom-anthropic/claude-sonnet-4-6",
+      defaultThinkingLevel: "medium",
+      modelRegistry: {
+        find: () => ({ id: "mock", provider: "mock", api: "anthropic-messages" }),
+      },
+      planManager,
+      isSubagent: false,
+    } as any);
+
+    return { toolMap, runner, planManager };
+  }
+
+  it("codex repro: delegate.execute in plan_drafted returns plan_mode_restricted (NOT plan_state_frozen) and emits cancelled", async () => {
+    const { toolMap, runner } = await setupAssembledToolMap();
+    const delegateTool = toolMap.delegate;
+    expect(delegateTool).toBeDefined();
+
+    // Spy on runner.emit to capture the cancelled event delegate.execute
+    // fires when the plan-mode gate rejects.
+    const emitted: Array<{ event: string; payload: any }> = [];
+    const origEmit = (runner as any).emit.bind(runner);
+    (runner as any).emit = (event: string, payload: any) => {
+      emitted.push({ event, payload });
+      return origEmit(event, payload);
+    };
+
+    // Also pre-spy runner.run so we can assert it's not reached.
+    const runSpy = vi.fn();
+    (runner as any).run = runSpy;
+
+    const result = await (delegateTool as any).execute("tc-R5-repro", {
+      description: "x",
+      prompt: "hello",
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.error).toBe("plan_mode_restricted");
+    expect(body.error).not.toBe("plan_state_frozen");
+    expect(body.tool).toBe("delegate");
+    expect(result.details?.planModeRestricted).toBe(true);
+
+    // The critical assertion for the TUI: delegate emits cancelled so the
+    // placeholder is cleared via SUBAGENT_CANCEL_PLACEHOLDER.
+    const cancelledEvents = emitted.filter((e) => e.event === "cancelled");
+    expect(cancelledEvents).toHaveLength(1);
+    expect(cancelledEvents[0].payload.toolCallId).toBe("tc-R5-repro");
+    expect(cancelledEvents[0].payload.reason).toBe("plan_mode_restricted");
+
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it("regression: non-delegate tools in plan_drafted still return plan_state_frozen (freeze wrapper intact)", async () => {
+    const { toolMap } = await setupAssembledToolMap();
+    // memory_search is wrapped by wrapToolForPlanDraftedFreeze — it must
+    // still return the plan_state_frozen envelope unchanged.
+    const memTool = toolMap.memory_search;
+    expect(memTool).toBeDefined();
+
+    const result = await (memTool as any).execute("tc-R5-mem", { query: "x" });
+    const body = JSON.parse(result.content[0].text);
+    expect(body.error).toBe("plan_state_frozen");
+    expect(body.state).toBe("plan_drafted");
+  });
+
+  it("TUI path: delegate cancel event flows through SUBAGENT_CANCEL_PLACEHOLDER (no phantom row)", async () => {
+    const { toolMap, runner } = await setupAssembledToolMap();
+    const delegateTool = toolMap.delegate;
+
+    // Subscribe to the cancelled event the way App.tsx does.
+    const dispatched: any[] = [];
+    (runner as any).on("cancelled", (ev: any) => {
+      dispatched.push({
+        type: "SUBAGENT_CANCEL_PLACEHOLDER",
+        toolCallId: ev.toolCallId,
+        reason: ev.reason,
+      });
+    });
+
+    await (delegateTool as any).execute("tc-R5-tui", {
+      description: "y",
+      prompt: "hello",
+    });
+
+    // The TUI subscription must have observed a dispatch matching the
+    // placeholder clear — this is what prevents the phantom "running" row.
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toEqual({
+      type: "SUBAGENT_CANCEL_PLACEHOLDER",
+      toolCallId: "tc-R5-tui",
+      reason: "plan_mode_restricted",
+    });
+  });
+});

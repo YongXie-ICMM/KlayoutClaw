@@ -308,7 +308,12 @@ export function assembleTools(opts: any): any {
       toolMap[exitTool.name] = exitTool;
       if (toolMap.memory_save) toolMap.memory_save = wrapToolForPlanDraftedFreeze(toolMap.memory_save, planManager);
       if (toolMap.memory_search) toolMap.memory_search = wrapToolForPlanDraftedFreeze(toolMap.memory_search, planManager);
-      if (toolMap.delegate) toolMap.delegate = wrapToolForPlanDraftedFreeze(toolMap.delegate, planManager);
+      // R5 finding #1: do NOT wrap delegate with the plan_drafted freeze.
+      // Its own execute() already handles plan-mode (returns
+      // plan_mode_restricted + emits `cancelled` so the TUI clears the
+      // SUBAGENT_PLACEHOLDER). The freeze wrapper short-circuits before
+      // execute runs, so the cancelled event never fires and the placeholder
+      // leaks. Delegate owns its own plan-mode contract.
       if (toolMap.thinking) toolMap.thinking = wrapToolForPlanDraftedFreeze(toolMap.thinking, planManager);
       toolMap[enterTool.name] = wrapToolForPlanDraftedFreeze(toolMap[enterTool.name], planManager);
       toolMap[exitTool.name] = wrapToolForPlanDraftedFreeze(toolMap[exitTool.name], planManager);
