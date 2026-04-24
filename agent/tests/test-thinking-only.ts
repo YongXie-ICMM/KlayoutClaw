@@ -34,6 +34,7 @@ import {
   isThinkingOnlyTermination,
   isThinkingOnlyTerminationByMessages,
   lastTurnTerminalError,
+  runPromptWithThinkingOnlyGuard,
 } from "../src/thinking-only-guard.js";
 
 // ---------------------------------------------------------------------------
@@ -1082,5 +1083,88 @@ describe("sinceIdx boundary (R8 finding #2)", () => {
     expect(lastTurnTerminalError({ messages: msgs }, sinceIdx)).toBe(
       "401 Invalid API key",
     );
+  });
+});
+
+describe("sinceIdx compaction safety (R8.1 finding — gpt-5.5 xhigh final)", () => {
+  // AgentSession.prompt() can perform pre-prompt or overflow compaction
+  // that REPLACES session.messages with a shorter array before appending
+  // the current turn. runPromptWithThinkingOnlyGuard rebinds sinceIdx=0
+  // when it detects a shrink so the scans still find the current assistant
+  // turn. Exercises the rebind via the user-facing API — no direct access
+  // to the private helper.
+
+  it("compaction shrinks messages → guard rebinds and still detects current-turn error", async () => {
+    // Pre-prompt: persistent session with 20 messages (long history simulation).
+    const priorHistory = Array.from({ length: 20 }, (_, i) =>
+      makeUser(`prior turn ${i}`),
+    );
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // Simulate pi-coding-agent: compaction drops history to 2 messages,
+        // then appends the current assistant turn (a retryable error).
+        session.messages = [
+          makeUser("compacted system context"),
+          makeAssistant("custom-anthropic", {
+            stopReason: "error",
+            content: [],
+            errorMessage: "overloaded_error",
+          }),
+        ];
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "user turn",
+      tracker,
+    );
+    // sinceIdx started at 20; after compaction messages.length=2 (< 20) →
+    // rebind to 0. The retryable-error shape is then detected, retries fire
+    // (stalled on the mock — same shape every call), and stillThinkingOnly
+    // reflects the real state. Critical assertion: sinceIdx is NOT left
+    // pointing past the end of the compacted array.
+    expect(result.sinceIdx).toBe(0);
+    expect(result.retries).toBeGreaterThan(0);
+    // Final check — lastTurnTerminalError sees the compacted current turn.
+    expect(lastTurnTerminalError(session, result.sinceIdx)).toBeNull();
+    // (errorMessage "overloaded_error" is retryable, so it returns null)
+  });
+
+  it("no compaction → sinceIdx preserved, boundary respected (R8 #2 regression)", async () => {
+    const priorHistory = [
+      makeUser("prior user"),
+      makeAssistant("custom-anthropic", {
+        stopReason: "error",
+        content: [],
+        errorMessage: "overloaded_error", // retryable prior error
+      }),
+    ];
+    const session = {
+      messages: priorHistory.slice(),
+      prompt: async () => {
+        // No compaction — session.messages grows, current turn appended clean.
+        session.messages.push(
+          makeAssistant("custom-anthropic", {
+            stopReason: "stop",
+            content: [{ type: "text", text: "done" }],
+          }),
+        );
+      },
+      subscribe: () => () => {},
+    };
+    const tracker = createTurnActivityTracker(session);
+    const result = await runPromptWithThinkingOnlyGuard(
+      session,
+      "user turn",
+      tracker,
+    );
+    // sinceIdx captured pre-prompt at 2. No shrink → stays at 2 so the
+    // scan skips the prior retryable-error turn and sees the clean stop.
+    expect(result.sinceIdx).toBe(2);
+    expect(result.retries).toBe(0);
+    expect(result.stillThinkingOnly).toBe(false);
   });
 });

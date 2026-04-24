@@ -386,10 +386,26 @@ export async function runPromptWithThinkingOnlyGuard(
   // an extension-handled / no-output current turn would inspect the
   // prior turn's trailing assistant shape and retry against stale
   // state.
-  const sinceIdx = session.messages?.length ?? 0;
+  //
+  // R8.1 finding (2026-04-24, gpt-5.5 xhigh final): AgentSession.prompt()
+  // can run pre-prompt / overflow compaction that REPLACES
+  // session.messages with a shorter array before appending the current
+  // turn. A raw pre-prompt snapshot would point past the new array's
+  // end → scans never iterate → current-turn error missed → silent
+  // empty success (the original ml09/ml11 failure class). Recompute the
+  // boundary after each prompt: if the history shrunk below the
+  // snapshot, compaction dropped the stale prior-turn shape anyway so
+  // it's safe to scan everything (sinceIdx = 0) for the current turn.
+  let sinceIdx = session.messages?.length ?? 0;
+  const reboundAfterCompaction = (): number => {
+    const n = session.messages?.length ?? 0;
+    if (n < sinceIdx) sinceIdx = 0;
+    return sinceIdx;
+  };
 
   tracker.reset();
   await session.prompt(message);
+  reboundAfterCompaction();
 
   let retries = 0;
   while (
@@ -400,6 +416,7 @@ export async function runPromptWithThinkingOnlyGuard(
     opts.onRetry?.(retries, maxRetries);
     tracker.reset();
     await session.prompt(continuePrompt);
+    reboundAfterCompaction();
   }
 
   const stillThinkingOnly = isThinkingOnlyTermination(
