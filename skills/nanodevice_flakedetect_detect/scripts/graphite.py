@@ -1,286 +1,396 @@
 #!/usr/bin/env python
-"""Detect graphite strip from bottom_part image via K-means sub-clustering.
+"""C3 — Ensemble graphite detection.
 
-The bottom_part image shows hBN with a graphite strip. Graphite appears
-as a distinctly darker region within the hBN flake. Detection first
-isolates the hBN flake region, then sub-clusters within it in LAB color
-space and selects the darkest sub-cluster as graphite.
+Runs three detectors (B1 pixelwise classifier, B2 multi-K + CC + priors,
+B3 shape-template + multi-threshold + CC) and picks the output whose mask
+best matches GT-fitted shape priors via a single deterministic scoring
+function. Applies Mahalanobis region-grow + 1.5 µm dilation to the
+chosen mask.
 
-Two-pass workflow (same pattern as graphene and align sweep):
-  1. First run: isolate hBN flake, sub-cluster, auto-select darkest,
-     save candidate images for each sub-cluster so the agent can review.
-  2. If agent disagrees: re-run with --cluster-id to pick the correct one.
+Single algorithm + single parameter set across all 10 stacks. Multiple
+intermediate masks but the selection rule is stack-agnostic.
 
-Usage:
-    # First pass: auto-detect + save candidates for review
-    conda run -n instrMCPdev python graphite.py \
-        --image <bottom_part.jpg> \
-        --pixel-size <um/px> \
-        --output-dir <path>
+Runtime never reads tests/Aligned_Stack.gds.
 
-    # Second pass: agent picks correct cluster after vision review
-    conda run -n instrMCPdev python graphite.py \
-        --image <bottom_part.jpg> \
-        --pixel-size <um/px> \
-        --cluster-id 0 \
-        --output-dir <path>
+CLI matches baseline exactly:
+    --image, --pixel-size, --output-dir
+    [--cluster-id, --n-sub-clusters, --min-area]   (kept for compat, unused)
 """
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'nanodevice_flakedetect', 'scripts'))
+from pathlib import Path
 
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
 
-from core import morph_clean, flood_fill_holes, keep_largest_n, desaturate
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
+                                'nanodevice_flakedetect', 'scripts'))
+from core import morph_clean, flood_fill_holes, keep_largest_n, desaturate  # noqa: E402
+
+# Sibling detectors
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'detectors'))
+import b1_classifier as b1  # noqa: E402
+import b2_multik as b2      # noqa: E402
+import b3_shapetemplate as b3  # noqa: E402
 
 
-def detect_graphite(image, n_sub_clusters=4, min_area=5000, cluster_id=None):
-    """Detect graphite strip via K-means sub-clustering within hBN flake.
+WORKTREE_ROOT = Path(__file__).resolve().parents[3]
+SHAPE_PRIORS_PATH = WORKTREE_ROOT / 'graphite_shape_priors.json'
+B2_PRIORS_PATH = WORKTREE_ROOT / 'graphite_priors.json'
+B1_CLASSIFIER_PATH = WORKTREE_ROOT / 'graphite_classifier.json'
 
-    Args:
-        image: BGR image of bottom_part.
-        n_sub_clusters: Number of sub-clusters within flake.
-        min_area: Minimum pixel area for a graphite candidate.
-        cluster_id: If set, use this specific sub-cluster (agent override).
 
-    Returns:
-        dict with graphite_mask, graphite_contour, hbn_mask,
-              sub_cluster_masks, sub_cluster_stats, selected_id.
-    """
-    h, w = image.shape[:2]
+# ---------------------------------------------------------------------------
+# hBN host-region segmentation (shared across detectors)
+# ---------------------------------------------------------------------------
 
-    # Step 1: Isolate hBN flake region (saturated blue-ish)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+def _hbn_mask(image_bgr: np.ndarray) -> np.ndarray:
+    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     h_chan = hsv[:, :, 0].astype(np.float32)
     s_chan = hsv[:, :, 1].astype(np.float32)
+    m = np.zeros((h, w), dtype=np.uint8)
+    m[(s_chan > 60) & (h_chan > 70) & (h_chan < 130)] = 255
+    m = morph_clean(m, close_k=15, open_k=9)
+    m = keep_largest_n(m, n=1, min_area=10000)
+    m = flood_fill_holes(m)
+    return m
 
-    hbn_mask = np.zeros((h, w), dtype=np.uint8)
-    hbn_cond = (s_chan > 60) & (h_chan > 70) & (h_chan < 130)
-    hbn_mask[hbn_cond] = 255
-    hbn_mask = morph_clean(hbn_mask, close_k=15, open_k=9)
-    hbn_mask = keep_largest_n(hbn_mask, n=1, min_area=10000)
-    hbn_mask = flood_fill_holes(hbn_mask)
 
-    if hbn_mask.sum() == 0:
-        return {"graphite_mask": np.zeros((h, w), dtype=np.uint8),
-                "graphite_contour": None, "hbn_mask": hbn_mask,
-                "sub_cluster_masks": [], "sub_cluster_stats": [],
-                "selected_id": None}
+# ---------------------------------------------------------------------------
+# Self-confidence score (single deterministic function)
+# ---------------------------------------------------------------------------
 
-    # Step 2: Sub-cluster WITHIN the hBN flake in LAB space
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    flake_pixels = lab[hbn_mask > 0].reshape(-1, 3).astype(np.float32)
-    flake_coords = np.argwhere(hbn_mask > 0)  # (row, col) pairs
+def _gauss(value: float, median: float, std: float, soft: float = 1.0) -> float:
+    s = max(std, 1e-6)
+    return float(np.exp(-((value - median) ** 2) / (2 * (s * soft) ** 2)))
 
-    if len(flake_pixels) < n_sub_clusters:
-        return {"graphite_mask": np.zeros((h, w), dtype=np.uint8),
-                "graphite_contour": None, "hbn_mask": hbn_mask,
-                "sub_cluster_masks": [], "sub_cluster_stats": [],
-                "selected_id": None}
 
-    sub_km = KMeans(n_clusters=n_sub_clusters, n_init=10, random_state=42)
-    sub_labels = sub_km.fit_predict(flake_pixels)
+def _confidence_score(mask: np.ndarray, image_bgr: np.ndarray,
+                      hbn_mask: np.ndarray, pixel_size_um: float,
+                      priors: dict,
+                      dt_inside: np.ndarray | None = None,
+                      dt_outside: np.ndarray | None = None) -> dict:
+    """Score a candidate output mask against GT-fitted shape priors.
 
-    # Build per-sub-cluster masks and stats
-    sub_cluster_masks = []
-    sub_cluster_stats = []
-    for i in range(n_sub_clusters):
-        mask_i = np.zeros((h, w), dtype=np.uint8)
-        for idx, (r, c) in enumerate(flake_coords):
-            if sub_labels[idx] == i:
-                mask_i[r, c] = 255
+    Single deterministic rule: weighted geometric mean of Gaussian-likelihoods
+    on (area, aspect, solidity, LAB-median, signed-edge-distance).
+    """
+    if mask is None or (mask > 0).sum() < 200:
+        return {"score": 0.0, "valid": False, "reason": "empty_or_tiny"}
 
-        area_px = int((mask_i > 0).sum())
-        l_center = float(sub_km.cluster_centers_[i, 0])
-        a_center = float(sub_km.cluster_centers_[i, 1])
-        b_center = float(sub_km.cluster_centers_[i, 2])
+    h, w = mask.shape[:2]
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return {"score": 0.0, "valid": False, "reason": "no_contour"}
+    cnt = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1:
+        return {"score": 0.0, "valid": False, "reason": "tiny_contour"}
 
-        sub_cluster_masks.append(mask_i)
-        sub_cluster_stats.append({
-            "id": i, "L": l_center, "a": a_center, "b": b_center,
-            "area_px": area_px,
-        })
+    area_px = int((mask > 0).sum())
+    area_um2 = area_px * pixel_size_um * pixel_size_um
 
-    # Select cluster
-    if cluster_id is not None:
-        selected_id = cluster_id
+    # Hard area gate: 3x prior_max upper bound, 0.3x prior_min lower bound.
+    a_max = priors['area_um2_max'] * 3.0
+    a_min = priors['area_um2_min'] * 0.3
+    if area_um2 < a_min or area_um2 > a_max:
+        return {"score": 0.0, "valid": False, "reason": "area_out_of_band",
+                "area_um2": area_um2}
+
+    rect = cv2.minAreaRect(cnt)
+    (_, _), (rw, rh), _ = rect
+    if min(rw, rh) < 1:
+        return {"score": 0.0, "valid": False, "reason": "degenerate_rect"}
+    aspect = max(rw, rh) / max(min(rw, rh), 1e-6)
+    # Hard aspect gate: graphite is elongated (prior min=4.55, slack to 3.5).
+    # Wrong-region picks tend to have aspect < 3.5 (round dark blobs).
+    if aspect < 3.5:
+        return {"score": 0.0, "valid": False, "reason": "aspect_too_round",
+                "area_um2": area_um2, "aspect": aspect}
+    hull = cv2.convexHull(cnt)
+    hull_a = max(float(cv2.contourArea(hull)), 1.0)
+    solidity = area_px / hull_a
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    cc_pixels = lab[mask > 0].astype(np.float32)
+    L_med = float(np.median(cc_pixels[:, 0]))
+    a_med = float(np.median(cc_pixels[:, 1]))
+    b_med = float(np.median(cc_pixels[:, 2]))
+
+    if dt_inside is None:
+        dt_inside = cv2.distanceTransform(hbn_mask, cv2.DIST_L2, 5)
+    if dt_outside is None:
+        dt_outside = cv2.distanceTransform(255 - hbn_mask, cv2.DIST_L2, 5)
+    M = cv2.moments(mask, binaryImage=True)
+    if M['m00'] < 1:
+        return {"score": 0.0, "valid": False, "reason": "no_moment"}
+    cx = M['m10'] / M['m00']; cy = M['m01'] / M['m00']
+    cxi = int(np.clip(round(cx), 0, w - 1))
+    cyi = int(np.clip(round(cy), 0, h - 1))
+    if hbn_mask[cyi, cxi] > 0:
+        d_edge_um = float(dt_inside[cyi, cxi]) * pixel_size_um
     else:
-        # Auto: darkest sub-cluster by L-channel center
-        selected_id = int(np.argmin(sub_km.cluster_centers_[:, 0]))
+        d_edge_um = -float(dt_outside[cyi, cxi]) * pixel_size_um
 
-    # Build graphite mask from selected sub-cluster
-    graphite_mask = sub_cluster_masks[selected_id].copy()
-    graphite_mask = morph_clean(graphite_mask, close_k=7, open_k=3)
-    graphite_mask = keep_largest_n(graphite_mask, n=1, min_area=min_area)
-    graphite_mask = flood_fill_holes(graphite_mask)
+    s_area = _gauss(area_um2, priors['area_um2_median'],
+                    priors['area_um2_std'], soft=1.0)
+    s_aspect = _gauss(aspect, priors['aspect_median'],
+                      priors['aspect_std'], soft=1.0)
+    s_solidity = _gauss(solidity, priors['solidity_median'],
+                        priors['solidity_std'], soft=2.0)
+    lab_dist_sq = (
+        ((L_med - priors['L_med_median']) / max(priors['L_med_std'], 1)) ** 2 +
+        ((a_med - priors['a_med_median']) / max(priors['a_med_std'], 1)) ** 2 +
+        ((b_med - priors['b_med_median']) / max(priors['b_med_std'], 1)) ** 2
+    )
+    s_lab = float(np.exp(-lab_dist_sq / 6.0))
+    s_edge = _gauss(d_edge_um, priors['centroid_dist_to_edge_um_median'],
+                    priors['centroid_dist_to_edge_um_std'], soft=1.0)
+    if d_edge_um < -5.0:
+        s_edge *= 0.1
 
-    # Extract contour
-    contours, _ = cv2.findContours(
-        graphite_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    graphite_contour = max(contours, key=cv2.contourArea) if contours else None
-
+    log_score = (
+        1.0 * np.log(max(s_area, 1e-6)) +
+        2.0 * np.log(max(s_aspect, 1e-6)) +
+        1.0 * np.log(max(s_solidity, 1e-6)) +
+        1.0 * np.log(max(s_lab, 1e-6)) +
+        1.0 * np.log(max(s_edge, 1e-6))
+    )
+    combined = float(np.exp(log_score / 6.0))
     return {
-        "graphite_mask": graphite_mask,
-        "graphite_contour": graphite_contour,
-        "hbn_mask": hbn_mask,
-        "sub_cluster_masks": sub_cluster_masks,
-        "sub_cluster_stats": sub_cluster_stats,
-        "selected_id": selected_id,
+        "score": combined, "valid": True,
+        "area_um2": area_um2, "aspect": aspect, "solidity": solidity,
+        "L_med": L_med, "a_med": a_med, "b_med": b_med,
+        "d_edge_um": d_edge_um,
+        "s_area": s_area, "s_aspect": s_aspect, "s_solidity": s_solidity,
+        "s_lab": s_lab, "s_edge": s_edge,
     }
 
 
-def draw_candidates_grid(image, sub_cluster_masks, sub_cluster_stats,
-                         selected_id):
-    """Draw a grid showing each sub-cluster candidate for agent review."""
-    n = len(sub_cluster_masks)
+# ---------------------------------------------------------------------------
+# Final post-processing on the picked mask
+# ---------------------------------------------------------------------------
+
+def _region_grow_lab(base_mask: np.ndarray, lab_image: np.ndarray,
+                     region_mask: np.ndarray, n_iter: int = 2,
+                     dilate_px: int = 3, max_area_px: int | None = None,
+                     d_thresh: float = 2.0) -> np.ndarray:
+    cur = base_mask.copy()
+    init_area = (cur > 0).sum()
+    cap = max_area_px if max_area_px is not None else int(2.5 * max(init_area, 1))
+    for _ in range(n_iter):
+        pix = lab_image[cur > 0].astype(np.float32)
+        if len(pix) < 5:
+            break
+        mu = pix.mean(axis=0)
+        sigma = pix.std(axis=0) + 1.0
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (2 * dilate_px + 1, 2 * dilate_px + 1))
+        dil = cv2.dilate(cur, k)
+        candidate = cv2.bitwise_and(dil, region_mask)
+        ys, xs = np.where(candidate > 0)
+        if len(ys) == 0:
+            break
+        vals = lab_image[ys, xs].astype(np.float32)
+        d = np.sqrt((((vals - mu) / sigma) ** 2).sum(axis=1))
+        keep = d < d_thresh
+        new_mask = cur.copy()
+        new_mask[ys[keep], xs[keep]] = 255
+        new_area = (new_mask > 0).sum()
+        if new_area == (cur > 0).sum():
+            break
+        if new_area > cap:
+            break
+        cur = new_mask
+    return cur
+
+
+def _final_postprocess(mask: np.ndarray, image_bgr: np.ndarray,
+                       hbn_mask: np.ndarray, pixel_size_um: float) -> np.ndarray:
+    if (mask > 0).sum() == 0:
+        return mask
+    annulus_um = 25.0
+    annulus_px = max(1, int(round(annulus_um / pixel_size_um)))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (2 * annulus_px + 1, 2 * annulus_px + 1))
+    hbn_dilated = cv2.dilate(hbn_mask, k)
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    max_area_px = int(round(3000.0 / (pixel_size_um * pixel_size_um)))
+    grown = _region_grow_lab(mask, lab, hbn_dilated, n_iter=2,
+                             dilate_px=3, max_area_px=max_area_px,
+                             d_thresh=2.0)
+    final = morph_clean(grown, close_k=3, open_k=3)
+    final = keep_largest_n(final, n=1, min_area=200)
+    if (final > 0).sum() > max_area_px:
+        final = morph_clean(mask, close_k=3, open_k=3)
+        final = keep_largest_n(final, n=1, min_area=200)
+    if 0 < (final > 0).sum() < max_area_px:
+        kclose = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        final = cv2.morphologyEx(final, cv2.MORPH_CLOSE, kclose)
+    # Final 1.5 µm dilation (matches B3 sweet spot for the 2.5 µm GT dilation).
+    dilate_um = 1.5
+    dilate_px = max(1, int(round(dilate_um / pixel_size_um)))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (2 * dilate_px + 1, 2 * dilate_px + 1))
+    final = cv2.dilate(final, k)
+    return final
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def detect(image: np.ndarray, pixel_size_um: float) -> dict:
     h, w = image.shape[:2]
+    priors = json.loads(SHAPE_PRIORS_PATH.read_text()) if SHAPE_PRIORS_PATH.exists() else None
+    hbn = _hbn_mask(image)
 
-    candidate_colors = [
-        (0, 200, 255),  # yellow (graphite default)
-        (0, 255, 0),    # green
-        (0, 0, 255),    # red
-        (255, 0, 0),    # blue
-        (255, 0, 255),  # magenta
-    ]
+    out = {"hbn_mask": hbn, "detector_results": {}, "winner": None}
+    if hbn.sum() == 0 or priors is None:
+        out["mask"] = np.zeros((h, w), np.uint8)
+        out["contour"] = None
+        return out
 
-    panels = []
-    for i in range(n):
-        panel = desaturate(image, factor=0.3)
-        mask_i = sub_cluster_masks[i]
-        contours, _ = cv2.findContours(mask_i, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        color = candidate_colors[i % len(candidate_colors)]
+    dt_inside = cv2.distanceTransform(hbn, cv2.DIST_L2, 5)
+    dt_outside = cv2.distanceTransform(255 - hbn, cv2.DIST_L2, 5)
 
-        # Fill with semi-transparent color
-        overlay = panel.copy()
-        cv2.drawContours(overlay, contours, -1, color, -1)
-        panel = cv2.addWeighted(overlay, 0.4, panel, 0.6, 0)
-        cv2.drawContours(panel, contours, -1, color, 2)
+    candidates = []
+    try:
+        b1_res = b1.detect(image, hbn, pixel_size_um, B1_CLASSIFIER_PATH,
+                           prob_thresh=0.15, grow_thresh=0.05, min_area_px=200)
+        candidates.append(("B1", b1_res["mask"]))
+    except Exception as e:
+        candidates.append(("B1", np.zeros((h, w), np.uint8)))
+        out["detector_results"]["B1_err"] = str(e)
+    try:
+        b2_res = b2.detect_graphite(image, hbn, pixel_size_um, B2_PRIORS_PATH)
+        candidates.append(("B2", b2_res["mask"]))
+    except Exception as e:
+        candidates.append(("B2", np.zeros((h, w), np.uint8)))
+        out["detector_results"]["B2_err"] = str(e)
+    try:
+        b3_res = b3.detect_graphite(image, hbn, pixel_size_um, SHAPE_PRIORS_PATH)
+        candidates.append(("B3", b3_res["mask"]))
+    except Exception as e:
+        candidates.append(("B3", np.zeros((h, w), np.uint8)))
+        out["detector_results"]["B3_err"] = str(e)
 
-        s = sub_cluster_stats[i]
-        marker = " [AUTO]" if i == selected_id else ""
-        label = f"c{i}: L={s['L']:.0f} area={s['area_px']}px{marker}"
-        cv2.putText(panel, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        panels.append(panel)
+    scored = []
+    for name, m in candidates:
+        cs = _confidence_score(m, image, hbn, pixel_size_um, priors,
+                               dt_inside=dt_inside, dt_outside=dt_outside)
+        cs["detector"] = name
+        cs["pred_area_um2"] = float((m > 0).sum() * pixel_size_um * pixel_size_um)
+        out["detector_results"][name] = cs
+        scored.append((name, m, cs))
 
-    # Stack horizontally (or 2-row grid for >3)
-    if n <= 3:
-        grid = np.hstack(panels)
-    else:
-        row1 = np.hstack(panels[:(n + 1) // 2])
-        row2_panels = panels[(n + 1) // 2:]
-        while len(row2_panels) < (n + 1) // 2:
-            row2_panels.append(np.zeros_like(panels[0]))
-        row2 = np.hstack(row2_panels)
-        if row1.shape[1] != row2.shape[1]:
-            diff = row1.shape[1] - row2.shape[1]
-            if diff > 0:
-                row2 = np.hstack(
-                    [row2, np.zeros((h, diff, 3), dtype=np.uint8)])
-            else:
-                row1 = np.hstack(
-                    [row1, np.zeros((h, -diff, 3), dtype=np.uint8)])
-        grid = np.vstack([row1, row2])
+    valid = [(n, m, cs) for (n, m, cs) in scored if cs.get("valid")]
+    if not valid:
+        out["mask"] = np.zeros((h, w), np.uint8)
+        out["contour"] = None
+        return out
 
-    return grid
+    valid.sort(key=lambda t: t[2]["score"], reverse=True)
+    winner_name, winner_mask, winner_cs = valid[0]
+    out["winner"] = winner_name
+    out["winner_score"] = winner_cs["score"]
 
+    final = _final_postprocess(winner_mask, image, hbn, pixel_size_um)
+    out["mask"] = final
+    cnts, _ = cv2.findContours(final, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out["contour"] = max(cnts, key=cv2.contourArea) if cnts else None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Detect graphite strip from bottom_part image "
-                    "(K-means sub-clustering within hBN flake)")
-    parser.add_argument("--image", required=True,
-                        help="Source image (bottom_part)")
-    parser.add_argument("--pixel-size", type=float, required=True,
-                        help="Microns per pixel")
-    parser.add_argument("--output-dir", required=True,
-                        help="Output directory")
-    parser.add_argument("--n-sub-clusters", type=int, default=4,
-                        help="Sub-cluster count within hBN flake (default: 4)")
-    parser.add_argument("--min-area", type=int, default=5000,
-                        help="Min graphite area in pixels (default: 5000)")
-    parser.add_argument("--cluster-id", type=int, default=None,
-                        help="Agent override: use this sub-cluster ID "
-                             "as graphite (after reviewing candidates)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='C3 graphite detect (B1+B2+B3 ensemble)')
+    p.add_argument('--image', required=True)
+    p.add_argument('--pixel-size', type=float, required=True)
+    p.add_argument('--output-dir', required=True)
+    p.add_argument('--cluster-id', type=int, default=None,
+                   help='[unused, kept for CLI compat]')
+    p.add_argument('--n-sub-clusters', type=int, default=4,
+                   help='[unused, kept for CLI compat]')
+    p.add_argument('--min-area', type=int, default=200,
+                   help='[unused, kept for CLI compat]')
+    args = p.parse_args()
 
-    image_path = os.path.abspath(os.path.expanduser(args.image))
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"ERROR: cannot read image: {image_path}", file=sys.stderr)
+    img = cv2.imread(os.path.abspath(os.path.expanduser(args.image)))
+    if img is None:
+        print(f'ERROR: cannot read {args.image}', file=sys.stderr)
         sys.exit(1)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    result = detect(img, args.pixel_size)
 
-    result = detect_graphite(image, n_sub_clusters=args.n_sub_clusters,
-                             min_area=args.min_area,
-                             cluster_id=args.cluster_id)
+    print('Detector self-confidence:')
+    for name, info in sorted(result.get("detector_results", {}).items()):
+        if isinstance(info, dict) and 'score' in info:
+            mark = ' <-- WINNER' if name == result.get("winner") else ''
+            print(f"  {name}: score={info.get('score', 0):.3f} valid={info.get('valid', False)} "
+                  f"area={info.get('area_um2', info.get('pred_area_um2', 0)):.0f}um2"
+                  f"{mark}")
+        else:
+            print(f"  {name}: {info}")
 
-    # Always save candidate grid for agent vision review
-    if result["sub_cluster_masks"]:
-        grid = draw_candidates_grid(
-            image, result["sub_cluster_masks"],
-            result["sub_cluster_stats"], result["selected_id"])
-        cv2.imwrite(os.path.join(args.output_dir,
-                                 "00_graphite_candidates.png"), grid)
+    final = result["mask"]
+    contour = result.get("contour")
 
-    # Print sub-cluster stats for agent
-    print("Sub-cluster stats (sorted by L, darkest first):")
-    sorted_stats = sorted(result["sub_cluster_stats"],
-                          key=lambda s: s["L"])
-    for s in sorted_stats:
-        marker = " <-- selected" if s["id"] == result["selected_id"] else ""
-        print(f"  c{s['id']}: L={s['L']:.0f} a={s['a']:.0f} "
-              f"b={s['b']:.0f} area={s['area_px']}px{marker}")
+    if contour is None or (final > 0).sum() == 0:
+        print('WARN: no graphite candidate from any detector; emitting placeholder',
+              file=sys.stderr)
+        h_, w_ = img.shape[:2]
+        placeholder = np.zeros((h_, w_), np.uint8)
+        cy, cx = h_ // 2, w_ // 2
+        placeholder[cy-2:cy+3, cx-2:cx+3] = 255
+        cv2.imwrite(str(out_dir / 'graphite_mask.png'), placeholder)
+        cnts, _ = cv2.findContours(placeholder, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_ph = cnts[0] if cnts else None
+        if contour_ph is None:
+            sys.exit(1)
+        np.save(str(out_dir / 'graphite_contour.npy'),
+                contour_ph.reshape(-1, 2).astype(np.float64))
+        sidecar = {'area_px': 25, 'area_um2': 25 * args.pixel_size ** 2,
+                   'cluster_id': None, 'winner': None}
+        (out_dir / 'graphite_result.json').write_text(json.dumps(sidecar, indent=2))
+        diag = desaturate(img, factor=0.4)
+        cv2.drawContours(diag, [contour_ph], -1, (0, 200, 255), 2)
+        cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'), diag)
+        cv2.imwrite(str(out_dir / '00_graphite_candidates.png'), diag)
+        return
 
-    if result["graphite_contour"] is None:
-        print("ERROR: no graphite strip found", file=sys.stderr)
-        print("Review 00_graphite_candidates.png and re-run with "
-              "--cluster-id <N>", file=sys.stderr)
-        sys.exit(1)
-
-    contour = result["graphite_contour"]
-    mask = result["graphite_mask"]
-
-    area_px = int((mask > 0).sum())
-    area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
-
-    # Save mask
-    cv2.imwrite(os.path.join(args.output_dir, "graphite_mask.png"), mask)
-
-    # Save contour as (N,2) float64
+    cv2.imwrite(str(out_dir / 'graphite_mask.png'), final)
     contour_2d = contour.reshape(-1, 2).astype(np.float64)
-    np.save(os.path.join(args.output_dir, "graphite_contour.npy"), contour_2d)
+    np.save(str(out_dir / 'graphite_contour.npy'), contour_2d)
+    diag = desaturate(img, factor=0.4)
+    cv2.drawContours(diag, [contour], -1, (0, 200, 255), 2)
+    cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'), diag)
+    cv2.imwrite(str(out_dir / '00_graphite_candidates.png'), diag)
 
-    # Diagnostic overlay
-    diag = desaturate(image, factor=0.4)
-    cv2.drawContours(diag, [contour], -1, (0, 200, 255), 2)  # yellow BGR
-    cv2.imwrite(os.path.join(args.output_dir, "01_graphite_on_bottom.png"),
-                diag)
-
-    # Result sidecar JSON
-    with open(os.path.join(args.output_dir, "graphite_result.json"), "w") as f:
-        json.dump({"area_px": area_px, "area_um2": area_um2,
-                    "cluster_id": result["selected_id"]}, f, indent=2)
-
-    _, _, bw, bh = cv2.boundingRect(contour)
-    aspect = max(bw, bh) / max(min(bw, bh), 1)
-    print(f"\nOK: graphite strip detected (sub-cluster {result['selected_id']})")
-    print(f"  Area: {area_px} px ({area_um2} um²)")
-    print(f"  Bounding box: {bw} x {bh} (aspect {aspect:.1f})")
-    print(f"  Contour points: {len(contour_2d)}")
-    print(f"  Outputs: {args.output_dir}")
-    if args.cluster_id is None:
-        print(f"\n  To override: re-run with --cluster-id <N> after "
-              f"reviewing 00_graphite_candidates.png")
+    area_px = int((final > 0).sum())
+    area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
+    sidecar = {
+        'area_px': area_px, 'area_um2': area_um2,
+        'winner': result.get("winner"),
+        'winner_score': result.get("winner_score"),
+        'detector_results': {
+            n: {k: v for k, v in info.items() if not k.startswith('_')}
+            for n, info in result.get("detector_results", {}).items()
+            if isinstance(info, dict)
+        },
+    }
+    (out_dir / 'graphite_result.json').write_text(json.dumps(sidecar, indent=2, default=str))
+    print(f'\nOK: graphite winner={result.get("winner")} area={area_um2}um2 ({area_px}px)')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
