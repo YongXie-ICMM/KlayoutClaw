@@ -62,7 +62,55 @@ def transform_contour(contour, warp_matrix):
     return np.round(transformed).astype(np.int32).reshape(-1, 1, 2)
 
 
-def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image_size):
+class MaskDroppedError(RuntimeError):
+    """Raised when a non-empty input mask is reduced to zero pixels by the
+    transform pipeline. The orchestrator can recover (re-run detect with a
+    different cluster, escalate to vision-review) only if it knows which
+    stage zeroed the mask, so the offending stage name is exposed via
+    ``dropped_at_stage`` and the per-stage counts via ``stage_counts``.
+    """
+
+    def __init__(self, material, dropped_at_stage, stage_counts):
+        self.material = material
+        self.dropped_at_stage = dropped_at_stage
+        self.stage_counts = dict(stage_counts)
+        super().__init__(
+            f"{material}: input had {stage_counts.get('input_pixels', 0)} px "
+            f"but was zeroed at stage {dropped_at_stage!r}; "
+            f"stage_counts={self.stage_counts}"
+        )
+
+
+def _pixel_count(mask):
+    """Count non-zero pixels in a binary mask (None-safe)."""
+    if mask is None:
+        return 0
+    return int((mask > 0).sum())
+
+
+def _detect_dropped_stage(stage_counts):
+    """Return the first stage where the pixel count fell to 0, or None.
+
+    Stages are checked in pipeline order. ``input_pixels`` itself is not
+    a 'drop' stage — if the input is empty there is no dropping to report.
+    """
+    if stage_counts.get("input_pixels", 0) <= 0:
+        return None
+    # Ordered list of (stage_name, key) pairs in pipeline execution order.
+    pipeline_keys = [
+        ("warp", "post_warp_pixels"),
+        ("bitwise_and", "post_bitwise_and_pixels"),
+        ("morph", "post_morph_pixels"),
+        ("keep_largest", "post_keep_largest_pixels"),
+    ]
+    for stage_name, key in pipeline_keys:
+        if key in stage_counts and stage_counts[key] == 0:
+            return stage_name
+    return None
+
+
+def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint,
+                image_size, min_area=500):
     """Build final material masks in full_stack coordinates.
 
     Args:
@@ -72,12 +120,29 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image
         warp_top: 2x3 affine warp (top_part → full_stack).
         footprint: Binary mask of top_hBN footprint in full_stack coords.
         image_size: Tuple (width, height) of the full_stack image.
+        min_area: Minimum area in pixels for keep_largest_n on graphene.
+            Defaults to 500 px (≈ 5.6 µm² at 0.106 µm/px). Raise this to
+            reject tiny noise components, lower it when working at a finer
+            pixel size or with intentionally small flakes.
 
     Returns:
-        Dict mapping material name -> binary mask (uint8, 0/255).
+        Tuple ``(masks, stage_counts)``:
+          - masks: Dict mapping material name -> binary mask (uint8, 0/255).
+          - stage_counts: Dict mapping material name -> per-stage pixel
+            counts plus an optional ``dropped_at_stage`` entry. Per-stage
+            keys vary by material (see issue #33 schema):
+              graphene: input/post_warp/post_bitwise_and/post_morph/post_keep_largest
+              graphite: input/post_keep_largest
+              bottom_hBN, top_hBN: input/post_keep_largest
+
+    Raises:
+        MaskDroppedError: If a material had ``input_pixels > 0`` but was
+            reduced to zero pixels at any stage. ``dropped_at_stage`` on
+            the raised exception identifies the offending stage.
     """
     w, h = image_size
     masks = {}
+    stage_counts = {}
     materials = detections.get("materials", {})
 
     # --- graphite: transform contour from bottom_part coords ---
@@ -86,9 +151,17 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image
         contour_path = os.path.join(detect_dir, info["contour_file"])
         if os.path.exists(contour_path) and warp_bot_inv is not None:
             contour = np.load(contour_path).reshape(-1, 2).astype(np.float64)
+            counts = {"input_pixels": int(len(contour))}
             transformed = transform_contour(contour, warp_bot_inv)
             graphite_mask = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(graphite_mask, [transformed], -1, 255, cv2.FILLED)
+            counts["post_keep_largest_pixels"] = _pixel_count(graphite_mask)
+            dropped = _detect_dropped_stage(counts)
+            if dropped is not None:
+                counts["dropped_at_stage"] = dropped
+                stage_counts["graphite"] = counts
+                raise MaskDroppedError("graphite", dropped, counts)
+            stage_counts["graphite"] = counts
             masks["graphite"] = graphite_mask
 
     # --- graphene: warp mask, clip to footprint, clean ---
@@ -98,16 +171,29 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image
         if os.path.exists(mask_path) and warp_top is not None:
             graphene_mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if graphene_mask_raw is not None:
+                counts = {"input_pixels": _pixel_count(graphene_mask_raw)}
                 graphene_in_stack = cv2.warpAffine(
                     graphene_mask_raw, warp_top, (w, h),
                     flags=cv2.INTER_NEAREST,
                 )
+                counts["post_warp_pixels"] = _pixel_count(graphene_in_stack)
                 if footprint is not None:
                     graphene_clipped = cv2.bitwise_and(graphene_in_stack, footprint)
                 else:
                     graphene_clipped = graphene_in_stack
+                counts["post_bitwise_and_pixels"] = _pixel_count(graphene_clipped)
                 graphene_clean = morph_clean(graphene_clipped, close_k=15, open_k=7)
-                graphene_largest = keep_largest_n(graphene_clean, n=1, min_area=500)
+                counts["post_morph_pixels"] = _pixel_count(graphene_clean)
+                graphene_largest = keep_largest_n(
+                    graphene_clean, n=1, min_area=min_area
+                )
+                counts["post_keep_largest_pixels"] = _pixel_count(graphene_largest)
+                dropped = _detect_dropped_stage(counts)
+                if dropped is not None:
+                    counts["dropped_at_stage"] = dropped
+                    stage_counts["graphene"] = counts
+                    raise MaskDroppedError("graphene", dropped, counts)
+                stage_counts["graphene"] = counts
                 masks["graphene"] = flood_fill_holes(graphene_largest)
 
     # --- bottom_hBN: already in full_stack coords ---
@@ -117,7 +203,15 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image
         if os.path.exists(mask_path):
             bottom_hbn_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if bottom_hbn_mask is not None:
+                counts = {"input_pixels": _pixel_count(bottom_hbn_mask)}
                 bottom_hbn = keep_largest_n(bottom_hbn_mask, n=1, min_area=5000)
+                counts["post_keep_largest_pixels"] = _pixel_count(bottom_hbn)
+                dropped = _detect_dropped_stage(counts)
+                if dropped is not None:
+                    counts["dropped_at_stage"] = dropped
+                    stage_counts["bottom_hBN"] = counts
+                    raise MaskDroppedError("bottom_hBN", dropped, counts)
+                stage_counts["bottom_hBN"] = counts
                 masks["bottom_hBN"] = flood_fill_holes(bottom_hbn)
 
     # --- top_hBN: already in full_stack coords (= footprint) ---
@@ -127,10 +221,18 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint, image
         if os.path.exists(mask_path):
             top_hbn_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if top_hbn_mask is not None:
+                counts = {"input_pixels": _pixel_count(top_hbn_mask)}
                 top_hbn = keep_largest_n(top_hbn_mask, n=1, min_area=5000)
+                counts["post_keep_largest_pixels"] = _pixel_count(top_hbn)
+                dropped = _detect_dropped_stage(counts)
+                if dropped is not None:
+                    counts["dropped_at_stage"] = dropped
+                    stage_counts["top_hBN"] = counts
+                    raise MaskDroppedError("top_hBN", dropped, counts)
+                stage_counts["top_hBN"] = counts
                 masks["top_hBN"] = flood_fill_holes(top_hbn)
 
-    return masks
+    return masks, stage_counts
 
 
 def extract_contours(masks, min_area_px=500):
@@ -227,6 +329,15 @@ def main():
                         help="Microns per pixel")
     parser.add_argument("--output-dir", required=True,
                         help="Output directory")
+    parser.add_argument(
+        "--min-area", type=int, default=500,
+        help=(
+            "Minimum component area in pixels for keep_largest_n on the "
+            "graphene mask. Default 500 px (≈ 5.6 µm² at 0.106 µm/px). "
+            "Lower this when working at finer pixel sizes or with smaller "
+            "flakes; raise it to reject more aggressive noise."
+        ),
+    )
     args = parser.parse_args()
 
     # Load reference image for size
@@ -291,11 +402,40 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Build masks in full_stack coordinates
-    masks = build_masks(detections, detect_dir, warp_bot_inv, warp_top,
-                        footprint, image_size)
+    try:
+        masks, stage_counts = build_masks(
+            detections, detect_dir, warp_bot_inv, warp_top,
+            footprint, image_size, min_area=args.min_area,
+        )
+    except MaskDroppedError as exc:
+        # Persist the partial diagnostics into combine_report.json so the
+        # orchestrator can read which stage zeroed the mask without parsing
+        # stderr. Then exit non-zero with a structured message.
+        os.makedirs(args.output_dir, exist_ok=True)
+        report_path = os.path.join(args.output_dir, "combine_report.json")
+        if os.path.exists(report_path):
+            try:
+                with open(report_path) as _rf:
+                    _report = json.load(_rf)
+            except Exception:
+                _report = {}
+        else:
+            _report = {}
+        _report.setdefault("transform_diagnostics", {})[exc.material] = (
+            exc.stage_counts
+        )
+        _report["transform_error"] = {
+            "material": exc.material,
+            "dropped_at_stage": exc.dropped_at_stage,
+            "stage_counts": exc.stage_counts,
+        }
+        with open(report_path, "w") as _rf:
+            json.dump(_report, _rf, indent=2)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(3)
 
     # Extract smoothed contours
-    contours = extract_contours(masks)
+    contours = extract_contours(masks, min_area_px=args.min_area)
 
     # Save per-material transformed masks
     mask_names = {
@@ -330,6 +470,10 @@ def main():
         "bottom_hBN": "already in full_stack coords (pass-through)",
         "top_hBN": "already in full_stack coords (= footprint, pass-through)",
     }
+    # Per-stage pixel counts for each material (issue #33). Lets the
+    # orchestrator distinguish "detect produced nothing" from "transform
+    # zeroed a valid input at stage X" without re-running the pipeline.
+    report["transform_diagnostics"] = stage_counts
     report["traces_file"] = "traces.json"
 
     with open(report_path, "w") as f:

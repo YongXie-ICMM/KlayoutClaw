@@ -228,6 +228,117 @@ class TestCore:
         assert LAYER_MAP["graphite"] == "13/0"
 
 
+class TestTransformDiagnostics:
+    """Unit tests for combine/transform.py per-stage diagnostics (issue #33).
+
+    Exercises build_masks() directly with synthesized fixtures so the test
+    runs in milliseconds — no full pipeline needed.
+    """
+
+    def _import_transform(self):
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(__file__), "..", "skills",
+            "nanodevice_flakedetect_combine", "scripts"
+        ))
+        import transform as t
+        return t
+
+    def _make_detections(self, tmp):
+        # Synthesize a graphene mask that is non-empty in source coords
+        # but lands entirely outside the footprint after warp+AND, so it
+        # zeroes at the bitwise_and stage.
+        H, W = 200, 200
+        src_mask = np.zeros((H, W), dtype=np.uint8)
+        src_mask[10:30, 10:30] = 255  # small flake near origin
+        cv2.imwrite(os.path.join(tmp, "graphene_mask.png"), src_mask)
+        np.save(os.path.join(tmp, "graphene_contour.npy"),
+                np.array([[10, 10], [30, 10], [30, 30], [10, 30]], dtype=np.int32))
+        return {
+            "materials": {
+                "graphene": {
+                    "mask_file": "graphene_mask.png",
+                    "contour_file": "graphene_contour.npy",
+                },
+            },
+        }
+
+    def test_zeroed_at_bitwise_and_raises(self):
+        """Non-empty input + footprint that doesn't overlap warped mask
+        must raise MaskDroppedError with dropped_at_stage='bitwise_and'."""
+        t = self._import_transform()
+        with tempfile.TemporaryDirectory() as tmp:
+            detections = self._make_detections(tmp)
+            warp_top = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+            # Footprint with no overlap with the [10:30,10:30] source flake.
+            footprint = np.zeros((200, 200), dtype=np.uint8)
+            footprint[150:180, 150:180] = 255
+            with pytest.raises(t.MaskDroppedError) as excinfo:
+                t.build_masks(
+                    detections, tmp,
+                    warp_bot_inv=None,
+                    warp_top=warp_top,
+                    footprint=footprint,
+                    image_size=(200, 200),
+                )
+            err = excinfo.value
+            assert err.material == "graphene"
+            assert err.dropped_at_stage == "bitwise_and"
+            assert err.stage_counts["input_pixels"] > 0
+            assert err.stage_counts["post_bitwise_and_pixels"] == 0
+
+    def test_empty_input_does_not_raise(self):
+        """Empty input mask is fine (no diagnostics, no error) — only
+        non-empty inputs that get zeroed are reported as drops."""
+        t = self._import_transform()
+        with tempfile.TemporaryDirectory() as tmp:
+            H, W = 200, 200
+            cv2.imwrite(os.path.join(tmp, "graphene_mask.png"),
+                        np.zeros((H, W), dtype=np.uint8))
+            np.save(os.path.join(tmp, "graphene_contour.npy"),
+                    np.zeros((0, 2), dtype=np.int32))
+            detections = {"materials": {"graphene": {
+                "mask_file": "graphene_mask.png",
+                "contour_file": "graphene_contour.npy",
+            }}}
+            warp_top = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+            footprint = np.full((H, W), 255, dtype=np.uint8)
+            masks, stage_counts = t.build_masks(
+                detections, tmp, warp_bot_inv=None, warp_top=warp_top,
+                footprint=footprint, image_size=(W, H),
+            )
+            # Empty input is recorded as input_pixels=0 with no error
+            # raised (orchestrator distinguishes "detect produced nothing"
+            # from "transform zeroed a valid input").
+            assert stage_counts["graphene"]["input_pixels"] == 0
+            assert "dropped_at_stage" not in stage_counts["graphene"]
+
+    def test_min_area_flag_filters_small_components(self):
+        """A small input that survives warp+AND but is below --min-area
+        must drop at the keep_largest stage."""
+        t = self._import_transform()
+        with tempfile.TemporaryDirectory() as tmp:
+            H, W = 200, 200
+            src_mask = np.zeros((H, W), dtype=np.uint8)
+            src_mask[10:14, 10:14] = 255  # 16 px flake
+            cv2.imwrite(os.path.join(tmp, "graphene_mask.png"), src_mask)
+            np.save(os.path.join(tmp, "graphene_contour.npy"),
+                    np.array([[10, 10], [14, 10], [14, 14], [10, 14]],
+                             dtype=np.int32))
+            detections = {"materials": {"graphene": {
+                "mask_file": "graphene_mask.png",
+                "contour_file": "graphene_contour.npy",
+            }}}
+            warp_top = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+            footprint = np.full((H, W), 255, dtype=np.uint8)
+            with pytest.raises(t.MaskDroppedError) as excinfo:
+                t.build_masks(
+                    detections, tmp, warp_bot_inv=None, warp_top=warp_top,
+                    footprint=footprint, image_size=(W, H),
+                    min_area=500,  # 16 px input << 500 threshold
+                )
+            assert excinfo.value.dropped_at_stage in {"morph", "keep_largest"}
+
+
 class TestSiftAlign:
     """Tests for align/scripts/sift_align.py — SIFT feature matching."""
 
