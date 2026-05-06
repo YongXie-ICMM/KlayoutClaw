@@ -22,7 +22,15 @@ Usage:
     conda run -n instrMCPdev python footprint.py \
         --source <source_image> --target <target_image> \
         --bottom <bottom_part_image> \
-        [--mirror] --pixel-size <um/px> --output-dir <path>
+        [--mirror] --pixel-size <um/px> --output-dir <path> \
+        [--warp <warp_sift_bottom.npy>]
+
+Warp resolution (issue #31):
+    If --warp PATH is given, the precomputed bottom->target warp is loaded
+    via np.load(PATH) and the internal SIFT pass is skipped. If --warp is
+    omitted, footprint.py looks for a precomputed warp at
+    <output-dir>/warp_sift_bottom.npy and at <source-dir>/../align/
+    warp_sift_bottom.npy before falling back to running SIFT internally.
 """
 
 import argparse
@@ -96,6 +104,40 @@ def sift_align(bottom_img, target_img, n_features=5000, ratio_thresh=0.7):
                                            ransacReprojThreshold=5.0)
     n_inliers = int(mask.sum()) if mask is not None else 0
     return M, n_inliers
+
+
+def resolve_warp_path(explicit_path, output_dir, source_path):
+    """Resolve the path of a precomputed bottom->target SIFT warp.
+
+    Priority (issue #31):
+      1. --warp PATH (if given and exists)
+      2. <output_dir>/warp_sift_bottom.npy
+      3. <parent_of_source_dir>/align/warp_sift_bottom.npy
+    Returns (path, source_tag) or (None, None) if no candidate exists.
+    """
+    if explicit_path:
+        if os.path.exists(explicit_path):
+            return explicit_path, "--warp"
+        return None, None
+    cand1 = os.path.join(output_dir, "warp_sift_bottom.npy")
+    if os.path.exists(cand1):
+        return cand1, "output_dir"
+    src_parent = os.path.dirname(os.path.abspath(source_path))
+    cand2 = os.path.join(os.path.dirname(src_parent), "align",
+                         "warp_sift_bottom.npy")
+    if os.path.exists(cand2):
+        return cand2, "source_parent/align"
+    return None, None
+
+
+def load_warp_matrix(path):
+    """Load and validate a 2x3 affine warp matrix from .npy."""
+    M = np.load(path)
+    if M.shape != (2, 3):
+        raise ValueError(
+            f"warp matrix at {path} has shape {M.shape}, expected (2, 3)"
+        )
+    return M.astype(np.float64)
 
 
 def compute_diff_image(target_bgr, bottom_bgr, warp_matrix):
@@ -481,6 +523,13 @@ def main():
     parser.add_argument("--n-clusters", type=int, default=12)
     parser.add_argument("--candidate-rank", type=int, default=1)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--warp", default=None,
+        help="Path to precomputed bottom->target SIFT warp (.npy). "
+             "If omitted, footprint.py auto-resolves "
+             "<output-dir>/warp_sift_bottom.npy or "
+             "<source-parent>/../align/warp_sift_bottom.npy. "
+             "Only runs SIFT internally when neither path resolves (#31).")
     args = parser.parse_args()
 
     source_img = cv2.imread(args.source)
@@ -524,15 +573,36 @@ def main():
     source_area = source_desc["area"]
     print(f"[B1] Source flake area={source_area:.0f}px")
 
-    # SIFT, diff, K-means
-    print("[B1] SIFT-aligning bottom to target...")
-    warp_matrix, n_inliers = sift_align(bottom_img, target_img)
-    if warp_matrix is None:
-        emit_failure(report_path, f"sift alignment failed ({n_inliers} matches)",
+    # SIFT (or precomputed warp via --warp / auto-lookup; #31)
+    warp_path, warp_src = resolve_warp_path(
+        args.warp, args.output_dir, args.source
+    )
+    if args.warp and warp_path is None:
+        emit_failure(report_path,
+                     f"--warp path not found: {args.warp}",
                      target_h, target_w)
-        print(f"ERROR: SIFT alignment failed ({n_inliers}).", file=sys.stderr)
+        print(f"ERROR: --warp path not found: {args.warp}", file=sys.stderr)
         sys.exit(1)
-    print(f"[B1] SIFT: {n_inliers} inliers")
+    if warp_path is not None:
+        try:
+            warp_matrix = load_warp_matrix(warp_path)
+        except (ValueError, OSError) as e:
+            emit_failure(report_path, f"cannot load warp {warp_path}: {e}",
+                         target_h, target_w)
+            print(f"ERROR: Cannot load warp {warp_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[B1] Reusing precomputed SIFT warp from {warp_src}: {warp_path}")
+    else:
+        print("[B1] SIFT-aligning bottom to target...")
+        warp_matrix, n_inliers = sift_align(bottom_img, target_img)
+        if warp_matrix is None:
+            emit_failure(report_path,
+                         f"sift alignment failed ({n_inliers} matches)",
+                         target_h, target_w)
+            print(f"ERROR: SIFT alignment failed ({n_inliers}).",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"[B1] SIFT: {n_inliers} inliers")
 
     diff_gray = compute_diff_image(target_img, bottom_img, warp_matrix)
     cv2.imwrite(os.path.join(args.output_dir, "02_diff_image.png"), diff_gray)
