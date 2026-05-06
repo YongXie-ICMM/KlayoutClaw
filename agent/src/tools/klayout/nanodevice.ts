@@ -101,6 +101,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       "nanodevice_flakedetect",
       "align",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Register source microscope images to the full_stack coordinate system.",
         "Uses SIFT for same-substrate alignment (bottom→full_stack) and",
         "Chamfer+DE for cross-substrate alignment (top PDMS→full_stack SiO2).",
@@ -169,6 +170,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       "nanodevice_flakedetect",
       "detect",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Detect individual material layers from their optimal source images.",
         "Runs 4 independent detections: graphite (bottom_part), graphene (top_part),",
         "bottom_hBN (bottom_part + SIFT warp to full_stack), top_hBN (footprint copy).",
@@ -225,6 +227,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       "nanodevice_flakedetect",
       "combine",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Transform per-material detections into the full_stack coordinate system,",
         "build unified traces.json, and draw overlay visualizations.",
         "Use after align and detect steps are both complete.",
@@ -274,6 +277,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       "nanodevice_flakedetect",
       "commit",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Insert detected material polygons into KLayout from traces.json.",
         "Loads background image, transforms coordinates (image→KLayout),",
         "and inserts polygons on layers 10-13/0.",
@@ -322,6 +326,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
       "nanodevice_flakedetect",
       "review",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Validate committed flake polygons in KLayout via visual inspection.",
         "Isolates each material layer, takes screenshots, compares with combine",
         "overlays, and produces a PASS/FAIL verdict.",
@@ -373,6 +378,7 @@ function registerGdsalignTools(): CodeGenTool[] {
       "nanodevice_gdsalign",
       "align_to_gds",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Align microscope stack images to a GDS fabrication template using",
         "lithographic marker detection. Computes image→GDS similarity transform",
         "and commits warped image + material contours to KLayout.",
@@ -436,6 +442,7 @@ function registerRoutingTools(): CodeGenTool[] {
       "nanodevice_routing",
       "place_pads",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Place bonding pads in a regular pattern around the device perimeter.",
         "Creates pads on a specified layer and places pin markers for routing.",
         "Use after device geometry is created and before routing leads.",
@@ -470,6 +477,7 @@ function registerRoutingTools(): CodeGenTool[] {
       "nanodevice_routing",
       "route_leads",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Route leads from device contact pins to bonding pad pins using multi-window",
         "EBL support. Inner window uses fine lines, outer window uses coarse lines,",
         "with boundary patches for connectivity.",
@@ -516,6 +524,7 @@ function registerRoutingTools(): CodeGenTool[] {
       "nanodevice_routing",
       "clear_routes",
       [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Remove all routing geometry from specified layers.",
         "Use to clear failed routes before re-routing with adjusted parameters.",
       ].join(" "),

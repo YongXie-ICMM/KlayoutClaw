@@ -29,6 +29,7 @@ export function registerVisualTools(): CodeGenTool[] {
       serverKey: PREFIX,
       group: GROUP,
       description: [
+        "**PLANNER, NOT EXECUTOR.** Returns a `workflow_plan` listing bash commands you must run yourself (via the bash tool).",
         "Return a workflow_plan for rendering the full KLayout GDS layout as a PNG",
         "using gdstk + matplotlib (per-layer colors, legend, DPI control). This tool",
         "does NOT execute the render — it returns a plan that the agent must run",

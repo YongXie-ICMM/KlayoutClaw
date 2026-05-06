@@ -31,6 +31,7 @@ export const unitFiles = [
   "tests/test-t16-graceful-degradation.ts",
   "tests/test-plan-reinjection.ts",
   "tests/test-thinking-only.ts",
+  "tests/test-issue-36-planner-prefix.ts",
 ];
 
 export const integrationFiles = [
