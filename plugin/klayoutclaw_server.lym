@@ -141,6 +141,15 @@ def _handles_stale():
     if _layout is None or _layout_view is None or _top_cell is None:
         return True
     try:
+        # Tab-switch awareness: if the user (or a prior tool) switched
+        # the active view, the cached _layout_view is still alive but
+        # no longer the GUI's current tab. Subsequent tools (route_inspect,
+        # screenshot, evaluate_design ...) would otherwise quietly operate
+        # on the prior tab. Treat that as stale so the next
+        # `_ensure_valid_handles()` re-acquires from `mw.current_view()`.
+        mw = pya.MainWindow.instance()
+        if mw is not None and _layout_view is not mw.current_view():
+            return True
         # Verify layout is still alive
         _layout.cells()
         # Verify the cellview is still valid
@@ -1254,10 +1263,57 @@ def _render_route_inspect_crossings_image(routes, crossings, out_path, dbu):
     abs_path = os.path.abspath(out_path)
 
     # Step 1: render the layout in the crossing bbox to a PNG.
+    #
+    # Two prep steps are required for save_image to actually paint the
+    # design (routes / flakes / mesa / topgate / contact patches / pads):
+    #
+    #   (a) Every layer that has shapes must have a registered
+    #       LayerProperties entry — `_refresh_view()` walks
+    #       `_layout.layer_indices()` and inserts any missing entry.
+    #       Without this, layers carrying shapes but no entry are
+    #       silently skipped by `save_image`, and the rendered PNG ends
+    #       up blank under the label overlay (only the labels visible).
+    #   (b) Every registered layer must be `visible = True`. The user
+    #       (or a prior tool call) may have hidden some layers to
+    #       declutter the GUI; save_image respects that. Snapshot
+    #       current visibility, force-show all, render, then restore.
+    try:
+        _refresh_view()
+    except Exception as _exc:
+        _log("route_inspect: _refresh_view failed (continuing): {}".format(_exc))
+
+    visibility_snapshot = []
+    try:
+        lp_iter = _layout_view.begin_layers()
+        while not lp_iter.at_end():
+            lp = lp_iter.current()
+            visibility_snapshot.append((lp.source_layer, lp.source_datatype, lp.visible))
+            if not lp.visible:
+                lp.visible = True
+                _layout_view.set_layer_properties(lp_iter, lp)
+            lp_iter.next()
+    except Exception as _exc:
+        _log("route_inspect: layer-visibility force failed (continuing): {}".format(_exc))
+
     _layout_view.zoom_box(pya.DBox(x1_um, y1_um, x2_um, y2_um))
     _layout_view.save_image(abs_path, width_px, height_px)
-    _log("route_inspect: base PNG saved to {} (zoom_box=[{:.3f},{:.3f},{:.3f},{:.3f}])".format(
-        abs_path, x1_um, y1_um, x2_um, y2_um))
+    _log("route_inspect: base PNG saved to {} (zoom_box=[{:.3f},{:.3f},{:.3f},{:.3f}], force-visible {} layers)".format(
+        abs_path, x1_um, y1_um, x2_um, y2_um, len(visibility_snapshot)))
+
+    # Restore the user's previous visibility state by source-layer/datatype lookup.
+    if visibility_snapshot:
+        try:
+            snap_by_key = {(l, d): v for (l, d, v) in visibility_snapshot}
+            lp_iter = _layout_view.begin_layers()
+            while not lp_iter.at_end():
+                lp = lp_iter.current()
+                key = (lp.source_layer, lp.source_datatype)
+                if key in snap_by_key and lp.visible != snap_by_key[key]:
+                    lp.visible = snap_by_key[key]
+                    _layout_view.set_layer_properties(lp_iter, lp)
+                lp_iter.next()
+        except Exception as _exc:
+            _log("route_inspect: visibility restore failed (non-fatal): {}".format(_exc))
 
     # Step 2: overlay route_id labels near each endpoint of every
     # crossing-involved route.
