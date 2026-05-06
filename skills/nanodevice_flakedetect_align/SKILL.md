@@ -222,6 +222,7 @@ Optional:
 - `--source-contour` + `--source-mask` — use pre-computed contour/mask from source_contour.py instead of re-segmenting internally. **Recommended**: ensures footprint uses the same source shape as sweep/refine.
 - `--n-clusters N` — number of K-means clusters (default: 12; increase for finer segmentation on retry)
 - `--candidate-rank N` — use the Nth-ranked candidate instead of the default (#1). **Always check `03_footprint_candidates.png`** — candidate #1 is often wrong. Try `--candidate-rank 2` or `--candidate-rank 3` on retry.
+- `--warp <path-to-warp_sift_bottom.npy>` — reuse the SIFT warp produced by `sift_align.py` instead of re-running SIFT internally (issue #31). If omitted, auto-resolves `<output-dir>/warp_sift_bottom.npy` then `<source-parent>/../align/warp_sift_bottom.npy`. Internal SIFT only runs when neither path exists. Sibling scripts (`sweep.py`, `refine.py`, `source_contour.py`) do not run SIFT internally and need no equivalent flag.
 
 **Outputs**: `footprint_mask.png`, `footprint_contour.npy`, `02_diff_image.png`, `02_cluster_map.png`, `03_footprint_candidates.png`, `04_footprint_grabcut.png`, updates `alignment_report.json`
 
