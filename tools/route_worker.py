@@ -1,31 +1,59 @@
 #!/usr/bin/env python
+"""Route worker v2 — issue #28 baseline.
+
+Drop-in replacement for tools/route_worker.py with:
+
+  - Ordered-loop pairing (cyclic monotonic DP) replacing Hungarian assignment.
+    Prevents inter-pair crossings BEFORE pathfinding runs. n=len(pin_a),
+    m=len(pin_b), n<=m. Cost: sum of Euclidean distances.
+
+  - `freeze_completed_routes_as_obstacles_with_margin: float` (default 1.0
+    um) — every pair sees prior routes as hard obstacles inflated by margin.
+
+  - `bus_pairs: [[a_idx, b_idx_list], ...]` — optional multi-pin nets. Each
+    net's source is a single pin on layer A; sinks are 1+ pins on layer B.
+    Singleton bus_pairs (b_idx_list of length 1) is equivalent to 1:1.
+    For multi-sink nets, the longest sink is routed first per-pair, then
+    each subsequent sink is routed from its B-pin to the nearest point on
+    the existing path (Steiner-tree approximation). Branches are inserted
+    as additional path objects sharing the net id (encoded in `net_id` in
+    the result entry).
+
+Backward compat:
+  - When `bus_pairs` is omitted: behaves like 1:1 pairing using ordered-loop.
+  - When the caller supplies `pin_pairs_override`: that takes precedence
+    (no ordered-loop, no Hungarian).
+  - All existing config keys (obs_safe_distance_um, path_safe_distance_um,
+    map_resolution_um, sort_pairs, dry_run, per_pair_obstacle_layers,
+    auto_map_resolution, etc.) continue to work.
+
+Output schema additions:
+  - paths[].net_id : index into `bus_pairs` (None when no bus_pairs).
+  - pairs[]       : present in dry_run AND success modes (the assignment
+                    chosen by ordered-loop, with inner/outer cyclic positions).
+  - assignment_engine : "ordered_loop" | "override".
 """
-Subprocess routing engine for KlayoutClaw auto_route MCP tool.
-
-Accepts a config JSON file path as CLI arg. Loads a GDS file using klayout.db,
-extracts pin locations, rasterizes obstacles into a 2D numpy cost grid, uses
-scipy Hungarian matching for optimal pin pairing, and scikit-image MCP_Geometric
-for Dijkstra-based minimum-cost pathfinding.
-
-Usage:
-    python route_worker.py config.json
-"""
-
+from __future__ import annotations
 import json
-import sys
 import math
+import os
+import sys
+from typing import Any, Sequence
+
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 from skimage.graph import MCP_Geometric
 import klayout.db as kdb
 
+# Ordered-loop module is co-located.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ordered_loop import ordered_loop_match  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (carried over from tools/route_worker.py)
 # ---------------------------------------------------------------------------
 
 def parse_layer(spec: str) -> tuple[int, int]:
-    """Parse a layer spec like '102/0' or '5' into (layer, datatype)."""
     parts = spec.strip().split("/")
     layer = int(parts[0])
     datatype = int(parts[1]) if len(parts) > 1 else 0
@@ -33,22 +61,14 @@ def parse_layer(spec: str) -> tuple[int, int]:
 
 
 def compress_path(points: list[list[int]]) -> list[list[int]]:
-    """Remove collinear waypoints from a path.
-
-    Keeps the first and last point, and any point where the direction changes
-    (cross product of consecutive direction vectors is non-zero).
-    """
     if len(points) <= 2:
         return list(points)
-
     result = [points[0]]
     for i in range(1, len(points) - 1):
-        # Direction vectors
         dx1 = points[i][0] - points[i - 1][0]
         dy1 = points[i][1] - points[i - 1][1]
         dx2 = points[i + 1][0] - points[i][0]
         dy2 = points[i + 1][1] - points[i][1]
-        # Cross product
         cross = dx1 * dy2 - dy1 * dx2
         if cross != 0:
             result.append(points[i])
@@ -56,68 +76,44 @@ def compress_path(points: list[list[int]]) -> list[list[int]]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Pin extraction
-# ---------------------------------------------------------------------------
-
-def extract_pin_centers(cell: kdb.Cell, layout: kdb.Layout, layer_num: int,
-                        datatype: int) -> list[tuple[int, int]]:
-    """Extract center points (in dbu) of all shapes on a given layer."""
+def extract_pin_centers(cell, layout, layer_num, datatype):
     layer_idx = layout.find_layer(layer_num, datatype)
     if layer_idx is None:
         return []
-
     centers = []
     for shape in cell.shapes(layer_idx).each():
-        bbox = shape.bbox()
-        cx = (bbox.left + bbox.right) // 2
-        cy = (bbox.bottom + bbox.top) // 2
+        bb = shape.bbox()
+        cx = (bb.left + bb.right) // 2
+        cy = (bb.bottom + bb.top) // 2
         centers.append((cx, cy))
     return centers
 
 
-def extract_pin_bboxes(cell: kdb.Cell, layout: kdb.Layout, layer_num: int,
-                       datatype: int) -> list[tuple[int, int, int, int]]:
-    """Extract (left, bottom, right, top) bboxes in dbu for all shapes on a layer."""
+def extract_pin_bboxes(cell, layout, layer_num, datatype):
     layer_idx = layout.find_layer(layer_num, datatype)
     if layer_idx is None:
         return []
     bbs = []
-    for shape in cell.shapes(layer_idx).each():
-        bb = shape.bbox()
-        bbs.append((bb.left, bb.bottom, bb.right, bb.top))
+    for s in cell.shapes(layer_idx).each():
+        b = s.bbox()
+        bbs.append((b.left, b.bottom, b.right, b.top))
     return bbs
 
 
-def min_pin_edge_um(pin_bboxes_a: list[tuple[int, int, int, int]],
-                    pin_bboxes_b: list[tuple[int, int, int, int]],
-                    dbu: float) -> float | None:
-    """Return the shortest pin bbox edge in um across both pin layers, or None
-    if either list is empty. Used to auto-derive map_resolution."""
-    if not pin_bboxes_a or not pin_bboxes_b:
+def min_pin_edge_um(bb_a, bb_b, dbu):
+    if not bb_a or not bb_b:
         return None
-    min_edge_dbu = None
-    for bb in pin_bboxes_a + pin_bboxes_b:
-        w = bb[2] - bb[0]
-        h = bb[3] - bb[1]
-        e = min(w, h)
+    me = None
+    for bb in bb_a + bb_b:
+        e = min(bb[2] - bb[0], bb[3] - bb[1])
         if e <= 0:
             continue
-        if min_edge_dbu is None or e < min_edge_dbu:
-            min_edge_dbu = e
-    if min_edge_dbu is None:
-        return None
-    return min_edge_dbu * dbu
+        if me is None or e < me:
+            me = e
+    return None if me is None else me * dbu
 
 
-# ---------------------------------------------------------------------------
-# Obstacle rasterization
-# ---------------------------------------------------------------------------
-
-def build_obstacle_region(cell: kdb.Cell, layout: kdb.Layout,
-                          obstacle_layers: list[str],
-                          safe_distance_dbu: int) -> kdb.Region:
-    """Merge all obstacle layer shapes into one Region, expanded by safe distance."""
+def build_obstacle_region(cell, layout, obstacle_layers, safe_distance_dbu):
     region = kdb.Region()
     for spec in obstacle_layers:
         ln, dt = parse_layer(spec)
@@ -131,58 +127,28 @@ def build_obstacle_region(cell: kdb.Cell, layout: kdb.Layout,
     return region
 
 
-def rasterize_region_kdb(region: kdb.Region, bbox: kdb.Box,
-                         resolution_dbu: int) -> np.ndarray:
-    """Rasterize a kdb.Region into a 2D boolean numpy array using KLayout's native rasterizer.
-
-    Grid axes: row = y (bottom-to-top mapped to 0..nrows-1), col = x.
-    """
+def rasterize_region_kdb(region, bbox, resolution_dbu):
     ncols = max(1, (bbox.width() + resolution_dbu - 1) // resolution_dbu)
     nrows = max(1, (bbox.height() + resolution_dbu - 1) // resolution_dbu)
     origin = kdb.Point(bbox.left, bbox.bottom)
     step = kdb.Vector(resolution_dbu, resolution_dbu)
-    raster = np.array(region.rasterize(origin, step, ncols, nrows))
-    return raster > 0
+    return np.array(region.rasterize(origin, step, ncols, nrows)) > 0
 
 
-# ---------------------------------------------------------------------------
-# Coordinate conversion helpers
-# ---------------------------------------------------------------------------
-
-def dbu_to_grid(x_dbu: int, y_dbu: int, bbox: kdb.Box,
-                resolution_dbu: int) -> tuple[int, int]:
-    """Convert dbu coordinates to grid (row, col)."""
-    col = (x_dbu - bbox.left) // resolution_dbu
-    row = (y_dbu - bbox.bottom) // resolution_dbu
+def dbu_to_grid(x, y, bbox, resolution_dbu):
+    col = (x - bbox.left) // resolution_dbu
+    row = (y - bbox.bottom) // resolution_dbu
     return (row, col)
 
 
-def grid_to_dbu(row: int, col: int, bbox: kdb.Box,
-                resolution_dbu: int) -> tuple[int, int]:
-    """Convert grid (row, col) back to dbu coordinates (center of grid cell)."""
+def grid_to_dbu(row, col, bbox, resolution_dbu):
     x = bbox.left + col * resolution_dbu + resolution_dbu // 2
     y = bbox.bottom + row * resolution_dbu + resolution_dbu // 2
     return (x, y)
 
 
-def conditional_overwrite(cost: np.ndarray, content: np.ndarray,
-                          content_mask: np.ndarray,
-                          r0: int, c0: int,
-                          condition_fn=None) -> None:
-    """Update cost grid subregion where both content_mask and condition_fn are true.
-
-    Args:
-        cost: Full cost grid (modified in-place).
-        content: New values to write (shape must fit in cost[r0:r0+nrows, c0:c0+ncols]).
-        content_mask: Boolean mask — which cells in content are candidates.
-        r0, c0: Top-left offset of the subregion in the full cost grid.
-        condition_fn: Function (existing_slice, content) -> bool mask.
-            Receives the existing cost subregion AND the content array,
-            enabling content-dependent conditions like "only increase".
-            Default: always True (unconditional overwrite of masked cells).
-    """
+def conditional_overwrite(cost, content, content_mask, r0, c0, condition_fn=None):
     nrows, ncols = content.shape
-    # Clip to grid bounds
     grid_rows, grid_cols = cost.shape
     r1 = min(r0 + nrows, grid_rows)
     c1 = min(c0 + ncols, grid_cols)
@@ -190,144 +156,77 @@ def conditional_overwrite(cost: np.ndarray, content: np.ndarray,
     c0_c = max(c0, 0)
     if r0_c >= r1 or c0_c >= c1:
         return
-    # Compute content slice offsets
     cr0 = r0_c - r0
     cc0 = c0_c - c0
     cr1 = cr0 + (r1 - r0_c)
     cc1 = cc0 + (c1 - c0_c)
-    content_slice = content[cr0:cr1, cc0:cc1]
-    mask_slice = content_mask[cr0:cr1, cc0:cc1]
+    cs = content[cr0:cr1, cc0:cc1]
+    ms = content_mask[cr0:cr1, cc0:cc1]
     region = cost[r0_c:r1, c0_c:c1]
     if condition_fn is not None:
-        mask = condition_fn(region, content_slice) & mask_slice
+        mask = condition_fn(region, cs) & ms
     else:
-        mask = mask_slice
-    region[mask] = content_slice[mask]
+        mask = ms
+    region[mask] = cs[mask]
 
 
-def get_damping_raster(region: kdb.Region, bbox: kdb.Box,
-                       resolution_dbu: int, safe_distance_dbu: int,
-                       hardness: float,
-                       n_steps: int) -> tuple[int, int, np.ndarray]:
-    """Build a graduated cost raster around a region.
-
-    Creates n_steps concentric expansions of the region. Each expansion
-    adds hardness // n_steps to the cost. Result: cost ramps from 0 at
-    safe_distance to hardness at the region boundary.
-
-    Returns (r0, c0, damping) where (r0, c0) is the grid offset of the
-    raster's top-left corner relative to the full cost grid (whose origin
-    is bbox.left, bbox.bottom). The raster covers only the bounding box
-    of the sized union for performance.
-    """
+def get_damping_raster(region, bbox, resolution_dbu, safe_distance_dbu, hardness, n_steps):
     if n_steps <= 0 or safe_distance_dbu <= 0:
         return 0, 0, np.zeros((0, 0), dtype=np.float64)
-
     union = region.dup()
     for i in range(n_steps):
-        sized = region.sized(int(safe_distance_dbu * (i + 1) / n_steps))
-        union += sized
-
-    # Clip to routing bbox
+        union += region.sized(int(safe_distance_dbu * (i + 1) / n_steps))
     union = union & bbox
-
     if union.is_empty():
         return 0, 0, np.zeros((0, 0), dtype=np.float64)
-
-    union_bbox = union.bbox()
-    # Snap origin to align with the full cost grid's pixel boundaries.
-    # This avoids partial-coverage rounding errors at damping field edges.
-    origin_x = bbox.left + ((union_bbox.left - bbox.left) // resolution_dbu) * resolution_dbu
-    origin_y = bbox.bottom + ((union_bbox.bottom - bbox.bottom) // resolution_dbu) * resolution_dbu
+    ub = union.bbox()
+    origin_x = bbox.left + ((ub.left - bbox.left) // resolution_dbu) * resolution_dbu
+    origin_y = bbox.bottom + ((ub.bottom - bbox.bottom) // resolution_dbu) * resolution_dbu
     origin = kdb.Point(origin_x, origin_y)
-    # Compute extent to cover the union bbox from the snapped origin
-    extent_x = union_bbox.right - origin_x
-    extent_y = union_bbox.top - origin_y
+    extent_x = ub.right - origin_x
+    extent_y = ub.top - origin_y
     step = kdb.Vector(resolution_dbu, resolution_dbu)
     ncols = max(1, (extent_x + resolution_dbu - 1) // resolution_dbu)
     nrows = max(1, (extent_y + resolution_dbu - 1) // resolution_dbu)
-
-    raster_raw = np.array(union.rasterize(origin, step, ncols, nrows))
-    # Normalize: each concentric layer contributes hardness // n_steps
+    raw = np.array(union.rasterize(origin, step, ncols, nrows))
     step_cost = hardness // n_steps if n_steps > 0 else hardness
-    damping = (raster_raw // (resolution_dbu * resolution_dbu)) * step_cost
+    damping = (raw // (resolution_dbu * resolution_dbu)) * step_cost
     damping = damping.astype(np.float64)
-
-    # Grid offset: where this raster sits in the full cost grid
     r0 = (origin_y - bbox.bottom) // resolution_dbu
     c0 = (origin_x - bbox.left) // resolution_dbu
     return r0, c0, damping
 
 
-# ---------------------------------------------------------------------------
-# Cost grid construction
-# ---------------------------------------------------------------------------
-
-def build_cost_grid_graduated(obstacle_grid: np.ndarray,
-                              obs_region: kdb.Region,
-                              bbox: kdb.Box,
-                              resolution_dbu: int,
-                              obs_hardness: float,
-                              obs_damping_step: int,
-                              obs_safe_dbu: int) -> np.ndarray:
-    """Build a float cost grid with graduated damping around obstacles.
-
-    Obstacle cells get cost -1 (impassable via MCP_Geometric negative-cost
-    convention). Cells near obstacles get stepped damping cost that
-    increases toward the obstacle boundary.
-    """
+def build_cost_grid_graduated(obstacle_grid, obs_region, bbox, resolution_dbu,
+                              obs_hardness, obs_damping_step, obs_safe_dbu):
     nrows, ncols = obstacle_grid.shape
     cost = np.ones((nrows, ncols), dtype=np.float64)
-
-    # Mark obstacles as impassable
     cost[obstacle_grid] = -1.0
-
-    # Add graduated damping around obstacles
     if obs_damping_step > 0 and obs_safe_dbu > 0:
         r0, c0, damping = get_damping_raster(
-            obs_region, bbox, resolution_dbu, obs_safe_dbu,
-            obs_hardness, obs_damping_step)
+            obs_region, bbox, resolution_dbu, obs_safe_dbu, obs_hardness, obs_damping_step)
         if damping.size > 0:
-            conditional_overwrite(
-                cost, damping, damping > 0, r0, c0,
-                condition_fn=lambda existing, new: existing >= 0)
-
+            conditional_overwrite(cost, damping, damping > 0, r0, c0,
+                                  condition_fn=lambda existing, new: existing >= 0)
     return cost
 
 
-# ---------------------------------------------------------------------------
-# Pathfinding
-# ---------------------------------------------------------------------------
-
-def find_path(cost: np.ndarray, start: tuple[int, int],
-              end: tuple[int, int]) -> list[tuple[int, int]] | None:
-    """Find minimum-cost path using MCP_Geometric (Dijkstra on grid).
-
-    Returns list of (row, col) or None if no path found.
-    Uses negative-sentinel convention: cost < 0 means impassable.
-    """
-    # Clamp to grid bounds
+def find_path(cost, start, end):
     nrows, ncols = cost.shape
     sr = max(0, min(start[0], nrows - 1))
     sc = max(0, min(start[1], ncols - 1))
     er = max(0, min(end[0], nrows - 1))
     ec = max(0, min(end[1], ncols - 1))
-
-    # If start or end is blocked, clear it temporarily.
-    # Defensive guard: MCP_Geometric produces silently wrong results
-    # when started on a negative-cost cell.
     orig_start = cost[sr, sc]
     orig_end = cost[er, ec]
     if cost[sr, sc] < 0:
         cost[sr, sc] = 1.0
     if cost[er, ec] < 0:
         cost[er, ec] = 1.0
-
     try:
         mcp = MCP_Geometric(cost, fully_connected=True)
         mcp.find_costs([(sr, sc)])
-        path = mcp.traceback((er, ec))
-        return path
+        return mcp.traceback((er, ec))
     except Exception:
         return None
     finally:
@@ -336,14 +235,62 @@ def find_path(cost: np.ndarray, start: tuple[int, int],
 
 
 # ---------------------------------------------------------------------------
+# Steiner branch helper (for bus mode)
+# ---------------------------------------------------------------------------
+
+def find_path_to_existing(cost, start_rc, existing_path_grid):
+    """Find shortest path from start_rc to any cell in existing_path_grid.
+
+    existing_path_grid is a boolean mask of cells that were marked by a
+    previously-routed segment of THIS net. Returns the path as a list of
+    (row, col) ending at the first existing-path cell it hits.
+
+    Implementation: temporarily make existing_path_grid cells walkable
+    (cost=1) so MCP_Geometric can terminate ON them. Restore after.
+    """
+    import sys as _sys
+    nrows, ncols = cost.shape
+    sr = max(0, min(start_rc[0], nrows - 1))
+    sc = max(0, min(start_rc[1], ncols - 1))
+    orig_start = cost[sr, sc]
+    if cost[sr, sc] < 0:
+        cost[sr, sc] = 1.0
+    saved_path_costs = cost[existing_path_grid].copy()
+    cost[existing_path_grid] = 1.0
+    try:
+        ends = list(zip(*np.where(existing_path_grid)))
+        if not ends:
+            return None
+        mcp = MCP_Geometric(cost, fully_connected=True)
+        # MCP_Geometric.find_costs returns (cumulative_costs, traceback);
+        # there is no `.costs` attribute. Use the returned array.
+        costs_arr, _tb = mcp.find_costs([(sr, sc)])
+        best_end = None
+        best_c = math.inf
+        for r, c in ends:
+            v = costs_arr[r, c]
+            if math.isfinite(v) and v < best_c:
+                best_c = v
+                best_end = (r, c)
+        if best_end is None:
+            return None
+        path = mcp.traceback(best_end)
+        return path
+    except Exception:
+        return None
+    finally:
+        cost[sr, sc] = orig_start
+        cost[existing_path_grid] = saved_path_costs
+
+
+# ---------------------------------------------------------------------------
 # Main routing logic
 # ---------------------------------------------------------------------------
 
 def route(config: dict) -> dict:
-    """Execute the full routing pipeline. Returns result dict."""
-    errors = []
+    errors: list[str] = []
 
-    # Parse config
+    # --- Parse config ---
     gds_path = config["gds_path"]
     cell_name = config.get("cell_name", "TOP")
     dbu = config.get("dbu", 0.001)
@@ -354,39 +301,62 @@ def route(config: dict) -> dict:
     obs_safe_um = config.get("obs_safe_distance_um", 5.0)
     path_safe_um = config.get("path_safe_distance_um", 5.0)
     map_res_um = config.get("map_resolution_um", 1.0)
-
-    # New graduated damping parameters (backward compatible defaults)
     obs_hardness = config.get("obs_hardness", 20.0)
-    obs_damping_step = config.get("obs_damping_step", 4)
+    obs_damping_step = int(config.get("obs_damping_step", 4))
     pin_safe_a_um = config.get("pin_safe_distance_a_um", 5.0)
     pin_safe_b_um = config.get("pin_safe_distance_b_um", 5.0)
     pin_hardness = config.get("pin_hardness", 20.0)
-    pin_damping_step = config.get("pin_damping_step", 4)
-    path_hardness = config.get("path_hardness", 10.0)
-    path_damping_step = config.get("path_damping_step", 5)
-    sort_pairs = config.get("sort_pairs", True)
-
-    # P4 additions
+    pin_damping_step = int(config.get("pin_damping_step", 4))
+    # C3 differentiator: stronger graduated path avoidance.
+    # path_hardness 10->25 (steeper barrier near completed routes),
+    # path_damping_step 5->8 (smoother gradient -> Dijkstra picks detours
+    # earlier rather than scraping the edge of the freeze halo).
+    path_hardness = config.get("path_hardness", 25.0)
+    path_damping_step = int(config.get("path_damping_step", 8))
+    sort_pairs = bool(config.get("sort_pairs", True))
     dry_run = bool(config.get("dry_run", False))
     per_pair_obs_layers = config.get("per_pair_obstacle_layers", None)
     auto_map_res = bool(config.get("auto_map_resolution", False))
 
-    # Convert um to dbu (resolution will be recomputed after auto_map_resolution
-    # override below if requested)
+    # New schema fields
+    bus_pairs = config.get("bus_pairs", None)
+    # C3: default freeze margin 1.0 -> 2.5 um — route-route crossings on
+    # singleton fixtures came in at 2-9 um^2 areas, i.e. routes scraping
+    # within ~1 um of prior routes. 2.5 um margin pushes that gap wider.
+    freeze_margin_um = float(config.get(
+        "freeze_completed_routes_as_obstacles_with_margin", 2.5))
+    pin_pairs_override = config.get("pin_pairs_override", None)
+
+    # C3: default strategy is hybrid:
+    #   singleton net (1 sink)  -> per-pair Dijkstra
+    #   multi-sink net (>=2)    -> Steiner tree
+    # User-facing strategy values: "hybrid" (default) | "per_pair" | "steiner".
+    strategy = config.get("routing_strategy", "hybrid")
+
+    # C3: auto-bus-detection threshold. When bus_pairs is None and pin_layer_a
+    # has multiple pins clustered within this distance, treat them as a
+    # multi-sink bus. Default 0 (disabled — typical fixtures are singleton
+    # Hall bars, so we don't want to falsely cluster their 11 contacts).
+    bus_auto_threshold_um = float(config.get("bus_auto_threshold_um", 0.0))
+
+    # C3: experimented with sort_pairs_reverse=True (longest first) — caused
+    # connectivity drops because long routes claimed corridors that shorter
+    # routes critically needed. Default False (shortest first, baseline order).
+    sort_pairs_reverse = bool(config.get("sort_pairs_reverse", False))
+
+    # --- Convert um→dbu (resolution recomputed after auto-map) ---
     obs_safe_dbu = int(round(obs_safe_um / dbu))
     path_width_dbu = int(round(path_width_um / dbu))
-
-    # Convert new um params to dbu
     pin_safe_a_dbu = int(round(pin_safe_a_um / dbu))
     pin_safe_b_dbu = int(round(pin_safe_b_um / dbu))
     path_safe_dbu = int(round(path_safe_um / dbu))
+    freeze_margin_dbu = int(round(freeze_margin_um / dbu))
 
-    # Load GDS
+    # --- Load GDS ---
     layout = kdb.Layout()
     layout.read(gds_path)
     layout.dbu = dbu
 
-    # Find cell
     cell = None
     for ci in range(layout.cells()):
         c = layout.cell(ci)
@@ -394,11 +364,12 @@ def route(config: dict) -> dict:
             cell = c
             break
     if cell is None:
-        return {"status": "error", "routed_pairs": 0, "total_pins_a": 0,
-                "total_pins_b": 0, "paths": [],
-                "errors": [f"Cell '{cell_name}' not found"]}
+        return {
+            "status": "error", "routed_pairs": 0, "total_pins_a": 0,
+            "total_pins_b": 0, "paths": [],
+            "errors": [f"Cell '{cell_name}' not found"],
+        }
 
-    # Extract pins
     la, da = parse_layer(pin_layer_a)
     lb, db = parse_layer(pin_layer_b)
     pins_a = extract_pin_centers(cell, layout, la, da)
@@ -410,365 +381,566 @@ def route(config: dict) -> dict:
             missing.append(f"pin_layer_a '{pin_layer_a}' has 0 pins")
         if not pins_b:
             missing.append(f"pin_layer_b '{pin_layer_b}' has 0 pins")
-        return {"status": "error", "routed_pairs": 0,
-                "total_pins_a": len(pins_a), "total_pins_b": len(pins_b),
-                "paths": [],
-                "errors": [f"No pins found: {'; '.join(missing)}. Check that the layer specs match your layout and that polygons exist on those layers."]}
+        return {
+            "status": "error", "routed_pairs": 0,
+            "total_pins_a": len(pins_a), "total_pins_b": len(pins_b),
+            "paths": [],
+            "errors": [f"No pins found: {'; '.join(missing)}."],
+        }
 
-    # Auto-derive map_resolution from smallest pin bbox edge if requested.
-    # Rule: resolution = min_edge_um / 3, rounded to 0.1 um, clamped to [0.2, 5.0].
-    # This ensures fine pins (e.g. 3x2 um contacts) don't get under-resolved on
-    # large layouts where the default 2.0 um grid can miss them entirely.
+    n_a = len(pins_a)
+    n_b = len(pins_b)
+
+    # --- auto_map_resolution ---
     auto_map_note = None
     if auto_map_res:
-        bbs_a = extract_pin_bboxes(cell, layout, la, da)
-        bbs_b = extract_pin_bboxes(cell, layout, lb, db)
-        min_edge = min_pin_edge_um(bbs_a, bbs_b, dbu)
-        if min_edge is not None and min_edge > 0:
-            chosen = max(0.2, min(5.0, round(min_edge / 3.0, 1)))
-            auto_map_note = f"auto_map_resolution: min_pin_edge_um={min_edge:.2f}, map_resolution_um set to {chosen}"
+        bb_a = extract_pin_bboxes(cell, layout, la, da)
+        bb_b = extract_pin_bboxes(cell, layout, lb, db)
+        m = min_pin_edge_um(bb_a, bb_b, dbu)
+        if m is not None and m > 0:
+            chosen = max(0.2, min(5.0, round(m / 3.0, 1)))
+            auto_map_note = f"auto_map_resolution: min_pin_edge_um={m:.2f}, map_resolution_um set to {chosen}"
             map_res_um = chosen
 
-    # Convert map resolution to dbu now that any auto override is applied
     resolution_dbu = int(round(map_res_um / dbu))
 
-    obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
+    # ---------------------------------------------------------------------
+    # PRE-PASS: assignment engine (run BEFORE cost-grid build, so we can
+    # restrict pin_exclusion to active pins only). This prevents the
+    # well-known pad-overrun bug — when there are 43 pad pins on L101/0
+    # but the router only uses 11, the original logic clears around all
+    # 43, leaving unchosen pads walkable.
+    # ---------------------------------------------------------------------
+    assignment_engine = "ordered_loop"
+    nets: list[dict[str, Any]] = []  # [{a_idx, b_idxs}, ...]
 
-    # Build pin footprint regions (used for obstacle exclusion, cost marking, and damping)
-    pin_radius = resolution_dbu  # half-width of pin footprint box
-    pin_regions_a = kdb.Region()
-    for px, py in pins_a:
-        pin_regions_a.insert(kdb.Box(
-            px - pin_radius, py - pin_radius,
-            px + pin_radius, py + pin_radius))
+    if pin_pairs_override is not None:
+        if not isinstance(pin_pairs_override, list):
+            return {"status": "failed", "routed_pairs": 0,
+                    "total_pins_a": n_a, "total_pins_b": n_b,
+                    "paths": [],
+                    "errors": ["pin_pairs_override must be a list of [a_idx, b_idx] pairs."]}
+        bad = []
+        for k, ent in enumerate(pin_pairs_override):
+            if (not isinstance(ent, (list, tuple)) or len(ent) != 2
+                    or not isinstance(ent[0], int) or not isinstance(ent[1], int)):
+                bad.append(f"entry {k}: must be [a_idx, b_idx]; got {ent!r}")
+                continue
+            if not (0 <= ent[0] < n_a):
+                bad.append(f"entry {k}: a_idx {ent[0]} out of range (n_a={n_a})")
+            if not (0 <= ent[1] < n_b):
+                bad.append(f"entry {k}: b_idx {ent[1]} out of range (n_b={n_b})")
+        if len(pin_pairs_override) != min(n_a, n_b):
+            bad.append(f"length {len(pin_pairs_override)} != expected pair count {min(n_a, n_b)}")
+        if bad:
+            return {"status": "failed", "routed_pairs": 0,
+                    "total_pins_a": n_a, "total_pins_b": n_b,
+                    "paths": [],
+                    "errors": ["pin_pairs_override validation errors:"] + bad}
+        for a, b in pin_pairs_override:
+            nets.append({"a_idx": int(a), "b_idxs": [int(b)]})
+        assignment_engine = "override"
 
-    pin_regions_b = kdb.Region()
-    for px, py in pins_b:
-        pin_regions_b.insert(kdb.Box(
-            px - pin_radius, py - pin_radius,
-            px + pin_radius, py + pin_radius))
+    elif bus_pairs is None and bus_auto_threshold_um > 0.0:
+        # Auto-bus detection: cluster pins on layer A that fall within the
+        # threshold into multi-source nets. Each cluster of A-pins shares
+        # its B-pin matches via a small-cost Hungarian among nearest B's.
+        # Implementation: use a union-find on pin distances.
+        threshold_dbu = bus_auto_threshold_um / dbu
+        parent = list(range(n_a))
 
-    # Subtract pin clearance from obstacles — pins often sit on device geometry
-    # (e.g. contact tips on mesa layer). Clear a corridor around each pin so
-    # paths can reach them through the obstacle field. The clearance must be
-    # large enough to cut through the full obstacle + damping zone.
-    all_pin_region = pin_regions_a + pin_regions_b
-    raw_obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
-    pin_exclusion = kdb.Region()
-    for pin_list in [pins_a, pins_b]:
-        for px, py in pin_list:
-            # Find the obstacle shape containing this pin
-            pt_box = kdb.Box(px - 1, py - 1, px + 1, py + 1)
-            touching = raw_obs_region.interacting(kdb.Region(pt_box))
-            if touching.is_empty():
-                clear_radius = obs_safe_dbu + resolution_dbu * 2
+        def _find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(i, j):
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                parent[ri] = rj
+        for i in range(n_a):
+            for j in range(i + 1, n_a):
+                d = math.hypot(pins_a[i][0] - pins_a[j][0],
+                               pins_a[i][1] - pins_a[j][1])
+                if d <= threshold_dbu:
+                    _union(i, j)
+        clusters: dict[int, list[int]] = {}
+        for i in range(n_a):
+            clusters.setdefault(_find(i), []).append(i)
+        # Each cluster -> (cluster_a_idxs, sorted by closeness, picks first
+        # b for each by ordered_loop). Simplest: use cluster centroid as the
+        # source A and the cluster's nearest k B-pins as sinks where
+        # k = len(cluster). This collapses correctly to singleton when
+        # threshold is too tight to merge.
+        used_b: set[int] = set()
+        for src_a_list in clusters.values():
+            # Centroid in dbu
+            cx = sum(pins_a[i][0] for i in src_a_list) / len(src_a_list)
+            cy = sum(pins_a[i][1] for i in src_a_list) / len(src_a_list)
+            # Need len(src_a_list) sinks — pick nearest unused B-pins.
+            avail = [(math.hypot(pins_b[bi][0] - cx, pins_b[bi][1] - cy), bi)
+                     for bi in range(n_b) if bi not in used_b]
+            avail.sort()
+            need = len(src_a_list)
+            picked = [bi for _, bi in avail[:need]]
+            for bi in picked:
+                used_b.add(bi)
+            if len(src_a_list) == 1:
+                # singleton: standard 1:1
+                nets.append({"a_idx": src_a_list[0], "b_idxs": [picked[0]]})
             else:
-                obs_bbox = touching.bbox()
-                dx = max(abs(px - obs_bbox.left), abs(px - obs_bbox.right))
-                dy = max(abs(py - obs_bbox.bottom), abs(py - obs_bbox.top))
-                max_dist = int(math.sqrt(dx * dx + dy * dy))
-                clear_radius = max_dist + obs_safe_dbu + resolution_dbu * 2
-            pin_exclusion.insert(kdb.Box(
-                px - clear_radius, py - clear_radius,
-                px + clear_radius, py + clear_radius))
-    obs_region = obs_region - pin_exclusion
+                # bus: pick the pin nearest the centroid as the source pin,
+                # rest are sinks too via Steiner from that source's path.
+                # Simpler — just designate the closest A as the bus source,
+                # ignore other A-pins (caller can split if they don't want
+                # this). Actually for general buses there's only one source
+                # per net, so we route each A as its own net for safety
+                # unless explicit bus_pairs are passed. So fall back to
+                # singletons here.
+                for ai in src_a_list:
+                    if not picked:
+                        break
+                    nets.append({"a_idx": ai, "b_idxs": [picked.pop(0)]})
+        assignment_engine = "auto_cluster"
 
-    # Compute bounding box (cell bbox with margin)
+    elif bus_pairs is not None:
+        if not isinstance(bus_pairs, list):
+            return {"status": "failed", "routed_pairs": 0,
+                    "total_pins_a": n_a, "total_pins_b": n_b,
+                    "paths": [],
+                    "errors": ["bus_pairs must be a list of [a_idx, [b_idx,...]] entries."]}
+        for k, ent in enumerate(bus_pairs):
+            if (not isinstance(ent, (list, tuple)) or len(ent) != 2
+                    or not isinstance(ent[0], int) or not isinstance(ent[1], (list, tuple))):
+                return {"status": "failed", "routed_pairs": 0,
+                        "total_pins_a": n_a, "total_pins_b": n_b,
+                        "paths": [],
+                        "errors": [f"bus_pairs entry {k}: must be [a_idx, [b_idx,...]]; got {ent!r}"]}
+            a_idx = int(ent[0])
+            b_idxs = [int(x) for x in ent[1]]
+            if not (0 <= a_idx < n_a):
+                return {"status": "failed", "routed_pairs": 0,
+                        "total_pins_a": n_a, "total_pins_b": n_b,
+                        "paths": [],
+                        "errors": [f"bus_pairs entry {k}: a_idx {a_idx} out of range"]}
+            if not b_idxs:
+                return {"status": "failed", "routed_pairs": 0,
+                        "total_pins_a": n_a, "total_pins_b": n_b,
+                        "paths": [],
+                        "errors": [f"bus_pairs entry {k}: empty b_idx list"]}
+            for bi in b_idxs:
+                if not (0 <= bi < n_b):
+                    return {"status": "failed", "routed_pairs": 0,
+                            "total_pins_a": n_a, "total_pins_b": n_b,
+                            "paths": [],
+                            "errors": [f"bus_pairs entry {k}: b_idx {bi} out of range"]}
+            nets.append({"a_idx": a_idx, "b_idxs": b_idxs})
+
+    else:
+        # Ordered-loop pairing on the full pin sets.
+        if n_a <= n_b:
+            inner = pins_a
+            outer = pins_b
+            swapped = False
+        else:
+            inner = pins_b
+            outer = pins_a
+            swapped = True
+        try:
+            assignment, total_cost = ordered_loop_match(inner, outer)
+        except ValueError as e:
+            return {"status": "failed", "routed_pairs": 0,
+                    "total_pins_a": n_a, "total_pins_b": n_b,
+                    "paths": [],
+                    "errors": [f"ordered_loop_match: {e}"]}
+        for ii, oo in assignment:
+            if swapped:
+                a_idx, b_idx = oo, ii
+            else:
+                a_idx, b_idx = ii, oo
+            nets.append({"a_idx": int(a_idx), "b_idxs": [int(b_idx)]})
+
+    # Active pin sets — only pins participating in any net are "active".
+    # Inactive pins remain blocked by global obstacles.
+    active_a = sorted({net["a_idx"] for net in nets})
+    active_b = sorted({bi for net in nets for bi in net["b_idxs"]})
+    active_pins_a = [pins_a[i] for i in active_a]
+    active_pins_b = [pins_b[i] for i in active_b]
+
+    # GLOBAL obstacle inflation = path_width/2. Forces path centerlines
+    # to stay path_width/2 from any obstacle, so the path POLYGON
+    # (centerline ± path_width/2) doesn't brush. Pin clearance correctly
+    # carves the per-pin-shape exception via individual-polygon logic.
+    obs_region = build_obstacle_region(cell, layout, obstacle_layers,
+                                        path_width_dbu // 2)
+
+    pin_radius = resolution_dbu
+    pin_regions_a = kdb.Region()
+    for px, py in active_pins_a:
+        pin_regions_a.insert(kdb.Box(px - pin_radius, py - pin_radius,
+                                     px + pin_radius, py + pin_radius))
+    pin_regions_b = kdb.Region()
+    for px, py in active_pins_b:
+        pin_regions_b.insert(kdb.Box(px - pin_radius, py - pin_radius,
+                                     px + pin_radius, py + pin_radius))
+
+    # PER-PAIR pin clearance — defer to routing loop. Globally clearing
+    # all active pins (v1 behaviour) opens corridors through OTHER chosen
+    # pads/contacts, allowing route_i to take a shortcut through pad_j.
+    # Instead, each pair temporarily clears ONLY its own pin shapes during
+    # its own pathfinding pass, then restores them.
+    raw_obs_region = build_obstacle_region(cell, layout, obstacle_layers, 0)
+    pin_clear_margin_dbu = obs_safe_dbu + resolution_dbu * 2
+
+    # Pre-compute per-pin clearance regions.
+    #
+    # CRITICAL discovery (round-2 investigation, HM05):
+    # `raw_obs_region.interacting(pt_box)` returns the MERGED obstacle blob.
+    # Because contacts straddle the mesa edge, the mesa+all-contacts merge
+    # into ONE polygon — so `own` ends up being the entire mesa+contacts blob.
+    # Inflating that by `pin_clear_margin` clears the area around EVERY
+    # contact, defeating the "this pin only" intent and re-introducing the
+    # original adjacent-contact-brush bug.
+    #
+    # Fix: Index INDIVIDUAL contact and pad polygons (not the merged region)
+    # so pin clearance can identify the SPECIFIC shape under the pin.
+    other_obs_keepout_dbu = path_width_dbu // 2
+
+    # Index every individual obstacle shape from each obstacle layer.
+    individual_obs_polys: list[kdb.Polygon] = []
+    for spec in obstacle_layers:
+        ln, dt = parse_layer(spec)
+        li = layout.find_layer(ln, dt)
+        if li is None:
+            continue
+        for shape in cell.shapes(li).each():
+            try:
+                individual_obs_polys.append(shape.polygon)
+            except Exception:
+                pass
+
+    def _shape_containing(px, py):
+        """Return the smallest individual obstacle polygon whose bbox
+        contains (px, py) and whose interior includes the point. None if
+        the pin sits in free space."""
+        candidates = []
+        for poly in individual_obs_polys:
+            bb = poly.bbox()
+            if bb.left <= px <= bb.right and bb.bottom <= py <= bb.top:
+                if poly.inside(kdb.Point(px, py)):
+                    candidates.append((bb.area(), poly))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: t[0])
+        return candidates[0][1]
+
+    def pin_clearance_region(px, py):
+        """Return a kdb.Region around (px,py) sized by pin_clear_margin_dbu,
+        with neighbour-obstacle keepout subtracted. Uses the INDIVIDUAL
+        contact/pad polygon under the pin (not the merged obstacle blob)."""
+        own_poly = _shape_containing(px, py)
+        if own_poly is None:
+            return kdb.Region(kdb.Box(
+                px - pin_clear_margin_dbu, py - pin_clear_margin_dbu,
+                px + pin_clear_margin_dbu, py + pin_clear_margin_dbu))
+        own_region = kdb.Region(own_poly)
+        cleared = own_region.sized(pin_clear_margin_dbu)
+        # Subtract every OTHER obstacle (each individual polygon) inflated
+        # by path_width/2, so the cleared zone never includes cells within
+        # path_width/2 of a neighbour obstacle.
+        others = kdb.Region()
+        for p in individual_obs_polys:
+            if p is own_poly:
+                continue
+            others.insert(p)
+        if not others.is_empty():
+            cleared = cleared - others.sized(other_obs_keepout_dbu)
+        return cleared
+
+    pin_a_clear = [pin_clearance_region(px, py) for (px, py) in pins_a]
+    pin_b_clear = [pin_clearance_region(px, py) for (px, py) in pins_b]
+    # No global pin_exclusion — keep obs_region full.
+
+    # Cell bbox routing window
     cell_bbox = cell.bbox()
     margin = max(obs_safe_dbu, resolution_dbu * 10)
-    bbox = kdb.Box(
-        cell_bbox.left - margin, cell_bbox.bottom - margin,
-        cell_bbox.right + margin, cell_bbox.top + margin,
-    )
+    bbox = kdb.Box(cell_bbox.left - margin, cell_bbox.bottom - margin,
+                   cell_bbox.right + margin, cell_bbox.top + margin)
 
-    # Rasterize obstacles
     obs_grid = rasterize_region_kdb(obs_region, bbox, resolution_dbu)
-
-    # Build graduated cost grid
     cost = build_cost_grid_graduated(
         obs_grid, obs_region, bbox, resolution_dbu,
         obs_hardness, obs_damping_step, obs_safe_dbu)
 
-    # Rasterize pin footprints as -2 (overwrite everything)
     all_pin_region = pin_regions_a + pin_regions_b
     pin_grid = rasterize_region_kdb(all_pin_region, bbox, resolution_dbu)
     cost[pin_grid] = -2.0
 
-    # Add pin damping halos (Pin A)
+    # Pin damping halos
     if pin_safe_a_dbu > 0 and pin_damping_step > 0:
         r0, c0, damping = get_damping_raster(
             pin_regions_a, bbox, resolution_dbu, pin_safe_a_dbu,
             pin_hardness, pin_damping_step)
         if damping.size > 0:
-            conditional_overwrite(
-                cost, damping, damping > 0, r0, c0,
-                condition_fn=lambda existing, new: (existing > 0) & (existing < new))
-
-    # Add pin damping halos (Pin B)
+            conditional_overwrite(cost, damping, damping > 0, r0, c0,
+                                  condition_fn=lambda e, n: (e > 0) & (e < n))
     if pin_safe_b_dbu > 0 and pin_damping_step > 0:
         r0, c0, damping = get_damping_raster(
             pin_regions_b, bbox, resolution_dbu, pin_safe_b_dbu,
             pin_hardness, pin_damping_step)
         if damping.size > 0:
-            conditional_overwrite(
-                cost, damping, damping > 0, r0, c0,
-                condition_fn=lambda existing, new: (existing > 0) & (existing < new))
+            conditional_overwrite(cost, damping, damping > 0, r0, c0,
+                                  condition_fn=lambda e, n: (e > 0) & (e < n))
 
-    # Hungarian matching: Euclidean distance cost matrix
-    n_a, n_b = len(pins_a), len(pins_b)
-    n = max(n_a, n_b)
-    dist_matrix = np.full((n, n), 1e18)
+    # C3: route longest nets first (sort_pairs_reverse=True default). Long
+    # pairs claim long corridors before short pairs squeeze in.
+    if sort_pairs and assignment_engine != "override":
+        def primary_dist(net):
+            a = pins_a[net["a_idx"]]
+            ds = []
+            for bi in net["b_idxs"]:
+                b = pins_b[bi]
+                ds.append(math.hypot(a[0] - b[0], a[1] - b[1]))
+            return min(ds)
+        nets.sort(key=primary_dist, reverse=sort_pairs_reverse)
 
-    for i in range(n_a):
-        for j in range(n_b):
-            dx = pins_a[i][0] - pins_b[j][0]
-            dy = pins_a[i][1] - pins_b[j][1]
-            dist_matrix[i, j] = math.sqrt(dx * dx + dy * dy)
-
-    # P3: explicit pairing override takes precedence over Hungarian matching.
-    pin_pairs_override = config.get("pin_pairs_override", None)
-    if pin_pairs_override is not None:
-        if not isinstance(pin_pairs_override, list):
-            return {
-                "status": "failed",
-                "routed_pairs": 0,
-                "total_pins_a": n_a,
-                "total_pins_b": n_b,
-                "paths": [],
-                "errors": [
-                    "pin_pairs_override must be a list of [a_idx, b_idx] pairs."
-                ],
-            }
-        bad = []
-        for k, entry in enumerate(pin_pairs_override):
-            if (not isinstance(entry, (list, tuple)) or len(entry) != 2
-                    or not isinstance(entry[0], int)
-                    or not isinstance(entry[1], int)):
-                bad.append(
-                    f"pin_pairs_override entry {k}: must be [a_idx, b_idx]; "
-                    f"got {entry!r}")
-                continue
-            if entry[0] < 0 or entry[0] >= n_a:
-                bad.append(
-                    f"pin_pairs_override entry {k}: a_idx {entry[0]} out of "
-                    f"range (n_a={n_a})")
-            if entry[1] < 0 or entry[1] >= n_b:
-                bad.append(
-                    f"pin_pairs_override entry {k}: b_idx {entry[1]} out of "
-                    f"range (n_b={n_b})")
-        expected_len = min(n_a, n_b)
-        if len(pin_pairs_override) != expected_len:
-            bad.append(
-                f"pin_pairs_override length ({len(pin_pairs_override)}) does "
-                f"not match expected pair count ({expected_len}). Run with "
-                f"dry_run=true first to see the Hungarian order.")
-        if bad:
-            return {
-                "status": "failed",
-                "routed_pairs": 0,
-                "total_pins_a": n_a,
-                "total_pins_b": n_b,
-                "paths": [],
-                "errors": ["pin_pairs_override validation errors:"] + bad,
-            }
-        pairs = [(int(a), int(b)) for a, b in pin_pairs_override]
-    else:
-        row_ind, col_ind = linear_sum_assignment(dist_matrix)
-
-        # Build matched pairs and filter dummy assignments
-        pairs = []
-        for idx in range(len(row_ind)):
-            i, j = row_ind[idx], col_ind[idx]
-            if i >= n_a or j >= n_b:
-                continue
-            pairs.append((i, j))
-
-        # Sort pairs by ascending distance (short pairs first)
-        if sort_pairs:
-            pairs.sort(key=lambda ij: dist_matrix[ij[0], ij[1]])
-
-    # Dry-run early-exit: return pair assignments without running the
-    # (expensive) find_path loop. Lets the caller veto obviously bad pair
-    # assignments before committing routing cost. Output schema stays
-    # compatible with the success path (paths[] is empty, pairs[] carries
-    # the preview). Respects pin_pairs_override if both are supplied.
+    # --- dry_run early exit ---
     if dry_run:
         preview = []
-        for i, j in pairs:
-            pa = pins_a[i]
-            pb = pins_b[j]
-            preview.append({
-                "pin_a_idx": int(i),
-                "pin_b_idx": int(j),
-                "pin_a_um": [round(pa[0] * dbu, 4), round(pa[1] * dbu, 4)],
-                "pin_b_um": [round(pb[0] * dbu, 4), round(pb[1] * dbu, 4)],
-                "distance_um": round(float(dist_matrix[i, j]) * dbu, 4),
-            })
-        dry_note = ["dry_run: matching only, no routes inserted."]
-        if pin_pairs_override is not None:
-            dry_note[0] = "dry_run: pin_pairs_override applied, no routes inserted."
-        if auto_map_note is not None:
-            dry_note.append(auto_map_note)
+        for net in nets:
+            a = pins_a[net["a_idx"]]
+            for bi in net["b_idxs"]:
+                b = pins_b[bi]
+                preview.append({
+                    "pin_a_idx": net["a_idx"],
+                    "pin_b_idx": bi,
+                    "pin_a_um": [round(a[0] * dbu, 4), round(a[1] * dbu, 4)],
+                    "pin_b_um": [round(b[0] * dbu, 4), round(b[1] * dbu, 4)],
+                    "distance_um": round(math.hypot(a[0] - b[0], a[1] - b[1]) * dbu, 4),
+                    "net_id": nets.index(net),
+                })
+        notes = [f"dry_run: matching only ({assignment_engine}), no routes inserted."]
+        if auto_map_note:
+            notes.append(auto_map_note)
         return {
-            "status": "dry_run",
-            "routed_pairs": 0,
-            "total_pins_a": n_a,
-            "total_pins_b": n_b,
-            "paths": [],
-            "pairs": preview,
-            "errors": dry_note,
+            "status": "dry_run", "routed_pairs": 0,
+            "total_pins_a": n_a, "total_pins_b": n_b,
+            "paths": [], "pairs": preview,
+            "errors": notes,
+            "assignment_engine": assignment_engine,
+            "map_resolution_um_used": map_res_um,
         }
 
-    # Validate per_pair_obstacle_layers length if provided. Must equal the
-    # number of matched pairs (post-Hungarian, post-sort).
+    # Validate per_pair_obs_layers length when supplied.
+    flat_pair_count = sum(len(net["b_idxs"]) for net in nets)
     if per_pair_obs_layers is not None:
         if not isinstance(per_pair_obs_layers, list):
             errors.append(
                 f"per_pair_obstacle_layers must be a list of lists; got {type(per_pair_obs_layers).__name__}")
             per_pair_obs_layers = None
-        elif len(per_pair_obs_layers) != len(pairs):
+        elif len(per_pair_obs_layers) != flat_pair_count:
             errors.append(
                 f"per_pair_obstacle_layers length ({len(per_pair_obs_layers)}) != "
-                f"matched pairs ({len(pairs)}); ignoring per-pair obstacles.")
+                f"flat pair count ({flat_pair_count}); ignoring per-pair obstacles.")
             per_pair_obs_layers = None
 
-    # Route each matched pair with per-pair pin recovery
-    result_paths = []
-    for pair_idx, (i, j) in enumerate(pairs):
-        pa = pins_a[i]
-        pb = pins_b[j]
+    # ---------------------------------------------------------------------
+    # Routing loop
+    # ---------------------------------------------------------------------
+    result_paths: list[dict[str, Any]] = []
+    pair_global_idx = 0  # index into per_pair_obs_layers (flattened across nets)
 
-        start_rc = dbu_to_grid(pa[0], pa[1], bbox, resolution_dbu)
-        end_rc = dbu_to_grid(pb[0], pb[1], bbox, resolution_dbu)
+    # Accumulator: cells occupied by completed routes + their freeze halos.
+    # Per-pair pin clearance MUST NOT overwrite these — clearing a cell that
+    # belongs to a prior route's frozen halo opens a corridor through that
+    # route, producing route-route crossings.
+    frozen_routes_grid = np.zeros_like(cost, dtype=bool)
 
-        # Step 1: Recover this pair's pin footprint regions to walkable (cost=1)
-        # Rasterize each pin's footprint box and save/restore all affected cells
-        pin_a_box = kdb.Box(pa[0] - pin_radius, pa[1] - pin_radius,
-                            pa[0] + pin_radius, pa[1] + pin_radius)
-        pin_b_box = kdb.Box(pb[0] - pin_radius, pb[1] - pin_radius,
-                            pb[0] + pin_radius, pb[1] + pin_radius)
-        pair_pin_region = kdb.Region(pin_a_box) + kdb.Region(pin_b_box)
-        pair_pin_grid = rasterize_region_kdb(pair_pin_region, bbox, resolution_dbu)
-        # Save original costs and set to walkable
-        saved_pin_costs = cost[pair_pin_grid].copy()
-        cost[pair_pin_grid] = 1.0
+    for net_id, net in enumerate(nets):
+        a_idx = net["a_idx"]
+        b_idxs = list(net["b_idxs"])
+        pa_dbu = pins_a[a_idx]
 
-        # Step 1b: Apply per-pair obstacle layers (if provided). These are
-        # rasterised on top of the existing cost grid as impassable cells,
-        # and restored after this pair's path is found. The per-pair region
-        # excludes this pair's own pin footprints (which must stay walkable
-        # for the endpoint snap to succeed).
-        per_pair_grid = None
-        saved_per_pair_costs = None
-        pair_obs_specs = None
-        if per_pair_obs_layers is not None:
-            try:
-                pair_obs_specs = per_pair_obs_layers[pair_idx]
-            except IndexError:
-                pair_obs_specs = None
-        if pair_obs_specs:
-            pair_obs_region = build_obstacle_region(
-                cell, layout, list(pair_obs_specs), 0)
-            # Cut the pin footprints out so we don't re-block the pair's
-            # start/end cells after just making them walkable above.
-            pair_obs_region = pair_obs_region - pair_pin_region
-            per_pair_grid = rasterize_region_kdb(
-                pair_obs_region, bbox, resolution_dbu)
-            if per_pair_grid.any():
-                saved_per_pair_costs = cost[per_pair_grid].copy()
-                cost[per_pair_grid] = -1.0
+        # Decide routing approach for this net
+        is_bus = len(b_idxs) > 1
+        if is_bus and strategy in ("steiner", "hybrid"):
+            # Steiner mode: route longest sink first, then branch others.
+            # Sort sinks by descending Euclidean distance from source.
+            b_idxs.sort(key=lambda bi: -math.hypot(
+                pins_b[bi][0] - pa_dbu[0], pins_b[bi][1] - pa_dbu[1]))
+        # else: per-pair sequential, default order.
 
-        # Step 2: Find path
-        path_rc = find_path(cost, start_rc, end_rc)
-        if path_rc is None:
-            errors.append(f"No path found for pin pair {i}->{j}")
-            # Restore per-pair obstacles first (reverse order of apply)
+        net_grid_mask = np.zeros_like(cost, dtype=bool)  # union of this net's path cells
+
+        for sink_local_idx, b_idx in enumerate(b_idxs):
+            pb_dbu = pins_b[b_idx]
+            start_rc = dbu_to_grid(pa_dbu[0], pa_dbu[1], bbox, resolution_dbu)
+            end_rc = dbu_to_grid(pb_dbu[0], pb_dbu[1], bbox, resolution_dbu)
+
+            # Per-pair pin recovery — clear THIS pair's pin shapes (their
+            # containing obstacle, sized by margin) so the path can reach
+            # both endpoints. Other pads/contacts stay obstacled.
+            # CRITICAL: don't clear cells that belong to PRIOR ROUTES'
+            # frozen halos — clearing them would let this route cross
+            # through that prior route. Subtract frozen_routes_grid.
+            pair_pin_region = pin_a_clear[a_idx] + pin_b_clear[b_idx]
+            pair_pin_grid_full = rasterize_region_kdb(pair_pin_region, bbox, resolution_dbu)
+            pair_pin_grid = pair_pin_grid_full & ~frozen_routes_grid
+            saved_pin_costs = cost[pair_pin_grid].copy()
+            cost[pair_pin_grid] = 1.0
+
+            # No per-pair keepout — global obstacle inflation (in obs_region)
+            # already enforces the path_width/2 centerline-to-obstacle gap.
+            # Use empty masks so the restore code is a no-op.
+            hard_keepout_mask = np.zeros_like(cost, dtype=bool)
+            saved_hard_costs = np.array([], dtype=cost.dtype)
+            soft_keepout_mask = np.zeros_like(cost, dtype=bool)
+            saved_soft_costs = np.array([], dtype=cost.dtype)
+
+            # Per-pair custom obstacles (caller-specified extras).
+            per_pair_grid = None
+            saved_per_pair_costs = None
+            if per_pair_obs_layers is not None:
+                try:
+                    extra = per_pair_obs_layers[pair_global_idx]
+                except IndexError:
+                    extra = None
+                if extra:
+                    extra_region = build_obstacle_region(cell, layout, list(extra), 0)
+                    extra_region = extra_region - pair_pin_region
+                    per_pair_grid = rasterize_region_kdb(extra_region, bbox, resolution_dbu)
+                    if per_pair_grid.any():
+                        saved_per_pair_costs = cost[per_pair_grid].copy()
+                        cost[per_pair_grid] = -1.0
+
+            # ---- ROUTE ----
+            this_path_rc = None
+            steiner_branch = bool(is_bus and strategy in ("steiner", "hybrid")
+                                  and sink_local_idx > 0 and net_grid_mask.any())
+            if steiner_branch:
+                # Branch: route from sink B back to nearest cell on the
+                # existing net path. Source = pin_b, target set = net cells.
+                this_path_rc = find_path_to_existing(cost, end_rc, net_grid_mask)
+            else:
+                this_path_rc = find_path(cost, start_rc, end_rc)
+
+            if this_path_rc is None:
+                errors.append(
+                    f"No path found for net_id={net_id} a_idx={a_idx} -> b_idx={b_idx}"
+                    + (" (steiner branch)" if steiner_branch else ""))
+                if per_pair_grid is not None and saved_per_pair_costs is not None:
+                    cost[per_pair_grid] = saved_per_pair_costs
+                cost[hard_keepout_mask] = saved_hard_costs
+                cost[soft_keepout_mask] = saved_soft_costs
+                cost[pair_pin_grid] = saved_pin_costs
+                pair_global_idx += 1
+                continue
+
+            # Restore per-pair custom obstacles + keepout before global cost-update.
             if per_pair_grid is not None and saved_per_pair_costs is not None:
                 cost[per_pair_grid] = saved_per_pair_costs
-            # Restore pin cells
+            cost[hard_keepout_mask] = saved_hard_costs
+            cost[soft_keepout_mask] = saved_soft_costs
+
+            # Convert to dbu + snap endpoints
+            path_dbu = [list(grid_to_dbu(r, c, bbox, resolution_dbu)) for r, c in this_path_rc]
+            if steiner_branch:
+                # For a branch, path_rc starts at pin_b (we ran search from
+                # end_rc) and ends at nearest existing-path cell. Swap so the
+                # output goes "from existing junction towards pin_b" — same
+                # data either way; consumers shouldn't care about direction.
+                path_dbu[0] = list(pb_dbu)
+            else:
+                path_dbu[0] = list(pa_dbu)
+                path_dbu[-1] = list(pb_dbu)
+            path_dbu = compress_path(path_dbu)
+
+            result_paths.append({
+                "points_dbu": path_dbu,
+                "pin_a": list(pa_dbu),
+                "pin_b": list(pb_dbu),
+                "net_id": net_id,
+                "branch_index": sink_local_idx,
+                "steiner_branch": steiner_branch,
+            })
+
+            # Mark this segment in cost grid (impassable for downstream pairs)
+            # and accumulate into net_grid_mask for Steiner.
+            if len(this_path_rc) >= 2:
+                pts = [kdb.Point(*grid_to_dbu(r, c, bbox, resolution_dbu))
+                       for r, c in this_path_rc]
+                path_obj = kdb.Path(pts, path_width_dbu, path_width_dbu // 2,
+                                    path_width_dbu // 2, True)
+                path_region = kdb.Region(path_obj)
+                pg = rasterize_region_kdb(path_region, bbox, resolution_dbu)
+                cost[pg] = -3.0
+                net_grid_mask |= pg
+
+                # Path damping: standard path_safe_distance.
+                if path_damping_step > 0 and path_safe_dbu > 0:
+                    r0, c0, damping = get_damping_raster(
+                        path_region, bbox, resolution_dbu, path_safe_dbu,
+                        path_hardness, path_damping_step)
+                    if damping.size > 0:
+                        conditional_overwrite(
+                            cost, damping, damping > 0, r0, c0,
+                            condition_fn=lambda e, n: (e > 0) & (e < n))
+
+                # ALSO: freeze with margin (issue #28 explicit request) —
+                # a hard inflation of the routed path PLUS path_safe_distance.
+                # Default margin 1um. Set to 0 to disable.
+                # Track frozen cells in `frozen_routes_grid` so subsequent
+                # per-pair pin clearance can't accidentally re-open them.
+                if freeze_margin_dbu > 0:
+                    frozen = path_region.sized(freeze_margin_dbu)
+                    fg = rasterize_region_kdb(frozen, bbox, resolution_dbu)
+                    cost[fg & (cost > 0)] = -1.0  # don't overwrite pins/sinks not yet routed
+                    frozen_routes_grid |= fg
+                    # Steiner: include freeze halo in net_grid_mask so the
+                    # next branch's find_path_to_existing can approach the
+                    # path through its own halo (otherwise the halo
+                    # surrounds the path on all sides and Dijkstra can't
+                    # reach the path cells).
+                    net_grid_mask |= fg
+                else:
+                    frozen_routes_grid |= pg
+
+            # Restore this pair's pin to blocked baseline
             cost[pair_pin_grid] = saved_pin_costs
-            continue
 
-        # Restore per-pair obstacle cells before marking the path (so the next
-        # pair sees a clean global cost grid again, only modified by path cells).
-        if per_pair_grid is not None and saved_per_pair_costs is not None:
-            cost[per_pair_grid] = saved_per_pair_costs
+            pair_global_idx += 1
 
-        # Step 3: Convert grid path to dbu coordinates and snap endpoints to pins
-        path_dbu = []
-        for r, c in path_rc:
-            x, y = grid_to_dbu(r, c, bbox, resolution_dbu)
-            path_dbu.append([x, y])
-        # Snap first/last waypoints to exact pin coordinates so paths
-        # visually connect to pins (grid cell centers are offset by up to
-        # half a resolution step from the actual pin position)
-        path_dbu[0] = list(pa)
-        path_dbu[-1] = list(pb)
-        path_dbu = compress_path(path_dbu)
-
-        result_paths.append({
-            "points_dbu": path_dbu,
-            "pin_a": list(pa),
-            "pin_b": list(pb),
-        })
-
-        # Step 4: Mark path as impassable (-3) and add graduated damping
-        # Build a kdb.Region from the path for rasterization
-        if len(path_rc) >= 2:
-            path_points = [kdb.Point(*grid_to_dbu(r, c, bbox, resolution_dbu))
-                           for r, c in path_rc]
-            path_obj = kdb.Path(path_points, path_width_dbu, path_width_dbu // 2,
-                                path_width_dbu // 2, True)
-            path_region = kdb.Region(path_obj)
-            path_grid = rasterize_region_kdb(path_region, bbox, resolution_dbu)
-            cost[path_grid] = -3.0
-
-            # Add graduated path damping
-            if path_damping_step > 0 and path_safe_dbu > 0:
-                r0, c0, damping = get_damping_raster(
-                    path_region, bbox, resolution_dbu, path_safe_dbu,
-                    path_hardness, path_damping_step)
-                if damping.size > 0:
-                    conditional_overwrite(
-                        cost, damping, damping > 0, r0, c0,
-                        condition_fn=lambda existing, new: (existing > 0) & (existing < new))
-
-        # Step 5: Restore this pair's pin footprint to blocked (-2)
-        cost[pair_pin_grid] = -2.0
-
-    # Emit the auto_map_resolution note as an info message so the agent can
-    # see what resolution was actually used (still routed under errors key
-    # because the worker has no separate info channel; route_worker output
-    # consumers treat errors[] as freeform notes when status == "success").
     if auto_map_note is not None:
         errors.append(auto_map_note)
 
+    info_only = all(n.startswith("auto_map_resolution") for n in errors)
+
     return {
-        "status": "success" if not errors else ("success" if all(n.startswith("auto_map_resolution") for n in errors) else "partial"),
+        "status": "success" if (not errors or info_only) else "partial",
         "routed_pairs": len(result_paths),
         "total_pins_a": n_a,
         "total_pins_b": n_b,
         "paths": result_paths,
         "errors": errors,
         "map_resolution_um_used": map_res_um,
+        "assignment_engine": assignment_engine,
+        "n_nets": len(nets),
     }
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def main():
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <config.json>", file=sys.stderr)
         sys.exit(1)
-
     config_path = sys.argv[1]
     with open(config_path) as f:
         config = json.load(f)
-
     result = route(config)
-
     output_path = config.get("output_path")
     if output_path:
         with open(output_path, "w") as f:
@@ -776,7 +948,6 @@ def main():
         print(f"Routes written to {output_path}")
     else:
         print(json.dumps(result, indent=2))
-
     if result["status"] == "error":
         sys.exit(1)
 
