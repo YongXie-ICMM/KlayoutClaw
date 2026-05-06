@@ -330,7 +330,7 @@ TOOLS = [
     },
     {
         "name": "route_inspect",
-        "description": "Inspect every route on a given layer and report (route_id, from_contact, to_pad, length_um, layer, endpoints_um) plus any pair crossings. route_id matches the indexing used by evaluate_design's contact_isolation.crossing_pairs so the two tools can be cross-referenced. Read-only \u2014 never modifies the layout.",
+        "description": "Inspect every route on a given layer and report (route_id, from_contact, to_pad, length_um, layer, endpoints_um) plus any pair crossings. route_id matches the indexing used by evaluate_design's contact_isolation.crossing_pairs so the two tools can be cross-referenced. When crossings are detected, also renders a labeled PNG of the crossing region (zoom_box around all crossing geometries with 10x line-width clearance, route_id printed near both endpoints of each crossing-involved route); the path is returned in the 'image_path' field. Read-only \u2014 never modifies the layout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -341,7 +341,8 @@ TOOLS = [
                     "description": "Layer specs for contact shapes that route endpoints may land on. Accepts a list of layer specs. Required — there is no default."
                 },
                 "pad_layer": {"type": "string", "description": "Layer spec for bonding pads. Required — there is no default."},
-                "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 5.0).", "default": 5.0}
+                "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 5.0).", "default": 5.0},
+                "image_path": {"type": "string", "description": "Optional output PNG path for the labeled-crossings image. Defaults to /tmp/route_inspect_&lt;ts&gt;.png. Only written when crossings are detected; with no crossings the response field 'image_path' is null."}
             },
             "required": ["route_layer", "contact_layers", "pad_layer"]
         }
@@ -1006,6 +1007,15 @@ def _tool_route_inspect(args):
             "pads). No default is assumed.")
     tolerance_um = float(args.get("tolerance_um", 5.0))
 
+    # Issue #34: optional labeled-crossings PNG. Default path uses an
+    # epoch timestamp so successive calls don't clobber prior output.
+    import time as _time
+    image_path_arg = args.get("image_path")
+    if image_path_arg:
+        labeled_image_path = os.path.abspath(str(image_path_arg))
+    else:
+        labeled_image_path = "/tmp/route_inspect_{}.png".format(int(_time.time()))
+
     dbu = _layout.dbu
     tolerance_dbu = int(round(tolerance_um / dbu))
 
@@ -1155,6 +1165,18 @@ def _tool_route_inspect(args):
             if area_um2 &gt; 0.01:
                 crossings.append([i, j, area_um2])
 
+    # Issue #34: labeled-crossings image. Only rendered when at least
+    # one crossing was detected — empty crossings short-circuits to
+    # image_path=None so the agent can branch on it.
+    image_path_out = None
+    if crossings:
+        try:
+            image_path_out = _render_route_inspect_crossings_image(
+                routes, crossings, labeled_image_path, dbu)
+        except Exception as _exc:
+            _log("route_inspect: labeled-crossings render failed: {}".format(_exc))
+            image_path_out = None
+
     # next_step_suggestion
     n_unmapped = sum(1 for r in out_routes if r["from_contact"] is None or r["to_pad"] is None)
     if crossings:
@@ -1171,8 +1193,158 @@ def _tool_route_inspect(args):
         "routes": out_routes,
         "crossings": crossings,
         "crossing_pairs_format": "[route_idx_A, route_idx_B, overlap_um2]",
+        "image_path": image_path_out,
         "next_step_suggestion": next_step,
     })
+
+
+def _render_route_inspect_crossings_image(routes, crossings, out_path, dbu):
+    """Render a labeled PNG showing each crossing-involved route's
+    route_id near both of its endpoints.
+
+    Issue #34 spec:
+      - Bbox = union of all crossing-involved route polygons
+        (both members of every crossing pair) + 10x line-width clearance.
+      - Render the layout in that bbox via the existing screenshot path
+        (LayoutView.zoom_box + save_image).
+      - Overlay each route's route_id as ``[&lt;id&gt;]`` near both endpoints
+        using pya.QImage + pya.QPainter (no external deps required).
+      - On any rendering failure, the caller catches and returns
+        image_path=None.
+    """
+    global _layout, _layout_view
+    if _layout_view is None:
+        return None
+
+    # Collect every route_id that participates in a crossing.
+    involved_ids = set()
+    for pair in crossings:
+        involved_ids.add(int(pair[0]))
+        involved_ids.add(int(pair[1]))
+
+    # Union bbox of all involved route polygons (DBU coordinates).
+    bbox_dbu = None
+    width_dbu_max = 0
+    for rid in involved_ids:
+        try:
+            poly = routes[rid]["polygon"]
+            bb = poly.bbox()
+            if bbox_dbu is None:
+                bbox_dbu = pya.Box(bb.left, bb.bottom, bb.right, bb.top)
+            else:
+                bbox_dbu = bbox_dbu + bb
+            # Effective line-width proxy: shorter edge of the route bbox.
+            edge = min(bb.width(), bb.height())
+            if edge &gt; width_dbu_max:
+                width_dbu_max = edge
+        except Exception:
+            continue
+    if bbox_dbu is None:
+        return None
+
+    # 10x line-width clearance.
+    pad_dbu = int(round(10 * max(width_dbu_max, int(round(1.0 / dbu)))))
+    x1_um = (bbox_dbu.left - pad_dbu) * dbu
+    y1_um = (bbox_dbu.bottom - pad_dbu) * dbu
+    x2_um = (bbox_dbu.right + pad_dbu) * dbu
+    y2_um = (bbox_dbu.top + pad_dbu) * dbu
+
+    width_px = 1024
+    height_px = 768
+    abs_path = os.path.abspath(out_path)
+
+    # Step 1: render the layout in the crossing bbox to a PNG.
+    _layout_view.zoom_box(pya.DBox(x1_um, y1_um, x2_um, y2_um))
+    _layout_view.save_image(abs_path, width_px, height_px)
+    _log("route_inspect: base PNG saved to {} (zoom_box=[{:.3f},{:.3f},{:.3f},{:.3f}])".format(
+        abs_path, x1_um, y1_um, x2_um, y2_um))
+
+    # Step 2: overlay route_id labels near each endpoint of every
+    # crossing-involved route.
+    try:
+        img = pya.QImage(abs_path)
+        if img.isNull():
+            _log("route_inspect: QImage failed to load saved PNG; returning unlabeled image")
+            return abs_path
+        painter = pya.QPainter(img)
+        try:
+            painter.setRenderHint(pya.QPainter.Antialiasing, True)
+        except Exception:
+            pass
+
+        # Coordinate transform: layout-um -&gt; image-pixel.
+        # save_image fits the zoom_box into the image; px_per_um is
+        # uniform along whichever axis fits, with letterboxing on the
+        # other. Use the *minimum* px-per-um of the two axes so that
+        # labels stay inside the rendered region.
+        u_w = x2_um - x1_um
+        u_h = y2_um - y1_um
+        if u_w &lt;= 0 or u_h &lt;= 0:
+            painter.end()
+            return abs_path
+        sx = width_px / u_w
+        sy = height_px / u_h
+        s_fit = min(sx, sy)
+        # Letterbox offsets (centre the bbox in the image).
+        ox = (width_px - u_w * s_fit) / 2.0
+        oy = (height_px - u_h * s_fit) / 2.0
+
+        def _to_px(x_um, y_um):
+            # Image y grows downward; layout y grows upward.
+            px = ox + (x_um - x1_um) * s_fit
+            py = height_px - (oy + (y_um - y1_um) * s_fit)
+            return px, py
+
+        # Label style: yellow text on a translucent black box for
+        # readability against any layer-stack background.
+        font = pya.QFont()
+        try:
+            font.setPointSize(11)
+            font.setBold(True)
+        except Exception:
+            pass
+        painter.setFont(font)
+        text_pen = pya.QPen(pya.QColor(255, 220, 0))
+        bg_brush = pya.QBrush(pya.QColor(0, 0, 0, 160))
+
+        for rid in sorted(involved_ids):
+            try:
+                ep_a, ep_b = routes[rid]["endpoints_dbu"]
+            except Exception:
+                continue
+            for ep in (ep_a, ep_b):
+                ux = ep[0] * dbu
+                uy = ep[1] * dbu
+                if ux &lt; x1_um or ux &gt; x2_um or uy &lt; y1_um or uy &gt; y2_um:
+                    # Endpoint outside the rendered bbox — skip.
+                    continue
+                px, py = _to_px(ux, uy)
+                label = "[{}]".format(rid)
+                # Draw small background rect behind the label for legibility.
+                fm = painter.fontMetrics()
+                try:
+                    tw = fm.horizontalAdvance(label)
+                except Exception:
+                    try:
+                        tw = fm.width(label)
+                    except Exception:
+                        tw = 30
+                try:
+                    th = fm.height()
+                except Exception:
+                    th = 16
+                pad = 3
+                bg_rect = pya.QRectF(px + 6, py - th - pad, tw + 2 * pad, th + 2 * pad)
+                painter.fillRect(bg_rect, bg_brush)
+                painter.setPen(text_pen)
+                painter.drawText(int(px + 6 + pad), int(py - pad), label)
+        painter.end()
+        img.save(abs_path)
+        _log("route_inspect: labeled {} crossing-involved route(s) in {}".format(
+            len(involved_ids), abs_path))
+    except Exception as _exc:
+        _log("route_inspect: label overlay failed (returning unlabeled image): {}".format(_exc))
+    return abs_path
 
 
 def _tool_evaluate_design(args):
