@@ -45,6 +45,21 @@ Execute arbitrary Python/pya code in KLayout. The view is refreshed automaticall
 
 **Returning data:** Set the `result` variable to return data to the caller. It will be JSON-serialized. If `result` is not set, `{"status": "ok"}` is returned.
 
+### Import availability
+
+`execute_script` runs inside KLayout's bundled `pya` Python interpreter, **not** the `instrMCPdev` conda env. The interpreter is intentionally minimal.
+
+- **Available:** `pya`, `numpy`, the Python standard library.
+- **Not available:** `cv2`, `sklearn`, `scipy`, `gdstk`, `shapely`, and other CV / ML / heavy-geometry packages. `import` of these will raise `ModuleNotFoundError`.
+
+For work that needs the unavailable packages, do not try to install them into KLayout's interpreter. Instead, run the heavy code out-of-process and let the result come back as data:
+
+- **Skill scripts** under `skills/.../scripts/` — invoked from bash, run in `instrMCPdev`, talk to KLayout over MCP. This is the canonical pattern for CV / segmentation / alignment workflows.
+- **Dedicated MCP tools** that already wrap a subprocess: `auto_route` (numpy/scipy/scikit-image), `evaluate_design` (gdstk/shapely/numpy).
+- **One-off scripts:** `conda run -n instrMCPdev python -m your_script`. If your subprocess needs the current edited geometry, call `save_layout` first so it can read the GDS from disk; then a follow-up `execute_script` (or `add_*` skill) can inject any returned shapes back into the layout.
+
+See also `docs/skills.md` for the full skill-script catalogue.
+
 ### Examples
 
 **Add a rectangle:**
