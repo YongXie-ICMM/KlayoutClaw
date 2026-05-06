@@ -204,6 +204,21 @@ If any step exhausts retries, stop and report to the user.
 
 ---
 
+## MCP Wedged? Restart KLayout
+
+MCP is the only path by design -- there is no standalone subprocess fallback. If an MCP call hangs, times out, or stops responding partway through the pipeline, the recovery is to restart KLayout, not to route around it.
+
+**Don't stand and wait. Restart KLayout:**
+
+1. `pkill -f klayout` -- kill any running KLayout processes.
+2. `open /Applications/klayout.app` -- relaunch (standalone command; do **not** chain with `&&`).
+3. Poll `http://127.0.0.1:8765/mcp` until the server responds (typically 5-10 s after launch).
+4. Re-run the failed call.
+
+Keeping MCP as the single canonical path forces real bugs to surface instead of being masked by a fallback. After the restart, resume the pipeline from the step that was in flight when the call wedged -- earlier completed steps remain valid in the saved layout if the layout was checkpointed; otherwise, restart from the last gate that was satisfied.
+
+---
+
 ## What This Skill Prescribes
 
 - Step ordering (QUERY -> PREPARE -> ANALYZE -> DESIGN -> ROUTE -> EVALUATE -> SAVE)

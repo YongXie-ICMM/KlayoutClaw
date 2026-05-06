@@ -501,6 +501,10 @@ This is a pure-text orchestrator skill with no scripts directory. The agent disp
 
 Steps are conditional: QUERY is skipped if all info is provided, PREPARE is skipped if no images are given, ROUTE is skipped if the device has no external contacts.
 
+### Recovery: MCP Wedged
+
+MCP is the only path by design -- there is no standalone subprocess fallback. If an MCP call hangs partway through the pipeline, restart KLayout (`pkill -f klayout`, then `open /Applications/klayout.app`, poll `http://127.0.0.1:8765/mcp` until ready, then re-run the failed call). Full procedure in the **MCP Wedged? Restart KLayout** section of `skills/nanodevice_e2e_design/SKILL.md`.
+
 ### Full Documentation
 
 See `skills/nanodevice_e2e_design/SKILL.md` for the complete methodology, gate conditions, retry protocol, and check primitives.
