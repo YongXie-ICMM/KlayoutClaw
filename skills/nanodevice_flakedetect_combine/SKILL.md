@@ -44,7 +44,8 @@ conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/tr
     --align-dir <align/> \
     --image <full_stack_raw_image> \
     --pixel-size <um_per_px> \
-    --output-dir <path>
+    --output-dir <path> \
+    [--min-area 500]
 ```
 
 - `--detections` — Path to detections.json from detect step
@@ -52,6 +53,7 @@ conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/tr
 - `--image` — Full stack raw image (for size reference)
 - `--pixel-size` — Microns per pixel
 - `--output-dir` — Output directory
+- `--min-area` — Minimum component area in pixels for `keep_largest_n` on the warped/clipped graphene mask. Default `500` px (≈ 5.6 µm² at 0.106 µm/px). Lower this when working at finer pixel sizes or with intentionally small flakes; raise it to reject more aggressive noise.
 
 **Transform rules by material:**
 
@@ -73,6 +75,44 @@ All materials get `smooth_material()` applied after transform.
 - `traces.json` — unified traces with all contours in full_stack pixel coordinates
 - `graphite_full.png`, `graphene_full.png`, `bottom_hbn_full.png`, `top_hbn_full.png` — transformed masks
 - Appends `transform_summary` section to `combine_report.json`
+- Appends `transform_diagnostics` section to `combine_report.json` — per-material per-stage pixel counts (see below)
+
+**Per-stage diagnostics (`transform_diagnostics`):**
+
+Every material reports its pixel count at each pipeline stage so the orchestrator can tell the difference between "detect produced nothing" and "transform zeroed a valid input at stage X". Stage keys vary by material:
+
+| Material | Stage keys |
+|----------|------------|
+| graphite | `input_pixels`, `post_keep_largest_pixels` |
+| graphene | `input_pixels`, `post_warp_pixels`, `post_bitwise_and_pixels`, `post_morph_pixels`, `post_keep_largest_pixels` |
+| bottom_hBN, top_hBN | `input_pixels`, `post_keep_largest_pixels` |
+
+Example success entry:
+```json
+"transform_diagnostics": {
+  "graphene": {
+    "input_pixels": 18234,
+    "post_warp_pixels": 17890,
+    "post_bitwise_and_pixels": 12044,
+    "post_morph_pixels": 11820,
+    "post_keep_largest_pixels": 11820
+  }
+}
+```
+
+**Refusal on zeroed valid input:** if `input_pixels > 0` but the mask drops to zero pixels at any stage, `transform.py` exits non-zero (code 3) with the partial counts persisted to `combine_report.json` under both `transform_diagnostics.<material>` and a top-level `transform_error` block:
+
+```json
+"transform_error": {
+  "material": "graphene",
+  "dropped_at_stage": "bitwise_and",
+  "stage_counts": { "input_pixels": 18234, "post_warp_pixels": 17890, "post_bitwise_and_pixels": 0 }
+}
+```
+
+`dropped_at_stage` is one of `warp`, `bitwise_and`, `morph`, `keep_largest`. The orchestrator can then re-run detect with a different cluster choice or escalate to vision-review without re-deriving which stage failed.
+
+This refusal composes with the alignment-status refusal: `transform.py` already exits with code 2 when `alignment_report.status` (or `footprint.status`) is `failed` / `needs_rotation_selection`. Per-stage diagnostics only run after that gate passes.
 
 ### overlay.py — Contour overlay visualization
 
