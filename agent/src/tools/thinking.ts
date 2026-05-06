@@ -23,8 +23,8 @@
  *     subagent spawn, no session-state mutation — TH-3.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
+import { Type, type Static } from "typebox";
+import { Value } from "typebox/value";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { TranscriptMarkerEmitter } from "../events/marker-emitter.js";
 

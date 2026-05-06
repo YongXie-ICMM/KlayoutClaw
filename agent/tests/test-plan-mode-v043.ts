@@ -68,7 +68,7 @@ import {
 } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 
 // ---- System under test ---------------------------------------------------

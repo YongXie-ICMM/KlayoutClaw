@@ -1,8 +1,9 @@
 /**
- * File editing tool — wraps Pi-Agent's edit tool and accepts both the
- * modern `path`/`oldText`/`newText` arguments and the legacy
- * `file_path`/`old_string`/`new_string` aliases used by skills and
- * plan-mode wrappers.
+ * File editing tool — wraps Pi-Agent's edit tool. Pi-Agent >=0.53 expects
+ * `{ path, edits: [{oldText, newText}] }`; this wrapper additionally
+ * accepts the legacy single-edit aliases (`file_path`, `old_string`,
+ * `new_string`, `oldText`, `newText`) used by skills and plan-mode
+ * wrappers, folding them into an `edits[]` for the underlying tool.
  */
 
 import { createEditTool as piCreateEditTool } from "@mariozechner/pi-coding-agent";
@@ -26,12 +27,18 @@ export function createEditTool(cwd: string): AgentTool<any> {
       if (p && p.path === undefined && p.file_path !== undefined) {
         p.path = p.file_path;
       }
-      if (p && p.oldText === undefined && p.old_string !== undefined) {
-        p.oldText = p.old_string;
+      if (p && !Array.isArray(p.edits)) {
+        const oldText = p.oldText ?? p.old_string;
+        const newText = p.newText ?? p.new_string;
+        if (oldText !== undefined && newText !== undefined) {
+          p.edits = [{ oldText, newText }];
+        }
       }
-      if (p && p.newText === undefined && p.new_string !== undefined) {
-        p.newText = p.new_string;
-      }
+      delete p.file_path;
+      delete p.old_string;
+      delete p.new_string;
+      delete p.oldText;
+      delete p.newText;
       return originalExecute(toolCallId, p, ...rest);
     },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

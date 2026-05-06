@@ -3,7 +3,7 @@
  * Uses MemoryManager for FTS5-backed persistent memory.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { MemoryManager } from "../memory/index.js";
 

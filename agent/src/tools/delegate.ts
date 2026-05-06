@@ -10,7 +10,7 @@ import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { SubagentConfig } from "../types/v04-contracts.js";
 import type { SubagentRunner } from "../subagent/runner.js";
 import type { PlanManager } from "../planning/index.js";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   resolveRoleWithFallback,
   getEffectiveGeneralPurposeRole,

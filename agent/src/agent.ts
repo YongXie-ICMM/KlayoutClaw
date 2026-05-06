@@ -137,13 +137,14 @@ export async function createDesignSession(
     : SettingsManager.create(cwd, agentDir);
 
   // --- Auth & Model Registry ---
-  const authStorage = new AuthStorage(
-    opts.ephemeral ? undefined : `${agentDir}/auth.json`,
-  );
-  const modelRegistry = new ModelRegistry(
-    authStorage,
-    opts.ephemeral ? undefined : `${agentDir}/models.json`,
-  );
+  // v0.53+: AuthStorage constructor is private; use static factories.
+  // v0.64+: ModelRegistry constructor is private; use static factories.
+  const authStorage = opts.ephemeral
+    ? AuthStorage.inMemory()
+    : AuthStorage.create(`${agentDir}/auth.json`);
+  const modelRegistry = opts.ephemeral
+    ? ModelRegistry.inMemory(authStorage)
+    : ModelRegistry.create(authStorage, `${agentDir}/models.json`);
 
   // Register providers from config
   for (const [providerName, providerConfig] of Object.entries(config.models.providers)) {

@@ -10,7 +10,7 @@
  * the RPC transport.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import * as fs from "node:fs";
 import { getTranscriptMarkerEmitter } from "../events/marker-emitter.js";

@@ -31,7 +31,7 @@ import { createEditTool } from "./edit.js";
 import { createWriteTool } from "./write.js";
 import { createMemorySaveTool, createMemorySearchTool } from "./memory.js";
 import { createThinkingTool } from "./thinking.js";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { SubagentRunner } from "../subagent/runner.js";
 import { createDelegateTool } from "./delegate.js";
 import { TOOL_ANNOTATIONS as DEFAULT_ANNOTATIONS } from "./annotations.js";

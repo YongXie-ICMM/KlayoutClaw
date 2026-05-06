@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { resolve } from "path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 
 // Mock getHistoryPath before importing history module
@@ -1727,7 +1727,7 @@ describe("thinking tool schema probe (Task 1.6 / T29 TH-1/2/4/14)", () => {
     const { TranscriptMarkerEmitter } = await import(
       "../src/events/marker-emitter.js"
     );
-    const { Value } = await import("@sinclair/typebox/value");
+    const { Value } = await import("typebox/value");
     const tool = createThinkingTool(new TranscriptMarkerEmitter());
     const schema: any = tool.parameters;
     expect(Value.Check(schema, { thought: "" })).toBe(false);
@@ -1764,7 +1764,7 @@ describe("thinking tool schema probe (Task 1.6 / T29 TH-1/2/4/14)", () => {
     const { TranscriptMarkerEmitter } = await import(
       "../src/events/marker-emitter.js"
     );
-    const { Value } = await import("@sinclair/typebox/value");
+    const { Value } = await import("typebox/value");
 
     const emitter = new TranscriptMarkerEmitter();
     const received: any[] = [];

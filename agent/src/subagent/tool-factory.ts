@@ -5,7 +5,7 @@
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { RoleConfig, ToolAnnotation } from "../types/v04-contracts.js";
 import type { NamespacedTool, ToolInputSchema } from "../mcp/types.js";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, resolve } from "path";
 import { execSync } from "child_process";

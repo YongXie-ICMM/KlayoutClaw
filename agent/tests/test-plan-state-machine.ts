@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 const tmpDirs: string[] = [];
 
