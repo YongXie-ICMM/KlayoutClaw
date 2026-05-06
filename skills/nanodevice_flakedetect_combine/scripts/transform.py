@@ -246,6 +246,31 @@ def main():
     # Load warp matrices from align dir
     align_dir = os.path.abspath(args.align_dir)
 
+    # Refuse footprints whose alignment_report.json marks them unusable.
+    # Per #32: combine.transform must not silently consume a footprint that
+    # the align stage flagged as degenerate. status="failed" means the
+    # candidate aborted; "needs_rotation_selection" means the orchestrator
+    # never picked a rotation; in either case the downstream warp would be
+    # garbage, so refuse fail-closed.
+    align_report_path = os.path.join(align_dir, "alignment_report.json")
+    if os.path.exists(align_report_path):
+        try:
+            with open(align_report_path) as _f:
+                _report = json.load(_f)
+        except Exception:
+            _report = {}
+        _status = _report.get("status", "")
+        _fp_status = _report.get("footprint", {}).get("status", "")
+        bad = {"failed", "needs_rotation_selection"}
+        if _status in bad or _fp_status in bad:
+            print(
+                f"ERROR: refusing to consume align outputs: "
+                f"alignment_report.status={_status!r} "
+                f"footprint.status={_fp_status!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     warp_bot_inv = None
     warp_bot_path = os.path.join(align_dir, "warp_sift_bottom.npy")
     if os.path.exists(warp_bot_path):
