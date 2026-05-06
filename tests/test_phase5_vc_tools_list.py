@@ -1,12 +1,17 @@
 #!/usr/bin/env python
-"""qlaybot v0.4.4 Phase 5 Task 5.10 (plugin-side half) — tools/list regression.
+"""Phase 5 + Issue #25 — vc_* tools must NOT be advertised by tools/list.
 
-Verifies that the KLayout MCP server (``plugin/klayoutclaw_server.lym``),
-after the Executor registers the 9 Phase 5 VC handlers, exposes them in
-its ``tools/list`` response.
+Originally this test (Phase 5 Task 5.10) asserted that the MCP server
+exposed all 9 ``vc_*`` handlers in its ``tools/list`` response. Issue #25
+(review session 2026-05-05) inverted that contract: ``vc_init`` was the
+only confirmed hang trigger, and the cheapest mitigation is a server-side
+off-switch — strip the ``vc_*`` entries from ``_TOOL_DISPATCH`` and from
+the advertised ``TOOLS`` list. The handler module
+``tools/vc_mcp_handlers`` is still imported and unit-tested separately
+(see ``test_phase5_vc_handlers.py``); only the MCP advertisement has been
+removed.
 
-Auto-skips when the MCP server is not reachable (same pattern as
-``tests/test_phase4_mcp.py``).  Run under the project's root pytest.
+Auto-skips when the MCP server is not reachable.
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ import pytest
 
 MCP_URL = "http://127.0.0.1:8765/mcp"
 
-_EXPECTED_VC_BARE_NAMES = [
+_FORBIDDEN_VC_NAMES = [
     "vc_init",
     "vc_checkpoint",
     "vc_history",
@@ -84,7 +89,7 @@ def _mcp_init_session():
     _mcp_call("initialize", {
         "protocolVersion": "2025-03-26",
         "capabilities": {},
-        "clientInfo": {"name": "test_phase5_vc_tools_list", "version": "0.1"},
+        "clientInfo": {"name": "test_phase5_vc_tools_list", "version": "0.2"},
     })
     yield
 
@@ -98,38 +103,21 @@ def _get_tool_names():
     return [t["name"] for t in tools]
 
 
-class TestPhase5VcToolsRegistered:
-    def test_all_9_vc_tools_in_tools_list(self):
-        """Plugin must register all 9 vc_* handlers in the MCP dispatch map."""
+class TestIssue25VcToolsStripped:
+    def test_no_vc_tools_in_tools_list(self):
+        """Issue #25: the MCP server must not advertise any vc_* tool."""
         names = _get_tool_names()
-        missing = [n for n in _EXPECTED_VC_BARE_NAMES if n not in names]
-        assert not missing, (
-            f"The following vc_* tools are missing from MCP tools/list: "
-            f"{missing}. Full tool list: {sorted(names)}"
+        leaked = [n for n in names if n in _FORBIDDEN_VC_NAMES]
+        assert not leaked, (
+            f"vc_* tools are still advertised by tools/list: {leaked}. "
+            f"Issue #25 requires these be stripped."
         )
 
-    def test_each_vc_tool_has_valid_schema(self):
-        """Each vc_* tool must have a valid JSON-Schema 'inputSchema' object."""
-        resp = _mcp_call("tools/list")
-        tools = {t["name"]: t for t in resp["result"]["tools"]}
-        for bare in _EXPECTED_VC_BARE_NAMES:
-            assert bare in tools, (
-                f"vc_* tool {bare!r} missing from tools/list"
-            )
-            tool = tools[bare]
-            schema = tool.get("inputSchema")
-            assert isinstance(schema, dict) and schema.get("type") == "object", (
-                f"tool {bare!r} must have inputSchema type=object, got {schema!r}"
-            )
-
-    def test_vc_init_requires_gds_path(self):
-        """vc_init inputSchema must mark ``gds_path`` as required."""
-        resp = _mcp_call("tools/list")
-        tools = {t["name"]: t for t in resp["result"]["tools"]}
-        init_tool = tools.get("vc_init")
-        assert init_tool is not None, "vc_init missing from tools/list"
-        schema = init_tool["inputSchema"]
-        required = schema.get("required", [])
-        assert "gds_path" in required, (
-            f"vc_init must require gds_path, got required={required!r}"
+    def test_no_name_starts_with_vc_(self):
+        """Defense in depth: no advertised tool name may start with 'vc_'."""
+        names = _get_tool_names()
+        leaked = [n for n in names if n.startswith("vc_")]
+        assert not leaked, (
+            f"Tool names beginning with 'vc_' must not be advertised: "
+            f"{leaked}."
         )
