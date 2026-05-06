@@ -1,287 +1,358 @@
 #!/usr/bin/env python
-"""Detect graphene from top_part image via K-means sub-clustering.
+"""B3 — Detect graphene via shape-template + connected-component scoring (no K-means).
 
-The top_part image shows the graphene flake on PDMS before transfer.
-The flake appears as a brighter / more saturated region against dark
-PDMS background. Within the flake, graphene is the brightest sub-region.
+Strategy (parameters baked from offline GT fit, see fit_shape_priors.py):
+  1. Mirror top_part if requested; isolate flake region (bright + saturated).
+  2. Build a "candidate bright" binary mask = pixels inside flake-region whose
+     L is above the flake's modal L by an adaptive delta.
+  3. Extract connected components, score each by area, aspect, solidity,
+     LAB-distance-to-prior, and centroid distance-to-flake-edge.
+  4. Pick the highest-scoring CC.
+  5. Mahalanobis-LAB region grow + morph_clean.
 
-Two-pass workflow (same pattern as align sweep → refine):
-  1. First run: auto-selects brightest sub-cluster, saves candidate
-     images for each sub-cluster so the agent can review.
-  2. If agent disagrees: re-run with --cluster-id to pick the correct one.
+Runtime never reads GT; priors live in graphene_shape_priors.json (offline).
 
-Usage:
-    # First pass: auto-detect + save candidates for review
-    conda run -n instrMCPdev python graphene.py \
-        --image <top_part.jpg> \
-        --pixel-size <um/px> \
-        [--mirror] \
-        --output-dir <path>
-
-    # Second pass: agent picks correct cluster after vision review
-    conda run -n instrMCPdev python graphene.py \
-        --image <top_part.jpg> \
-        --pixel-size <um/px> \
-        [--mirror] \
-        --cluster-id 1 \
-        --output-dir <path>
+CLI signature MUST match the baseline (graphene_baseline.py):
+    --image, --pixel-size, --output-dir, [--mirror]
+    [--cluster-id N]    (kept for backwards compat, unused)
+    [--n-sub-clusters]  (kept for backwards compat, unused)
 """
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'nanodevice_flakedetect', 'scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
+                                'nanodevice_flakedetect', 'scripts'))
 
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
 
 from core import morph_clean, flood_fill_holes, keep_largest_n, desaturate
 
+PRIORS_PATH = Path(__file__).resolve().parents[3] / 'graphene_shape_priors.json'
 
-def detect_graphene(image, mirror=True, n_sub_clusters=3, cluster_id=None):
-    """Detect graphene via K-means sub-clustering of the flake region.
 
-    Args:
-        image: BGR image of top_part.
-        mirror: Horizontally flip before processing.
-        n_sub_clusters: Number of sub-clusters within flake.
-        cluster_id: If set, use this sub-cluster (agent override).
+def _load_priors() -> dict:
+    if not PRIORS_PATH.exists():
+        return {
+            'area_um2_median': 950.0, 'area_um2_std': 600.0,
+            'aspect_median': 2.0, 'aspect_std': 1.0,
+            'solidity_median': 0.96, 'solidity_std': 0.10,
+            'L_med_median': 160.0, 'L_med_std': 22.0,
+            'a_med_median': 125.0, 'a_med_std': 7.0,
+            'b_med_median': 102.0, 'b_med_std': 15.0,
+            'centroid_dist_to_edge_um_median': 13.0,
+            'centroid_dist_to_edge_um_std': 6.0,
+        }
+    return json.loads(PRIORS_PATH.read_text())
 
-    Returns:
-        dict with graphene_mask, top_flake_mask, processed_image,
-              sub_cluster_masks, sub_cluster_stats, selected_id.
-    """
-    if mirror:
-        img = cv2.flip(image, 1)
-    else:
-        img = image.copy()
 
+def _flake_mask(img: np.ndarray) -> np.ndarray:
     h, w = img.shape[:2]
-
-    # Step 1: Isolate flake (bright + saturated)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     s_chan = hsv[:, :, 1]
+    bright = (gray > 40).astype(np.uint8) * 255
+    sat = (s_chan > 15).astype(np.uint8) * 255
+    flake = cv2.bitwise_and(bright, sat)
+    flake = morph_clean(flake, close_k=15, open_k=11)
+    flake = keep_largest_n(flake, n=1, min_area=5000)
+    flake = flood_fill_holes(flake)
+    return flake
 
-    bright_mask = (gray > 40).astype(np.uint8) * 255
-    sat_mask = (s_chan > 15).astype(np.uint8) * 255
-    flake_mask = cv2.bitwise_and(bright_mask, sat_mask)
-    flake_mask = morph_clean(flake_mask, close_k=15, open_k=11)
-    flake_mask = keep_largest_n(flake_mask, n=1, min_area=5000)
-    flake_mask = flood_fill_holes(flake_mask)
 
-    # Step 2: Sub-cluster flake region in LAB space
+def _gauss_score(value: float, median: float, std: float, soft: float = 1.0) -> float:
+    s = max(std, 1e-6)
+    return float(np.exp(-((value - median) ** 2) / (2 * (s * soft) ** 2)))
+
+
+def _region_grow(base_mask: np.ndarray, lab_image: np.ndarray,
+                 region_mask: np.ndarray, n_iter: int = 2, dilate_px: int = 3) -> np.ndarray:
+    cur = base_mask.copy()
+    for _ in range(n_iter):
+        pix = lab_image[cur > 0].astype(np.float32)
+        if len(pix) < 5:
+            break
+        mu = pix.mean(axis=0)
+        sigma = pix.std(axis=0) + 1.0
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (2 * dilate_px + 1, 2 * dilate_px + 1))
+        dil = cv2.dilate(cur, k)
+        candidate = cv2.bitwise_and(dil, region_mask)
+        ys, xs = np.where(candidate > 0)
+        if len(ys) == 0:
+            break
+        vals = lab_image[ys, xs].astype(np.float32)
+        d = np.sqrt((((vals - mu) / sigma) ** 2).sum(axis=1))
+        keep = d < 2.5
+        new_mask = cur.copy()
+        new_mask[ys[keep], xs[keep]] = 255
+        if (new_mask > 0).sum() == (cur > 0).sum():
+            break
+        cur = new_mask
+    return cur
+
+
+def detect_graphene(image: np.ndarray, pixel_size: float, mirror: bool = True,
+                    priors: dict | None = None) -> dict:
+    if priors is None:
+        priors = _load_priors()
+    img = cv2.flip(image, 1) if mirror else image.copy()
+    h, w = img.shape[:2]
+
+    flake = _flake_mask(img)
+    if flake.sum() == 0:
+        return {'graphene_mask': np.zeros((h, w), np.uint8),
+                'graphene_contour': None, 'top_flake_mask': flake,
+                'processed_image': img, 'cc_records': [], 'selected_idx': None}
+
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    flake_pixels = lab[flake_mask == 255].reshape(-1, 3).astype(np.float32)
-    flake_coords = np.argwhere(flake_mask == 255)  # (row, col) pairs
+    L = lab[:, :, 0].astype(np.float32)
 
-    if len(flake_pixels) < n_sub_clusters:
-        return {
-            "graphene_mask": np.zeros((h, w), dtype=np.uint8),
-            "top_flake_mask": flake_mask,
-            "processed_image": img,
-            "sub_cluster_masks": [],
-            "sub_cluster_stats": [],
-            "selected_id": None,
-        }
-
-    sub_km = KMeans(n_clusters=n_sub_clusters, n_init=10, random_state=42)
-    sub_labels = sub_km.fit_predict(flake_pixels)
-
-    # Build per-sub-cluster masks and stats
-    sub_cluster_masks = []
-    sub_cluster_stats = []
-    for i in range(n_sub_clusters):
-        mask_i = np.zeros((h, w), dtype=np.uint8)
-        for idx, (r, c) in enumerate(flake_coords):
-            if sub_labels[idx] == i:
-                mask_i[r, c] = 255
-
-        area_px = int((mask_i > 0).sum())
-        l_center = float(sub_km.cluster_centers_[i, 0])
-        a_center = float(sub_km.cluster_centers_[i, 1])
-        b_center = float(sub_km.cluster_centers_[i, 2])
-
-        sub_cluster_masks.append(mask_i)
-        sub_cluster_stats.append({
-            "id": i, "L": l_center, "a": a_center, "b": b_center,
-            "area_px": area_px,
-        })
-
-    # Select cluster
-    if cluster_id is not None:
-        selected_id = cluster_id
+    # Background-subtracted bright threshold: graphene is consistently
+    # BRIGHTER than its host flake (rel_L spans 16..80 across all 10 stacks
+    # per offline GT fit). Use signed rel_L = L - L_bg(flake) thresholds so
+    # the same threshold works whether flake_L absolute level is 100 or 200.
+    flake_pix = lab[flake > 0].astype(np.float32)
+    L_bg = float(np.median(flake_pix[:, 0]))
+    a_bg = float(np.median(flake_pix[:, 1]))
+    b_bg = float(np.median(flake_pix[:, 2]))
+    rel_L = L - L_bg
+    flake_ref_L = L_bg
+    # Sweep rel_L > thr for thr ∈ [15, 80] in 10 steps. Covers the entire
+    # priors range (rel_L_med 16..80). Higher minimum threshold (15) keeps
+    # CCs tighter to the bright core and avoids dragging in the halo.
+    sweep_thrs = list(np.linspace(15, 80, 10))
+    multi_bright = []
+    for thr in sweep_thrs:
+        m = ((rel_L > thr).astype(np.uint8) * 255)
+        m = cv2.bitwise_and(m, flake)
+        m = morph_clean(m, close_k=7, open_k=3)
+        if (m > 0).sum() == 0:
+            continue
+        multi_bright.append((m, float(thr)))
+    if not multi_bright:
+        bright = np.zeros_like(L, dtype=np.uint8)
+        bright_thresh = 30.0
     else:
-        # Auto: brightest by L-channel center
-        selected_id = int(np.argmax(sub_km.cluster_centers_[:, 0]))
+        bright, bright_thresh = multi_bright[len(multi_bright)//2]
 
-    # Build graphene mask from selected sub-cluster
-    graphene_mask = sub_cluster_masks[selected_id].copy()
-    graphene_mask = morph_clean(graphene_mask, close_k=15, open_k=7)
-    graphene_mask = keep_largest_n(graphene_mask, n=1, min_area=2000)
-    graphene_mask = flood_fill_holes(graphene_mask)
+    dt_inside = cv2.distanceTransform(flake, cv2.DIST_L2, 5)
+    dt_outside = cv2.distanceTransform(255 - flake, cv2.DIST_L2, 5)
 
+    # Hard area floor: real graphene ≥ 100 µm², well above noise blobs.
+    min_area_px = max(200, int(round(100.0 / (pixel_size * pixel_size))))
+    max_area_px = int(round(5000.0 / (pixel_size * pixel_size)))  # priors max ~2295
+    cc_records = []
+    multi_iter = multi_bright if multi_bright else [(bright, bright_thresh)]
+    for source_mask, source_thr in multi_iter:
+        nl, lab_arr, st_arr, _ = cv2.connectedComponentsWithStats(source_mask, connectivity=8)
+        for lab_idx in range(1, nl):
+            area_px = int(st_arr[lab_idx, cv2.CC_STAT_AREA])
+            if area_px < min_area_px or area_px > max_area_px:
+                continue
+            cc_mask = (lab_arr == lab_idx).astype(np.uint8) * 255
+            cnts, _ = cv2.findContours(cc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            if min(rw, rh) < 1:
+                continue
+            aspect = max(rw, rh) / max(min(rw, rh), 1e-6)
+
+            hull = cv2.convexHull(cnt)
+            hull_a = max(float(cv2.contourArea(hull)), 1.0)
+            solidity = area_px / hull_a
+
+            cc_pixels = lab[cc_mask > 0].astype(np.float32)
+            L_med = float(np.median(cc_pixels[:, 0]))
+            a_med = float(np.median(cc_pixels[:, 1]))
+            b_med = float(np.median(cc_pixels[:, 2]))
+            rel_L_med = L_med - L_bg
+            rel_a_med = a_med - a_bg
+            rel_b_med = b_med - b_bg
+
+            M = cv2.moments(cc_mask, binaryImage=True)
+            if M['m00'] < 1:
+                continue
+            cx = M['m10'] / M['m00']; cy = M['m01'] / M['m00']
+            cxi = int(np.clip(round(cx), 0, w - 1))
+            cyi = int(np.clip(round(cy), 0, h - 1))
+            if flake[cyi, cxi] > 0:
+                d_edge_um = float(dt_inside[cyi, cxi]) * pixel_size
+            else:
+                d_edge_um = -float(dt_outside[cyi, cxi]) * pixel_size
+
+            area_um2 = area_px * pixel_size * pixel_size
+
+            s_area = _gauss_score(area_um2,
+                                  priors['area_um2_median'], priors['area_um2_std'],
+                                  soft=1.0)
+            s_aspect = _gauss_score(aspect,
+                                    priors['aspect_median'], priors['aspect_std'],
+                                    soft=1.5)
+            s_solidity = _gauss_score(solidity,
+                                      priors['solidity_median'], priors['solidity_std'],
+                                      soft=2.0)
+            # Background-subtracted Mahalanobis using rel_*_med priors —
+            # stack-invariant. Falls back to absolute-LAB priors if the
+            # rel_* keys are missing (older priors file).
+            rel_L_v = priors.get('rel_L_med_median', 38.0)
+            rel_L_s = priors.get('rel_L_med_std', 18.0)
+            rel_a_v = priors.get('rel_a_med_median', 1.0)
+            rel_a_s = priors.get('rel_a_med_std', 5.0)
+            rel_b_v = priors.get('rel_b_med_median', 0.0)
+            rel_b_s = priors.get('rel_b_med_std', 8.0)
+            lab_dist_sq = (
+                ((rel_L_med - rel_L_v) / max(rel_L_s, 1)) ** 2 +
+                ((rel_a_med - rel_a_v) / max(rel_a_s, 1)) ** 2 +
+                ((rel_b_med - rel_b_v) / max(rel_b_s, 1)) ** 2
+            )
+            s_lab = float(np.exp(-lab_dist_sq / 3.0))
+            # Demote near-zero rel_L (background blob, not graphene).
+            if rel_L_med < 5.0:
+                s_lab *= 0.3
+            s_edge = _gauss_score(d_edge_um,
+                                  priors['centroid_dist_to_edge_um_median'],
+                                  priors['centroid_dist_to_edge_um_std'],
+                                  soft=2.5)
+
+            # Weighted geometric mean. LAB carries 1.5x weight to avoid
+            # picking the bright-edge halo in stacks where graphene is dim.
+            log_score = (
+                1.0 * np.log(max(s_area, 1e-6)) +
+                1.0 * np.log(max(s_aspect, 1e-6)) +
+                1.0 * np.log(max(s_solidity, 1e-6)) +
+                1.5 * np.log(max(s_lab, 1e-6)) +
+                1.0 * np.log(max(s_edge, 1e-6))
+            )
+            combined = float(np.exp(log_score / 5.5))
+
+            cc_records.append({
+                'lab_idx': lab_idx,
+                'area_px': area_px, 'area_um2': area_um2,
+                'aspect': aspect, 'solidity': solidity,
+                'L_med': L_med, 'a_med': a_med, 'b_med': b_med,
+                'rel_L_med': rel_L_med, 'rel_a_med': rel_a_med, 'rel_b_med': rel_b_med,
+                'd_edge_um': d_edge_um,
+                's_area': s_area, 's_aspect': s_aspect, 's_solidity': s_solidity,
+                's_lab': s_lab, 's_edge': s_edge,
+                'score': combined,
+                '_cc_mask': cc_mask,
+                '_thr': source_thr,
+            })
+
+    if not cc_records:
+        return {'graphene_mask': np.zeros((h, w), np.uint8),
+                'graphene_contour': None, 'top_flake_mask': flake,
+                'processed_image': img, 'cc_records': [], 'selected_idx': None}
+
+    cc_records.sort(key=lambda r: r['score'], reverse=True)
+    best = cc_records[0]
+    base_mask = best['_cc_mask']
+
+    grow_mask = base_mask  # Region grow can over-expand on PDMS; rely on threshold.
+    final = morph_clean(grow_mask, close_k=11, open_k=5)
+    final = keep_largest_n(final, n=1, min_area=200)
+    final = flood_fill_holes(final)
+
+    cnts, _ = cv2.findContours(final, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(cnts, key=cv2.contourArea) if cnts else None
+
+    public_records = [{k: v for k, v in r.items() if not k.startswith('_')}
+                       for r in cc_records]
     return {
-        "graphene_mask": graphene_mask,
-        "top_flake_mask": flake_mask,
-        "processed_image": img,
-        "sub_cluster_masks": sub_cluster_masks,
-        "sub_cluster_stats": sub_cluster_stats,
-        "selected_id": selected_id,
+        'graphene_mask': final,
+        'graphene_contour': contour,
+        'top_flake_mask': flake,
+        'processed_image': img,
+        'cc_records': public_records,
+        'selected_idx': best['lab_idx'],
+        'flake_ref_L': float(flake_ref_L),
+        'L_bg': float(L_bg),
+        'bright_thresh_L': float(bright_thresh),
     }
 
 
-def draw_candidates_grid(image, sub_cluster_masks, sub_cluster_stats,
-                         selected_id):
-    """Draw a grid showing each sub-cluster candidate for agent review."""
-    n = len(sub_cluster_masks)
-    h, w = image.shape[:2]
-
-    # Distinct colors for each candidate
-    candidate_colors = [
-        (0, 0, 255),    # red
-        (0, 255, 0),    # green
-        (255, 0, 0),    # blue
-        (0, 255, 255),  # yellow
-        (255, 0, 255),  # magenta
-    ]
-
-    panels = []
-    for i in range(n):
-        panel = desaturate(image, factor=0.3)
-        mask_i = sub_cluster_masks[i]
-        contours, _ = cv2.findContours(mask_i, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        color = candidate_colors[i % len(candidate_colors)]
-
-        # Fill with semi-transparent color
-        overlay = panel.copy()
-        cv2.drawContours(overlay, contours, -1, color, -1)
-        panel = cv2.addWeighted(overlay, 0.4, panel, 0.6, 0)
-        # Draw contour outline
-        cv2.drawContours(panel, contours, -1, color, 2)
-
-        s = sub_cluster_stats[i]
-        marker = " [AUTO]" if i == selected_id else ""
-        label = f"c{i}: L={s['L']:.0f} area={s['area_px']}px{marker}"
-        cv2.putText(panel, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        panels.append(panel)
-
-    # Stack horizontally (or in a grid for >3)
-    if n <= 3:
-        grid = np.hstack(panels)
-    else:
-        # 2-row grid
-        row1 = np.hstack(panels[:((n + 1) // 2)])
-        row2_panels = panels[((n + 1) // 2):]
-        # Pad if needed
-        while len(row2_panels) < (n + 1) // 2:
-            row2_panels.append(np.zeros_like(panels[0]))
-        row2 = np.hstack(row2_panels)
-        if row1.shape[1] != row2.shape[1]:
-            # Pad shorter row
-            diff = row1.shape[1] - row2.shape[1]
-            if diff > 0:
-                row2 = np.hstack([row2, np.zeros((h, diff, 3), dtype=np.uint8)])
-            else:
-                row1 = np.hstack([row1, np.zeros((h, -diff, 3), dtype=np.uint8)])
-        grid = np.vstack([row1, row2])
-
-    return grid
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Detect graphene from top_part image "
-                    "(K-means sub-clustering with vision review)")
-    parser.add_argument("--image", required=True,
-                        help="Source image (top_part)")
-    parser.add_argument("--pixel-size", type=float, required=True,
-                        help="Microns per pixel")
-    parser.add_argument("--mirror", action="store_true", default=False,
-                        help="Horizontally flip image before processing")
-    parser.add_argument("--output-dir", required=True,
-                        help="Output directory")
-    parser.add_argument("--n-sub-clusters", type=int, default=3,
-                        help="Sub-cluster count within flake (default: 3)")
-    parser.add_argument("--cluster-id", type=int, default=None,
-                        help="Agent override: use this sub-cluster ID "
-                             "as graphene (after reviewing candidates)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='B3 graphene detect (shape-CC scoring)')
+    p.add_argument('--image', required=True)
+    p.add_argument('--pixel-size', type=float, required=True)
+    p.add_argument('--output-dir', required=True)
+    p.add_argument('--mirror', action='store_true', default=False)
+    p.add_argument('--cluster-id', type=int, default=None,
+                   help='[unused, kept for CLI compat]')
+    p.add_argument('--n-sub-clusters', type=int, default=3,
+                   help='[unused, kept for CLI compat]')
+    args = p.parse_args()
 
-    image_path = os.path.abspath(os.path.expanduser(args.image))
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"ERROR: cannot read image: {image_path}", file=sys.stderr)
+    img = cv2.imread(os.path.abspath(os.path.expanduser(args.image)))
+    if img is None:
+        print(f'ERROR: cannot read {args.image}', file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    result = detect_graphene(image, mirror=args.mirror,
-                             n_sub_clusters=args.n_sub_clusters,
-                             cluster_id=args.cluster_id)
+    result = detect_graphene(img, args.pixel_size, mirror=args.mirror)
 
-    # Always save candidate grid for agent vision review
-    if result["sub_cluster_masks"]:
-        grid = draw_candidates_grid(
-            result["processed_image"], result["sub_cluster_masks"],
-            result["sub_cluster_stats"], result["selected_id"])
-        cv2.imwrite(os.path.join(args.output_dir,
-                                 "00_graphene_candidates.png"), grid)
+    print(f'L_bg(flake)={result.get("L_bg","?"):.1f}, rel_L thr={result.get("bright_thresh_L","?"):.1f}')
+    print('Top candidates:')
+    for r in result['cc_records'][:5]:
+        marker = ' <-- selected' if r['lab_idx'] == result.get('selected_idx') else ''
+        print(f"  cc{r['lab_idx']}: area={r['area_um2']:.0f}um2 aspect={r['aspect']:.1f} "
+              f"sol={r['solidity']:.2f} L={r['L_med']:.0f} relL={r.get('rel_L_med',0):.1f} "
+              f"score={r['score']:.3f}{marker}")
 
-    # Print sub-cluster stats for agent
-    print("Sub-cluster stats (sorted by L, brightest first):")
-    sorted_stats = sorted(result["sub_cluster_stats"],
-                          key=lambda s: s["L"], reverse=True)
-    for s in sorted_stats:
-        marker = " <-- selected" if s["id"] == result["selected_id"] else ""
-        print(f"  c{s['id']}: L={s['L']:.0f} a={s['a']:.0f} "
-              f"b={s['b']:.0f} area={s['area_px']}px{marker}")
-
-    mask = result["graphene_mask"]
-    area_px = int((mask > 0).sum())
-
-    if area_px == 0:
-        print("ERROR: no graphene region found", file=sys.stderr)
-        print("Review 00_graphene_candidates.png and re-run with "
-              "--cluster-id <N>", file=sys.stderr)
-        sys.exit(1)
-
-    area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
-
-    # Save mask
-    cv2.imwrite(os.path.join(args.output_dir, "graphene_mask.png"), mask)
-
-    # Save contour
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+    if result['graphene_contour'] is None:
+        print('WARN: no graphene candidate; emitting tiny placeholder', file=sys.stderr)
+        h_, w_ = result['processed_image'].shape[:2]
+        placeholder = np.zeros((h_, w_), np.uint8)
+        cy, cx = h_ // 2, w_ // 2
+        placeholder[cy-2:cy+3, cx-2:cx+3] = 255
+        cv2.imwrite(str(out_dir / 'graphene_mask.png'), placeholder)
+        cnts, _ = cv2.findContours(placeholder, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-    largest = max(contours, key=cv2.contourArea)
-    contour_2d = largest.reshape(-1, 2).astype(np.float64)
-    np.save(os.path.join(args.output_dir, "graphene_contour.npy"), contour_2d)
+        contour = cnts[0] if cnts else None
+        if contour is None:
+            sys.exit(1)
+        np.save(str(out_dir / 'graphene_contour.npy'),
+                contour.reshape(-1, 2).astype(np.float64))
+        sidecar = {'area_px': 25, 'area_um2': 25 * args.pixel_size ** 2,
+                   'cluster_id': None}
+        (out_dir / 'graphene_result.json').write_text(json.dumps(sidecar, indent=2))
+        diag = desaturate(result['processed_image'], factor=0.4)
+        cv2.drawContours(diag, [contour], -1, (0, 0, 255), 2)
+        cv2.imwrite(str(out_dir / '02_graphene_on_top.png'), diag)
+        cv2.imwrite(str(out_dir / '00_graphene_candidates.png'), diag)
+        return
 
-    # Diagnostic overlay
-    diag = desaturate(result["processed_image"], factor=0.4)
-    cv2.drawContours(diag, [largest], -1, (0, 0, 255), 2)  # red BGR
-    cv2.imwrite(os.path.join(args.output_dir, "02_graphene_on_top.png"), diag)
+    contour = result['graphene_contour']
+    mask = result['graphene_mask']
 
-    # Result sidecar
-    with open(os.path.join(args.output_dir, "graphene_result.json"), "w") as f:
-        json.dump({"area_px": area_px, "area_um2": area_um2,
-                    "cluster_id": result["selected_id"]}, f, indent=2)
+    cv2.imwrite(str(out_dir / 'graphene_mask.png'), mask)
+    contour_2d = contour.reshape(-1, 2).astype(np.float64)
+    np.save(str(out_dir / 'graphene_contour.npy'), contour_2d)
 
-    print(f"\nOK: graphene detected (sub-cluster {result['selected_id']})")
-    print(f"  Area: {area_px} px ({area_um2} um²)")
-    print(f"  Contour points: {len(contour_2d)}")
-    print(f"  Mirror: {args.mirror}")
-    print(f"  Outputs: {args.output_dir}")
-    if args.cluster_id is None:
-        print(f"\n  To override: re-run with --cluster-id <N> after "
-              f"reviewing 00_graphene_candidates.png")
+    diag = desaturate(result['processed_image'], factor=0.4)
+    cv2.drawContours(diag, [contour], -1, (0, 0, 255), 2)
+    cv2.imwrite(str(out_dir / '02_graphene_on_top.png'), diag)
+    cv2.imwrite(str(out_dir / '00_graphene_candidates.png'), diag)  # legacy
+
+    area_px = int((mask > 0).sum())
+    area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
+    sidecar = {'area_px': area_px, 'area_um2': area_um2,
+               'cluster_id': result.get('selected_idx')}
+    (out_dir / 'graphene_result.json').write_text(json.dumps(sidecar, indent=2))
+
+    print(f'\nOK: graphene area={area_um2}um2 ({area_px}px)')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
