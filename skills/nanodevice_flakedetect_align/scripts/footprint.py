@@ -591,6 +591,9 @@ def main():
                          target_h, target_w)
             print(f"ERROR: Cannot load warp {warp_path}: {e}", file=sys.stderr)
             sys.exit(1)
+        # warp_sift_bottom.npy is saved as target→source (full_stack→bottom_part);
+        # invert to bottom→target so cv2.warpAffine treats it as a forward map.
+        warp_matrix = cv2.invertAffineTransform(warp_matrix)
         print(f"[B1] Reusing precomputed SIFT warp from {warp_src}: {warp_path}")
     else:
         print("[B1] SIFT-aligning bottom to target...")
