@@ -172,6 +172,232 @@ def _ensure_valid_handles():
 
 
 # ---------------------------------------------------------------------------
+# execute_script protection: pre/post snapshot + damage recovery
+#
+# `_layout` exposed to user scripts is a direct alias of the active
+# cellview's layout (see `_get_or_create_view`). Destructive ops in user
+# code (`_layout.clear()`, `_layout.assign(...)`, `_layout.read(...)`)
+# leave dangling pya handles inside both the user script (the script's
+# own captures) and the GUI's `cv.cell` pointer. The GUI's next paint
+# dereferences the dangling pointer and segfaults the whole process.
+#
+# These helpers snapshot the live state before exec(), then probe each
+# handle individually after exec(), rebinding any that became invalid
+# and emitting an explicit, agent-visible report (never silent) of what
+# the server repaired and why.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_layout_state():
+    """Capture identifying tokens for the live layout/view state before
+    execute_script runs, so post-exec damage can be detected and named."""
+    snap = {
+        "had_layout": _layout is not None,
+        "had_view": _layout_view is not None,
+        "pre_cells": None,
+        "top_cell_name": None,
+        "cv_cell_name": None,
+    }
+    if _layout is not None:
+        try:
+            snap["pre_cells"] = _layout.cells()
+        except Exception:
+            snap["pre_cells"] = None
+    if _top_cell is not None:
+        try:
+            snap["top_cell_name"] = _top_cell.name
+        except Exception:
+            snap["top_cell_name"] = None
+    if _layout_view is not None:
+        try:
+            cv = _layout_view.active_cellview()
+            if cv is not None and cv.is_valid() and cv.cell is not None:
+                snap["cv_cell_name"] = cv.cell.name
+        except Exception:
+            snap["cv_cell_name"] = None
+    return snap
+
+
+def _post_exec_revalidate(pre):
+    """Detect destroyed/dangling pya handles after exec() and rebind them
+    to safe values before control returns to Qt's event loop. Returns a
+    list of human-readable dicts -- one per protective action -- so the
+    agent sees exactly what the server changed and why. Never silent.
+    """
+    global _layout, _layout_view, _top_cell
+    actions = []
+
+    # 1. Verify _layout itself is alive.
+    layout_alive = False
+    if _layout is not None:
+        try:
+            _layout.cells()
+            layout_alive = True
+        except Exception:
+            layout_alive = False
+
+    if not layout_alive:
+        old_pre = pre.get("pre_cells")
+        actions.append({
+            "trigger": "_layout reference is invalid after script (None or destroyed). pre_cells={}".format(old_pre),
+            "action": "Re-acquired _layout via _get_or_create_view(); a fresh tab/layout was used if necessary.",
+            "guidance": "Do not None-out or destroy _layout. Use a detached pya.Layout() for scratch work, or cv.layout() for a local read-only handle.",
+        })
+        try:
+            _get_or_create_view()
+        except Exception as _re:
+            actions.append({
+                "trigger": "_layout re-acquisition failed",
+                "action": "No recovery possible; subsequent tools may fail",
+                "error": str(_re),
+            })
+            try:
+                _log("execute_script: layout recovery failed: {}".format(_re))
+            except Exception:
+                pass
+        if actions:
+            try:
+                _log("execute_script: {} protective action(s) applied (layout rebuild)".format(len(actions)))
+            except Exception:
+                pass
+        return actions
+
+    # 2. Detect mass cell destruction (e.g. _layout.clear()).
+    pre_cells = pre.get("pre_cells")
+    try:
+        post_cells = _layout.cells()
+    except Exception:
+        post_cells = None
+    if pre_cells is not None and post_cells == 0 and pre_cells > 0:
+        actions.append({
+            "trigger": "Active layout was emptied during script (cells: {} -&gt; 0). Likely _layout.clear() / .assign() / .read() on the live view layout.".format(pre_cells),
+            "action": "No data recovery is possible. Any pya.Cell, pya.Shapes, or pya.Region handles your script captured before the destructive call are now dangling and will raise 'Object has been destroyed already'.",
+            "guidance": "_layout IS the active cellview's layout, not a scratch buffer. For temporary work use pya.Layout() (detached). To replace the visible layout safely, call create_layout (new tab) instead of clear()+assign().",
+        })
+
+    # 3. Verify _top_cell handle.
+    top_cell_alive = False
+    if _top_cell is not None:
+        try:
+            _ = _top_cell.name
+            top_cell_alive = True
+        except Exception:
+            top_cell_alive = False
+
+    top_cell_was_recreated = False
+    if not top_cell_alive:
+        old_name = pre.get("top_cell_name")
+        try:
+            if _layout.cells() == 0:
+                _top_cell = _layout.create_cell("TOP")
+                top_cell_was_recreated = True
+                actions.append({
+                    "trigger": "_top_cell handle was destroyed and layout is empty (previous top: {!r}).".format(old_name),
+                    "action": "Created a fresh placeholder cell named 'TOP' so the cellview can paint.",
+                    "guidance": "Re-create geometry on this cell, or call create_layout to start a clean tab.",
+                })
+            else:
+                _top_cell = _layout.top_cell()
+                top_cell_was_recreated = True
+                try:
+                    _new_name = _top_cell.name
+                except Exception:
+                    _new_name = "unknown"
+                actions.append({
+                    "trigger": "_top_cell handle was destroyed but layout still contains cells (previous top: {!r}).".format(old_name),
+                    "action": "Rebound _top_cell to current layout.top_cell() = {!r}.".format(_new_name),
+                    "guidance": "If you need a specific cell, retrieve it by name from _layout after destructive operations.",
+                })
+        except Exception as _re:
+            actions.append({
+                "trigger": "_top_cell rebinding failed",
+                "action": "No recovery possible; subsequent tools may fail",
+                "error": str(_re),
+            })
+
+    # 4. Verify the active cellview's `cell` pointer (the GUI-crash hazard).
+    # Logic: a "dangling" cv.cell is one that (a) was a valid named cell at
+    # pre-snapshot time but is no longer reachable via .name, OR (b) we just
+    # recreated _top_cell in step 3 -- because pya's Python `cv.cell` wrapper
+    # may auto-rebind silently while KLayout's C++ cv->cell pointer remains
+    # stale (Qt paints will then dereference garbage and either segfault or
+    # hang the GUI). We therefore force-rebind whenever step 3 fired, not
+    # just when we can prove cv.cell is None/dead.
+    # A cv.cell of None on a freshly-created view (when the snapshot also
+    # had None and step 3 did NOT rebuild _top_cell) is not dangerous and
+    # must not be reported.
+    pre_had_cv_cell = pre.get("cv_cell_name") is not None
+    if _layout_view is not None:
+        try:
+            cv = _layout_view.active_cellview()
+        except Exception:
+            cv = None
+        if cv is not None:
+            try:
+                cv_valid = cv.is_valid()
+            except Exception:
+                cv_valid = False
+            if cv_valid:
+                cv_cell_ok = False
+                try:
+                    if cv.cell is not None:
+                        _ = cv.cell.name
+                        cv_cell_ok = True
+                    else:
+                        # cv.cell is None: only OK if it was None before too.
+                        cv_cell_ok = not pre_had_cv_cell
+                except Exception:
+                    cv_cell_ok = False
+                # Force a rebind whenever we recreated _top_cell, even if
+                # cv.cell looks valid -- the Python wrapper can be auto-rebound
+                # by pya while the underlying C++ cv->cell still points at
+                # destroyed memory, causing Qt to hang on next paint.
+                if top_cell_was_recreated:
+                    cv_cell_ok = False
+                if not cv_cell_ok:
+                    old = pre.get("cv_cell_name")
+                    try:
+                        if _top_cell is not None:
+                            cv.cell = _top_cell
+                        else:
+                            cv.cell = _layout.top_cell()
+                        try:
+                            _new_name = cv.cell.name
+                        except Exception:
+                            _new_name = "unknown"
+                        if top_cell_was_recreated:
+                            _trig = ("Active cellview's cv.cell may reference C++-stale memory "
+                                     "after _top_cell was rebuilt (previous: {!r}). Force-rebinding "
+                                     "preemptively to keep Qt's next paint safe.").format(old)
+                        else:
+                            _trig = ("Active cellview's cv.cell pointer was dangling after script "
+                                     "(previous: {!r}). This is the KLayout GUI segfault trigger.").format(old)
+                        actions.append({
+                            "trigger": _trig,
+                            "action": "Rebound cv.cell to {!r} before returning to Qt's event loop.".format(_new_name),
+                            "guidance": "After _layout.clear() / .assign() / .read() you MUST rebind cv.cell. The server did this for you; consider operating on a detached pya.Layout() and using create_layout to swap views explicitly.",
+                        })
+                    except Exception as _re:
+                        actions.append({
+                            "trigger": "cv.cell rebinding failed",
+                            "action": "Could not rebind cv.cell -- KLayout may crash on next repaint",
+                            "error": str(_re),
+                        })
+
+    # Mirror a one-line summary into the KLayout log so users with the
+    # console open see protection events without parsing the JSON.
+    if actions:
+        try:
+            _log("execute_script: {} protective action(s) applied".format(len(actions)))
+            for _a in actions:
+                _log("  - {}".format(_a.get("trigger", "?")))
+        except Exception:
+            pass
+
+    return actions
+
+
+# ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
 
@@ -491,6 +717,8 @@ def _tool_execute_script(args):
         "_get_or_create_view": _get_or_create_view,
         "_refresh_view": _refresh_view,
     }
+    # Snapshot live layout/view state so post-exec damage is detectable.
+    _pre_state = _snapshot_layout_state()
     # Capture stdout/stderr during execution
     _captured_stdout = io.StringIO()
     _captured_stderr = io.StringIO()
@@ -498,45 +726,69 @@ def _tool_execute_script(args):
     _old_stderr = sys.stderr
     sys.stdout = _captured_stdout
     sys.stderr = _captured_stderr
+    _exec_error = None
     try:
         exec(code, ns)
     except Exception as e:
-        # Capture output before re-raising
-        _err_stdout = _captured_stdout.getvalue()
-        _err_stderr = _captured_stderr.getvalue()
-        # Format a readable error with traceback pointing to user code lines
-        tb_lines = _tb_mod.format_exception(type(e), e, e.__traceback__)
-        # Filter to show only the &lt;string&gt; (user code) frames
-        user_frames = []
-        for line in _tb_mod.format_tb(e.__traceback__):
-            if '&lt;string&gt;' in line:
-                user_frames.append(line.strip())
-        err_msg = "{}: {}".format(type(e).__name__, e)
-        if user_frames:
-            err_msg += "\n  in user code:\n    " + "\n    ".join(user_frames)
-        if _err_stdout:
-            err_msg += "\n  stdout: " + _err_stdout.rstrip()
-        if _err_stderr:
-            err_msg += "\n  stderr: " + _err_stderr.rstrip()
-        raise RuntimeError(err_msg)
+        _exec_error = e
     finally:
         sys.stdout = _old_stdout
         sys.stderr = _old_stderr
     _stdout_val = _captured_stdout.getvalue()
     _stderr_val = _captured_stderr.getvalue()
-    # Update globals in case script called _get_or_create_view()
+    # Update globals in case script called _get_or_create_view() or
+    # reassigned them. Must happen before revalidation so we probe the
+    # freshest references.
     if ns.get("_layout") is not _layout:
         _layout = ns["_layout"]
     if ns.get("_layout_view") is not _layout_view:
         _layout_view = ns["_layout_view"]
     if ns.get("_top_cell") is not _top_cell:
         _top_cell = ns["_top_cell"]
-    _refresh_view()
+    # Post-exec damage detection + auto-recovery. MUST run before control
+    # returns to Qt's event loop, otherwise a destroyed cv.cell left over
+    # from the script will segfault the GUI on its next repaint. Runs
+    # whether or not the script raised. Never silent: every action goes
+    # back to the agent in `protections_applied` (or the error message).
+    _protections = _post_exec_revalidate(_pre_state)
+    if _exec_error is not None:
+        _e = _exec_error
+        # Filter traceback to show only the &lt;string&gt; (user code) frames
+        user_frames = []
+        for line in _tb_mod.format_tb(_e.__traceback__):
+            if '&lt;string&gt;' in line:
+                user_frames.append(line.strip())
+        err_msg = "{}: {}".format(type(_e).__name__, _e)
+        if user_frames:
+            err_msg += "\n  in user code:\n    " + "\n    ".join(user_frames)
+        if _stdout_val:
+            err_msg += "\n  stdout: " + _stdout_val.rstrip()
+        if _stderr_val:
+            err_msg += "\n  stderr: " + _stderr_val.rstrip()
+        if _protections:
+            err_msg += "\n  protections_applied (server auto-recovery to keep KLayout alive):"
+            for _act in _protections:
+                err_msg += "\n    - " + json.dumps(_act, sort_keys=True)
+        raise RuntimeError(err_msg)
+    try:
+        _refresh_view()
+    except Exception as _re:
+        _protections.append({
+            "trigger": "_refresh_view raised after script",
+            "action": "Suppressed to preserve response; layer panel may be stale",
+            "error": str(_re),
+        })
     result = ns.get("result", {"status": "ok"})
     if not isinstance(result, dict):
         result = {"status": "ok", "result": result}
     result["stdout"] = _stdout_val
     result["stderr"] = _stderr_val
+    if _protections:
+        result["protections_applied"] = _protections
+        # Surface the protection marker even when the user's script didn't
+        # set a status key. Preserve any non-default status the script chose.
+        if result.get("status") in (None, "ok"):
+            result["status"] = "ok_with_protections"
     return json.dumps(result)
 
 
