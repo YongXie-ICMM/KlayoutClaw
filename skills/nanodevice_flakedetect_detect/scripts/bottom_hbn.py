@@ -164,9 +164,13 @@ def detect_bottom_hbn(image: np.ndarray, pixel_size: float, priors: dict | None 
     # Primary candidate: HSV-gate union (baseline behaviour) — robust on
     # stacks where K-means splits bottom_hBN across multiple clusters.
     # Tighten S>80 to drop the leaked low-saturation hole-fill.
+    # close_k reduced 15 -> 7: bench data showed close_k=15 bridges
+    # neighboring blue debris into one giant CC on AH stacks (e.g. AH06
+    # detector returned 24925 µm² vs GT 7103). 7px ≈ 0.7 µm — closes
+    # genuine pinholes without merging separate flakes.
     tight_gate = np.zeros((h, w), dtype=np.uint8)
     tight_gate[(s_chan > 80) & (h_chan > 80) & (h_chan < 130)] = 255
-    union_mask = morph_clean(tight_gate, close_k=15, open_k=7)
+    union_mask = morph_clean(tight_gate, close_k=7, open_k=7)
     union_mask = keep_largest_n(union_mask, n=1, min_area=5000)
     if (union_mask > 0).sum() > int(2000.0 / (pixel_size ** 2)):
         rec = _score_cc(union_mask, image, hsv, priors, pixel_size)
@@ -200,7 +204,8 @@ def detect_bottom_hbn(image: np.ndarray, pixel_size: float, priors: dict | None 
             cluster_mask = cv2.bitwise_and(cluster_mask, color_gate)
             if (cluster_mask > 0).sum() < 1000:
                 continue
-            cluster_mask = morph_clean(cluster_mask, close_k=15, open_k=7)
+            # close_k 15 -> 7 to avoid bridging neighboring blue flakes.
+            cluster_mask = morph_clean(cluster_mask, close_k=7, open_k=7)
             # Split into connected components — bottom_hBN is usually a
             # single dominant flake; smaller components are stray reflections.
             nl, lab_arr, st_arr, _ = cv2.connectedComponentsWithStats(cluster_mask)
@@ -226,13 +231,18 @@ def detect_bottom_hbn(image: np.ndarray, pixel_size: float, priors: dict | None 
                 cluster_sats.append((cid, s_mean, h_mean))
             cluster_sats = [x for x in cluster_sats if x[1] > 100 and 80 < x[2] < 130]
             cluster_sats.sort(key=lambda x: -x[1])
-            for n_take in (1, 2, 3):
+            # Restricted to top1 only: bench data showed top2/top3 unions
+            # systematically over-merge on AH/HM stacks (e.g. AH06
+            # kmeans_union_K8_top3 produced 24925 µm² vs GT 7103). The
+            # primary HSV union_tight + the per-cluster CC candidates above
+            # already cover legitimate split-cluster cases.
+            for n_take in (1,):
                 if len(cluster_sats) < n_take:
                     continue
                 union_k = np.zeros((h, w), dtype=np.uint8)
                 for cid, _, _ in cluster_sats[:n_take]:
                     union_k[labels == cid] = 255
-                union_k = morph_clean(union_k, close_k=15, open_k=7)
+                union_k = morph_clean(union_k, close_k=7, open_k=7)
                 union_k = keep_largest_n(union_k, n=1, min_area=5000)
                 if (union_k > 0).sum() < int(2000.0 / (pixel_size ** 2)):
                     continue
@@ -244,7 +254,19 @@ def detect_bottom_hbn(image: np.ndarray, pixel_size: float, priors: dict | None 
             pass
 
     if not candidates:
-        return {'bottom_hbn_mask': np.zeros((h, w), np.uint8), 'cc_records': []}
+        # Never-empty fallback: when the scorer rejects everything, fall back
+        # to the loose color_gate's largest CC. This fixes HM05 EMPTY and
+        # gives downstream a real-sized blob (with low_confidence) instead of
+        # silently failing the pipeline.
+        loose = morph_clean(color_gate, close_k=7, open_k=5)
+        loose = keep_largest_n(loose, n=1, min_area=2000)
+        if (loose > 0).sum() == 0:
+            return {'bottom_hbn_mask': np.zeros((h, w), np.uint8),
+                    'cc_records': [], 'low_confidence': True}
+        loose_filled = flood_fill_holes(loose)
+        return {'bottom_hbn_mask': loose_filled, 'cc_records': [],
+                'selected_score': 0.0, 'low_confidence': True,
+                '_fallback_source': 'loose_color_gate_largest_cc'}
 
     candidates.sort(key=lambda r: r['score'], reverse=True)
     best = candidates[0]
@@ -309,6 +331,11 @@ def main():
         print("ERROR: no bottom hBN region found in bottom_part", file=sys.stderr)
         sys.exit(1)
 
+    # Always save the bottom_part-coords mask so the new graphite detector can
+    # use it directly (avoids inverting the warp twice).
+    cv2.imwrite(os.path.join(args.output_dir, "bottom_hbn_mask_bp.png"),
+                mask_bottom)
+
     # Warp mask to full_stack coordinates
     M_src2tgt = invert_affine(warp_tgt2src)
     h_fs, w_fs = target_img.shape[:2]
@@ -344,7 +371,9 @@ def main():
 
     with open(os.path.join(args.output_dir, "bottom_hbn_result.json"), "w") as f:
         json.dump({"area_px": area_px, "area_um2": area_um2,
-                   "score": result.get('selected_score')}, f, indent=2)
+                   "score": result.get('selected_score'),
+                   "low_confidence": bool(result.get('low_confidence', False)),
+                   "fallback_source": result.get('_fallback_source')}, f, indent=2)
 
     print(f"OK: bottom hBN detected")
     print(f"  Area: {area_px} px ({area_um2} um2)")

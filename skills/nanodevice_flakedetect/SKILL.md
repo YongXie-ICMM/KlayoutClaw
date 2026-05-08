@@ -86,7 +86,7 @@ Commit and review don't write to disk — they use KLayout directly.
 > - pixel_size: `<value>` um/px
 > - output_dir: `<out>/detect`
 
-**What the subagent does:** Runs all 4 detect scripts, reviews candidate images for graphite/graphene, re-runs with `--cluster-id` if needed, assembles `detections.json`.
+**What the subagent does:** Runs all 4 detect scripts. For graphene, reviews candidate images and re-runs with `--cluster-id` if needed. For graphite & bottom_hBN, the C3 ensemble picks a winner automatically; the subagent inspects `low_confidence` / `winner_score` in the result JSON and escalates to vision-review when those signal a poor pick. Then assembles `detections.json`.
 
 **What it produces:** Per-material masks/contours/result.json files, `detections.json`
 
@@ -160,7 +160,8 @@ Commit and review don't write to disk — they use KLayout directly.
 | Problem | Retry from | What to change |
 |---------|------------|----------------|
 | Polygon boundaries don't match flake edges | Step 1 (align) | Try different rotation or wider scale range |
-| Wrong material detected | Step 2 (detect) | Adjust cluster selection with `--cluster-id` |
+| Wrong material detected (graphene) | Step 2 (detect) | Adjust cluster selection with `--cluster-id` |
+| Wrong material detected (graphite / bottom_hBN) | Step 2 (detect) | Inspect `winner_score` + `low_confidence` in result JSON; spawn vision-review or refit priors. The C3 ensemble has no `--cluster-id` knob. |
 | Polygons flipped or offset | Step 4 (commit) | Check coordinate transform formula |
 
 **Max 2 retries per stage.** If still failing after 2 retries, report to the user for manual intervention.
