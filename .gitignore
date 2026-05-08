@@ -1,3 +1,8 @@
 _oracle_out/
 tools/__pycache__/
 tests/__pycache__/
+agent/node_modules/
+agent/dist/
+.tmp/
+.scratch/
+agent/.tmp/
