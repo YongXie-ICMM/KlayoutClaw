@@ -1,0 +1,6 @@
+.git
+.claude/worktrees
+node_modules
+__pycache__
+*.pyc
+agent/dist
