@@ -13,7 +13,7 @@
 On 2026-04-14/15 we ran 15 full benchmark sessions (`ml04`, `ml08`, `ml09`, `ml11`, `ml14`) across three harnesses (Claude Code, OpenCode, qlaybot) and synthesised the results into `/Users/andrewwayne/Benchmark_Records/2026_04_14_15/KLAYOUTCLAW_ENHANCEMENT_SYNTHESIS.md`. That review produced a first round of uncommitted changes which, when audited against the original transcripts and feedback files, showed two patterns:
 
 1. **Overfit to the specific Hall-bar benchmark.** Defaults, example text, schema descriptions, and docs vocabulary all assumed the benchmark's exact layer numbers (`graphene=11/0`, `graphite=13/0`, `mesa=20/0`, `contact_patch=21/0`, `bonding_pad=2/0`, `contact_route=3/0`) and device topology ("Hall-bar-style arms"). Any future benchmark on a different device would silently mis-score.
-2. **One critical gap and one real bug, both re-implemented or worked around every session.** Agents hand-rolled "graphene ∩ graphite + graphene-only + graphite-only" geometry in `execute_script` every single time. And `auto_route`'s Hungarian matching had no override, so `ml14` made 23 sequential auto_route calls then abandoned the tool and wrote manual Manhattan paths.
+2. **One critical gap and one real bug, both re-implemented or worked around every session.** Agents hand-rolled "graphene ∩ graphite + graphene-only + graphite-only" geometry in `execute_script` every single time. And `auto_route`'s then-current default assignment had no override, so `ml14` made 23 sequential auto_route calls then abandoned the tool and wrote manual Manhattan paths.
 
 This report documents the problems we solved, how we verified each fix, and what remains out-of-scope.
 
@@ -114,9 +114,9 @@ each with `area_um2`, `bbox_um`, `centroid_um`, `num_polygons`. Score is always 
 
 ### 8. `auto_route` could not be overridden — ml14 abandoned the tool after 23 calls
 
-**Problem.** The single largest workflow failure in the benchmark set. CC ml14's transcript shows 23 sequential `auto_route` calls (lines 412–548) as the agent tried to coerce the Hungarian assignment into producing a valid routing, then gave up and wrote manual Manhattan paths with explicit exit-column staggering. `dry_run` previews the matching; it does not let you commit a different one.
+**Problem.** The single largest workflow failure in the benchmark set. CC ml14's transcript shows 23 sequential `auto_route` calls (lines 412–548) as the agent tried to coerce the default assignment into producing a valid routing, then gave up and wrote manual Manhattan paths with explicit exit-column staggering. `dry_run` previews the matching; it does not let you commit a different one.
 
-**Fix.** New parameter `pin_pairs_override: [[a_idx, b_idx], ...]` on `auto_route`. When present, it replaces Hungarian matching entirely; the rest of the routing pipeline (cost grid, pathfinding, insertion) is unchanged. Validation covers:
+**Fix.** New parameter `pin_pairs_override: [[a_idx, b_idx], ...]` on `auto_route`. When present, it replaces the automatic assignment entirely; the rest of the routing pipeline (cost grid, pathfinding, insertion) is unchanged. Validation covers:
 - malformed entries (not a 2-element list),
 - wrong length (must equal `min(n_pin_a, n_pin_b)`),
 - out-of-range indices,
@@ -124,7 +124,7 @@ each with `area_um2`, `bbox_um`, `centroid_um`, `num_polygons`. Score is always 
 
 Any validation failure returns `status: "failed"` with a structured `errors[]` list rather than silently running the wrong assignment. The `dry_run` preview also honours the override, so the recommended workflow is: `auto_route(dry_run=true)` → inspect `pairs[]` → re-call with `pin_pairs_override=[[a_idx, b_idx], …], dry_run=false`.
 
-**Verification.** `tests/test_route_worker_override.py` — four tests: crossed assignment produces diagonal paths (dy > 50 µm), wrong-length rejected, out-of-range index rejected, malformed entry rejected. Live-session E2E (`test_e2e_route_override.sh`) drives Claude through: draw 4 pins in two vertically-separated pairs → dry-run to see Hungarian parallel pairing → override with `[[0,1],[1,0]]` → query the committed L10/0 shapes and confirm both routes span the 100 µm y-gap (Hungarian would have kept them parallel at dy ≈ 0).
+**Verification.** `tests/test_route_worker_override.py` — four tests: crossed assignment produces diagonal paths (dy > 50 µm), wrong-length rejected, out-of-range index rejected, malformed entry rejected. Live-session E2E (`test_e2e_route_override.sh`) drives Claude through: draw 4 pins in two vertically-separated pairs → dry-run to see the parallel default pairing → override with `[[0,1],[1,0]]` → query the committed L10/0 shapes and confirm both routes span the 100 µm y-gap (the default pairing would have kept them parallel at dy ≈ 0).
 
 **Commits:** `1fefbae`, `c350b41`, `4e7d97e`, `a5fab4a`, `004f44e` (+ three E2E fixup commits for assertion-shape issues: `fc682cf`, `d46618c`, `484d6cd`).
 
@@ -184,7 +184,7 @@ Any validation failure returns `status: "failed"` with a structured `errors[]` l
 |---|---|
 | `plugin/klayoutclaw_server.lym` | Schema defaults stripped; `material_overlap_report` + `pin_pairs_override` registered; `_tool_route_inspect` guards. |
 | `tools/evaluate_worker.py` | `_prim_bulk_containment` rewrite; new `_prim_material_overlap_report`; `_build_next_step` sanitised; `main()` forwards `report` side-data; `raw` variable hardened against `UnboundLocalError`. |
-| `tools/route_worker.py` | `pin_pairs_override` branch with validation, applied before Hungarian + dry_run. |
+| `tools/route_worker.py` | `pin_pairs_override` branch with validation, applied before automatic assignment + dry_run. |
 | `docs/tools.md` | Parameter tables + primitive bullet for `bulk_containment`, `material_overlap_report`, `pin_pairs_override` + manual-pairing workflow paragraph; `route_inspect` table shows required args. |
 | `CLAUDE.md` | `route_inspect` and `evaluate_design` row descriptions updated to reflect Task 1/2/3 changes. |
 | `docs/skills.md` | No substantive change (doc counts). |

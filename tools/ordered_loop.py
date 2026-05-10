@@ -1,7 +1,7 @@
-"""Ordered-loop pairing engine — shared infrastructure for issue #28 candidates.
+"""Ordered-loop pairing engine for the auto_route assignment pre-pass.
 
-The algorithm replaces Hungarian assignment in tools/route_worker.py to prevent
-inter-net crossings PRIOR to pathfinding. Two CCW-ordered cyclic loops:
+The algorithm prevents inter-net crossings PRIOR to pathfinding by matching two
+CCW-ordered cyclic loops:
 
   - inner: pin_a centroids ordered by angle around their centroid.
   - outer: pin_b centroids ordered by angle around the chip centroid (or pin_b

@@ -479,7 +479,7 @@ TOOLS = [
     },
     {
         "name": "auto_route",
-        "description": "Route pin pairs between pin_layer_a and pin_layer_b using Hungarian matching + Dijkstra pathfinding. Inserts routed paths on output_layer. Returns status, routed_pairs, errors, map_resolution_um_used, and next_step_suggestion. Requires numpy/scipy/scikit-image in the conda env (default 'instrMCPdev').",
+        "description": "Route pin pairs between pin_layer_a and pin_layer_b using ordered-loop assignment plus sequential cost-based pathfinding. Inserts routed paths on output_layer. Returns status, routed_pairs, errors, map_resolution_um_used, and next_step_suggestion. Requires numpy/scikit-image/klayout in the conda env (default 'instrMCPdev').",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -492,8 +492,8 @@ TOOLS = [
                 "path_safe_distance": {"type": "number", "description": "Minimum distance between routed paths in um. Default 5.", "default": 5.0},
                 "map_resolution": {"type": "number", "description": "Routing grid resolution in um. Smaller = finer but slower. Ignored if auto_map_resolution=true. Default 2.", "default": 2.0},
                 "auto_map_resolution": {"type": "boolean", "description": "Override map_resolution by deriving from the smallest pin bbox edge across both pin layers (target: min_edge_um / 3, clamped to [0.2, 5.0]). Use on layouts with small contacts (~3x2 um) where the default 2.0 under-resolves. Default false.", "default": False},
-                "dry_run": {"type": "boolean", "description": "Preview Hungarian matching without committing routes. Returns status='dry_run' and a pairs[] array of assignments + distances so you can veto an obviously bad match before paying the pathfinding cost. Default false.", "default": False},
-                "per_pair_obstacle_layers": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Optional per-pair extra obstacle layers, unioned with obstacle_layers for that pair only. Length MUST equal len(pairs) after Hungarian matching — call with dry_run=true first to see the pair order. Example: [['13/0'], [], []] avoids graphite for pair 0, nothing extra for pairs 1-2."},
+                "dry_run": {"type": "boolean", "description": "Preview the ordered-loop assignment without committing routes. Returns status='dry_run' and a pairs[] array of assignments + distances so you can inspect the topology before paying the pathfinding cost. Default false.", "default": False},
+                "per_pair_obstacle_layers": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Optional per-pair extra obstacle layers, unioned with obstacle_layers for that pair only. Length MUST equal len(pairs) after the assignment pre-pass — call with dry_run=true first to see the pair order. Example: [['13/0'], [], []] avoids graphite for pair 0, nothing extra for pairs 1-2."},
                 "pin_pairs_override": {
                     "type": "array",
                     "items": {
@@ -502,15 +502,15 @@ TOOLS = [
                         "minItems": 2,
                         "maxItems": 2
                     },
-                    "description": "Explicit [a_idx, b_idx] pairs overriding Hungarian matching. Length MUST equal min(n_pin_a, n_pin_b). Call with dry_run=true first to see the shape-iteration order. Use when Hungarian matches the wrong endpoints (e.g. dense layouts where two pairs would collide). If omitted, Hungarian matching + optional sort_pairs is used."
+                    "description": "Explicit [a_idx, b_idx] pairs overriding the default ordered-loop assignment. Length MUST equal min(n_pin_a, n_pin_b). Call with dry_run=true first to see the shape-iteration order. Use when the default assignment is not the desired device-level topology. If omitted, ordered-loop assignment + optional sort_pairs is used."
                 },
-                "conda_env": {"type": "string", "description": "Conda env with numpy+scipy+scikit-image. Default 'instrMCPdev'.", "default": "instrMCPdev"},
+                "conda_env": {"type": "string", "description": "Conda env with numpy+scikit-image+klayout. Default 'instrMCPdev'.", "default": "instrMCPdev"},
                 "python_path": {"type": "string", "description": "Explicit python binary path (overrides conda_env)."},
                 "obs_hardness": {"type": "number", "description": "Max cost at obstacle boundary (higher = paths stay further away). Default 20.", "default": 20.0},
                 "pin_safe_distance_a": {"type": "number", "description": "Avoidance halo around Pin A shapes in um. Default 5.", "default": 5.0},
                 "pin_safe_distance_b": {"type": "number", "description": "Avoidance halo around Pin B shapes in um. Default 5.", "default": 5.0},
                 "path_hardness": {"type": "number", "description": "Max cost near previously routed paths (higher = more spacing). Default 10.", "default": 10.0},
-                "sort_pairs": {"type": "boolean", "description": "Route shortest pairs first. Improves success rate on dense layouts. Default true.", "default": True},
+                "sort_pairs": {"type": "boolean", "description": "Route assigned pairs/nets by distance after assignment; default ordering is shortest first. Default true.", "default": True},
                 "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds. Clamped to [10, 600]. Default 120."},
                 "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping steps. Lower = stronger avoidance. Default 4."}
             },
@@ -532,7 +532,7 @@ TOOLS = [
     },
     {
         "name": "evaluate_design",
-        "description": "Score a device design against a list of geometric quality checks. Returns weighted overall score (0-1), per-check scores, diagnostic fields (e.g. crossing_pairs for contact_isolation), and a next_step_suggestion string pointing the agent at the inspection tools relevant to any failing check.",
+        "description": "Run a nanodevice-oriented DRC + metric evaluation against a caller-supplied geometric checklist. Returns weighted overall score (0-1), per-check scores, DRC-like diagnostic fields (e.g. crossing_pairs for contact_isolation), and a next_step_suggestion string pointing the agent at the inspection tools relevant to any failing check.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1030,6 +1030,7 @@ def _tool_auto_route(args):
     _log("auto_route: using worker {}".format(worker_path))
 
     # Spawn subprocess
+    python_path = python_path or os.environ.get("PYTHON_PATH")
     if python_path:
         cmd = "{} {} {}".format(python_path, worker_path, config_json)
     else:
@@ -1086,19 +1087,22 @@ def _tool_auto_route(args):
         except Exception:
             pass
         preview_pairs = result.get("pairs", [])
+        assignment_engine = result.get("assignment_engine", "ordered_loop")
+        assignment_label = "ordered-loop" if assignment_engine == "ordered_loop" else assignment_engine
         return json.dumps({
             "status": "dry_run",
             "routed_pairs": 0,
             "total_pins_a": result.get("total_pins_a", 0),
             "total_pins_b": result.get("total_pins_b", 0),
             "pairs": preview_pairs,
+            "assignment_engine": assignment_engine,
             "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
             "errors": result.get("errors", []),
             "next_step_suggestion": (
-                "dry_run preview: {} Hungarian assignments computed, no routes inserted. "
+                "dry_run preview: {} assignments computed by {}, no routes inserted. "
                 "Review the pairs[] array — if the matching looks good, call auto_route again with dry_run=false. "
                 "If a pair looks wrong, flag obstacles via per_pair_obstacle_layers[pair_idx] before the real run."
-            ).format(len(preview_pairs)),
+            ).format(len(preview_pairs), assignment_label),
         })
 
     # Insert routed paths into layout
@@ -1149,7 +1153,7 @@ def _tool_auto_route(args):
                      "screenshot(zoom_box=...) over the unrouted region, and consider per_pair_obstacle_layers or a higher timeout for the retry.".format(inserted, total_pairs))
     else:
         next_step = ("No routes inserted. Re-check pin_layer_a / pin_layer_b have geometry via get_layout_info, "
-                     "try dry_run=True first to preview Hungarian matching, and consult the errors list.")
+                     "try dry_run=True first to preview the ordered-loop assignment, and consult the errors list.")
 
     return json.dumps({
         "status": status,
@@ -1159,6 +1163,8 @@ def _tool_auto_route(args):
         "output_layer": output_layer,
         "path_width_um": path_width,
         "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
+        "assignment_engine": result.get("assignment_engine"),
+        "n_nets": result.get("n_nets"),
         "errors": result.get("errors", []),
         "next_step_suggestion": next_step,
     })
@@ -1656,7 +1662,7 @@ def _render_route_inspect_crossings_image(routes, crossings, out_path, dbu):
 
 
 def _tool_evaluate_design(args):
-    """Evaluate device design against spatial quality checks using external evaluate_worker.py."""
+    """Run nanodevice DRC + metric checks using external evaluate_worker.py."""
     import tempfile
     import subprocess
 
@@ -1790,6 +1796,7 @@ def _tool_evaluate_design(args):
         _log("evaluate_design: using worker {}".format(worker_path))
 
         # Spawn subprocess
+        python_path = python_path or os.environ.get("PYTHON_PATH")
         if python_path:
             cmd = "{} {} {}".format(python_path, worker_path, config_json)
         else:
@@ -2378,12 +2385,13 @@ class KlayoutClawServer(pya.QTcpServer):
 
     def __init__(self, parent=None):
         super(KlayoutClawServer, self).__init__(parent)
-        ha = pya.QHostAddress("127.0.0.1")
+        _bind_addr = os.environ.get("KLAYOUT_MCP_BIND", "127.0.0.1")
+        ha = pya.QHostAddress(_bind_addr)
         ok = self.listen(ha, 8765)
         if not ok:
-            _log("ERROR: Failed to bind to 127.0.0.1:8765 — port may be in use")
+            _log("ERROR: Failed to bind to {}:8765 — port may be in use".format(_bind_addr))
             return
-        _log("MCP server listening on 127.0.0.1:8765")
+        _log("MCP server listening on {}:8765".format(_bind_addr))
         cb = sys.modules.get("_klayoutclaw")
         if cb:
             cb.server_port = 8765

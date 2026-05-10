@@ -20,7 +20,7 @@ A device-agnostic methodology for designing nanodevices on material regions in K
 | 3 | ANALYZE | Study material regions, compute overlaps/exclusions, identify design-relevant zones | Never |
 | 4 | DESIGN | Create device geometry via `execute_script` | Never |
 | 5 | ROUTE | Use `auto_route` tool to connect device contacts to bonding pads | Device has no external contacts |
-| 6 | EVALUATE | Run configurable evaluator + visual inspection, iterate on failures | Never |
+| 6 | EVALUATE | Run nanodevice DRC + metric evaluator, visually inspect failures, iterate | Never |
 | 7 | SAVE | Export GDS + write result.json summary | Never |
 
 Each step has a gate condition. Maximum 2 retries per step. If a step fails after retries, report to the user.
@@ -115,6 +115,7 @@ If the device has contacts that need fan-out to bonding pads:
    - `output_layer`: route layer
    - `obstacle_layers`: device geometry layers to avoid
    - Line width and safe distance as needed
+   - For dense fan-out, use `dry_run=true` first to inspect the ordered-loop assignment, then use `pin_pairs_override` if the required device topology differs.
 5. For failed pairs, write custom routing via `execute_script`
 6. Clean up temporary pin marker layers
 
@@ -126,7 +127,7 @@ The agent decides routing topology, line widths, and obstacle avoidance based on
 
 ## Step 6: EVALUATE
 
-Run the `evaluate_design` MCP tool with a check configuration composed by the agent based on what it designed.
+Run the `evaluate_design` MCP tool as a nanodevice DRC + metric pass, with a check configuration composed by the agent based on what it designed.
 
 **Available check primitives:**
 
@@ -134,6 +135,9 @@ Run the `evaluate_design` MCP tool with a check configuration composed by the ag
 |-----------|------|----------|
 | `component_overlap` | component, region, region_op | Fraction of component area overlapping with region |
 | `component_containment` | component, region, region_op | Fraction of component area contained within region |
+| `bulk_containment` | component, bulk_region/materials, region_op, core_bbox | Fraction of a device body/core inside a caller-declared bulk region |
+| `arm_material_class` | component, classes, containment_threshold | Fraction of shapes landing in exactly one material class |
+| `material_overlap_report` | materials | Pairwise and multi-way material-region report |
 | `contact_isolation` | component | Fraction of route pairs that don't cross |
 | `connectivity` | contact_component, pad_component, route_component, tolerance | Fraction of contacts reaching pads |
 | `route_endpoints` | route_component, target_components, tolerance | Fraction of route endpoints on valid targets |

@@ -55,7 +55,7 @@ Execute arbitrary Python/pya code in KLayout. The view is refreshed automaticall
 For work that needs the unavailable packages, do not try to install them into KLayout's interpreter. Instead, run the heavy code out-of-process and let the result come back as data:
 
 - **Skill scripts** under `skills/.../scripts/` — invoked from bash, run in `instrMCPdev`, talk to KLayout over MCP. This is the canonical pattern for CV / segmentation / alignment workflows.
-- **Dedicated MCP tools** that already wrap a subprocess: `auto_route` (numpy/scipy/scikit-image), `evaluate_design` (gdstk/shapely/numpy).
+- **Dedicated MCP tools** that already wrap a subprocess: `auto_route` (numpy/scikit-image/klayout), `evaluate_design` (gdstk/shapely/numpy).
 - **One-off scripts:** `conda run -n instrMCPdev python -m your_script`. If your subprocess needs the current edited geometry, call `save_layout` first so it can read the GDS from disk; then a follow-up `execute_script` (or `add_*` skill) can inject any returned shapes back into the layout.
 
 See also `docs/skills.md` for the full skill-script catalogue.
@@ -185,9 +185,9 @@ Capture the current KLayout viewport as a PNG image. Returns exactly what the us
 
 ## auto_route
 
-Automatically route connections between pin pairs using cost-based pathfinding. Extracts pins from two layers, uses Hungarian matching for optimal pairing, then minimum-cost pathfinding (Dijkstra on a raster grid) to create routes avoiding obstacles.
+Automatically route connections between pin pairs using an ordered assignment pass followed by cost-based pathfinding. Extracts pins from two layers, computes an ordered-loop pairing by default so cyclic pin order is preserved before routing, then runs a sequential minimum-cost path search on a raster grid while treating caller-declared geometry and completed routes as obstacles.
 
-Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, scipy, and scikit-image. Requires these packages in a conda environment (default: `instrMCPdev`).
+Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, scikit-image, and the standalone KLayout Python package. Requires these packages in a conda environment (default: `instrMCPdev`).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -200,15 +200,15 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 | `path_safe_distance` | number | no | 5.0 | Min distance between paths (um) |
 | `map_resolution` | number | no | 2.0 | Grid resolution in microns. Ignored if `auto_map_resolution=true`. |
 | `auto_map_resolution` | bool | no | false | Override `map_resolution` by deriving from smallest pin bbox edge (target: edge_um / 3, clamped [0.2, 5.0]). Use on layouts with small contacts (~3×2 um). |
-| `dry_run` | bool | no | false | Preview Hungarian matching without committing routes. Returns `status="dry_run"` and a `pairs[]` array of assignments + straight-line distances. |
-| `per_pair_obstacle_layers` | string[][] | no | | Per-pair extra obstacle layers, unioned with `obstacle_layers` for that pair only. Length MUST equal `len(pairs)` after Hungarian matching — call with `dry_run=true` first to see pair order. |
-| `pin_pairs_override` | int[][] | no | | Explicit `[a_idx, b_idx]` pairs overriding Hungarian matching. Length MUST equal `min(n_pin_a, n_pin_b)`. Run with `dry_run=true` first to inspect the shape-iteration order. |
+| `dry_run` | bool | no | false | Preview ordered-loop assignment without committing routes. Returns `status="dry_run"` and a `pairs[]` array of assignments + straight-line distances. |
+| `per_pair_obstacle_layers` | string[][] | no | | Per-pair extra obstacle layers, unioned with `obstacle_layers` for that pair only. Length MUST equal `len(pairs)` after the assignment pre-pass — call with `dry_run=true` first to see pair order. |
+| `pin_pairs_override` | int[][] | no | | Explicit `[a_idx, b_idx]` pairs overriding the default ordered-loop assignment. Length MUST equal `min(n_pin_a, n_pin_b)`. Run with `dry_run=true` first to inspect the shape-iteration order. |
 | `conda_env` | string | no | "instrMCPdev" | Conda env with routing deps |
 | `python_path` | string | no | | Path to python binary (overrides conda_env) |
 | `timeout` | number | no | 120 | Subprocess timeout in seconds. Clamped to `[10, 600]` by the handler. |
 | `obs_damping_step` | number | no | 4 | Obstacle cost damping step for graduated damping pathfinder. Lower = stronger avoidance. |
 
-**Advanced tuning parameters** (passed through to `route_worker.py` config JSON — not exposed in MCP tool schema, but can be added to the config directly):
+**Advanced tuning parameters** (passed through to `route_worker.py`; some are exposed by the MCP schema, while worker-only entries are available when invoking the worker/config directly):
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -219,7 +219,10 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
 | `pin_damping_step` | int | 4 | Gradient steps for pin avoidance fields |
 | `path_hardness` | number | 10.0 | Max cost near previously routed paths |
 | `path_damping_step` | int | 5 | Gradient steps for path avoidance fields |
-| `sort_pairs` | bool | true | Route shortest pairs first (improves success rate) |
+| `sort_pairs` | bool | true | Route pairs/nets by distance after assignment; default ordering is shortest first unless `sort_pairs_reverse` is set in the worker config. |
+| `freeze_completed_routes_as_obstacles_with_margin` | number | 2.5 | Worker-level hard margin around completed routes before subsequent pairs are routed. |
+| `bus_pairs` | array | | Worker-level explicit multi-sink nets of the form `[[a_idx, [b_idx, ...]], ...]`; multi-sink nets use the configured `routing_strategy`. |
+| `routing_strategy` | string | "hybrid" | Worker-level strategy for multi-sink nets: `hybrid`, `per_pair`, or `steiner`. |
 
 **Returns (normal run):**
 ```json
@@ -231,6 +234,8 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
   "output_layer": "10/0",
   "path_width_um": 10.0,
   "map_resolution_um_used": 2.0,
+  "assignment_engine": "ordered_loop",
+  "n_nets": 8,
   "errors": [],
   "next_step_suggestion": "Routes committed. Call screenshot ... then route_inspect to map each route_id back to its contact/pad, and evaluate_design with contact_isolation to detect crossings."
 }
@@ -246,9 +251,10 @@ Runs routing computation in a subprocess (`tools/route_worker.py`) using numpy, 
   "pairs": [
     {"pin_a_idx": 0, "pin_b_idx": 5, "pin_a_um": [100.0, 200.0], "pin_b_um": [300.0, 400.0], "distance_um": 282.8}
   ],
+  "assignment_engine": "ordered_loop",
   "map_resolution_um_used": 2.0,
-  "errors": ["dry_run: Hungarian matching only, no routes inserted."],
-  "next_step_suggestion": "dry_run preview: 8 Hungarian assignments computed ..."
+  "errors": ["dry_run: matching only (ordered_loop), no routes inserted."],
+  "next_step_suggestion": "dry_run preview: 8 assignments computed by ordered-loop ..."
 }
 ```
 
@@ -256,11 +262,11 @@ The `next_step_suggestion` field adapts to the outcome (success / partial / dry_
 
 The `pairs[]` order from a dry_run matches the order `per_pair_obstacle_layers[pair_idx]` is interpreted against on the subsequent real run.
 
-**Manual pairing workflow:** When Hungarian matching assigns pins the wrong way (e.g. two pairs would need to cross through a narrow corridor):
+**Manual pairing workflow:** When the default ordered-loop assignment is not the desired device-level topology:
 
-1. Call `auto_route(dry_run=true)` to see the Hungarian assignment as a `pairs[]` array.
+1. Call `auto_route(dry_run=true)` to see the ordered assignment as a `pairs[]` array.
 2. Read `pin_a_idx` / `pin_b_idx` per entry to identify the mismatch.
-3. Re-call `auto_route(pin_pairs_override=[[a_idx, b_idx], ...], dry_run=false)` with the corrected pairing. The override list must have length equal to the Hungarian pair count.
+3. Re-call `auto_route(pin_pairs_override=[[a_idx, b_idx], ...], dry_run=false)` with the corrected pairing. The override list must have length equal to the assigned pair count.
 
 **Algorithm:**
 1. Save current layout to temp GDS
@@ -269,11 +275,12 @@ The `pairs[]` order from a dry_run matches the order `per_pair_obstacle_layers[p
 4. Rasterize obstacles into a 2D cost grid using `kdb.Region.rasterize()` (resolution = map_resolution)
 5. Apply graduated damping fields around obstacles (stepped cost gradient within obs_safe_distance)
 6. Mark all pins as impassable with their own damping halos (asymmetric per pin set)
-7. Hungarian matching (scipy) finds optimal pin pairings, sorted by distance (shortest first)
-8. For each pair: temporarily recover pin cells, find minimum-cost path via MCP_Geometric (scikit-image), mark path as impassable with damping, re-block pins
-9. Paths compressed (collinear points removed) and inserted as pya.Path objects
+7. Ordered-loop matching sorts both pin sets cyclically and selects a cyclic-monotonic low-cost pairing; explicit overrides bypass this assignment engine.
+8. For each pair/net: temporarily recover only the active pins, apply any per-pair obstacles, find a minimum-cost path via MCP_Geometric (scikit-image), freeze the accepted route and margin as an obstacle, and re-block the pins.
+9. Multi-sink bus nets can be routed as sequential pairs or as hybrid Steiner-style branches.
+10. Paths are compressed (collinear points removed) and inserted as pya.Path objects.
 
-**Dependencies (subprocess):** numpy, scipy, scikit-image, klayout (standalone package)
+**Dependencies (subprocess):** numpy, scikit-image, klayout (standalone package)
 
 ---
 
@@ -319,7 +326,7 @@ Report per-route metadata (contact, pad, length, crossings) for every route on a
 
 ## evaluate_design
 
-Evaluate a device design against configurable geometric quality checks. Runs `tools/evaluate_worker.py` as a subprocess. Accepts a list of check primitives with per-check weights. Returns per-check scores, a weighted overall score, and a `next_step_suggestion` string that tells the agent which inspection tool to run next when a check underperforms.
+Evaluate a nanodevice layout using a configurable DRC-like checklist plus continuous geometric metrics. Runs `tools/evaluate_worker.py` as a subprocess. Accepts a layer map and a list of check primitives with per-check weights, so the caller can encode device-specific validity criteria rather than relying on a fixed Hall-bar score. Returns violation-oriented diagnostics, per-check scores, a weighted overall score, and a `next_step_suggestion` string that tells the agent which inspection tool to run next when a check underperforms.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

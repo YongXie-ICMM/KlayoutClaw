@@ -153,4 +153,4 @@ path = pya.DPath([
 top_cell.shapes(li_route).insert(path)
 ```
 
-Use this for any pairs that `auto_route` couldn't connect. Check the auto_route result for `failed_pairs` to identify which contacts need manual routing.
+Use this for any pairs that `auto_route` couldn't connect. The current MCP response reports `routed_pairs`, `errors`, and route metadata via `route_inspect`; use those fields plus the dry-run `pairs[]` order to identify which contacts need manual routing.

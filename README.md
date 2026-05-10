@@ -50,7 +50,7 @@ Then just ask:
 | **MCP Server** (`plugin/`) | KLayout autorun macro. 19 JSON-RPC tools on `127.0.0.1:8765`: layout I/O, `execute_script`, screenshot, autoroute, design evaluation, plus 9 `vc_*` version-control tools. Zero external deps. |
 | **Skills** (`skills/`) | Claude Code plugin with 9 skills — geometry, display, visual, image, GDS import, and 4 nanodevice pipelines (flakedetect, gdsalign, routing, e2e design). Loaded automatically. |
 | **Qlaybot** (`agent/`) | Standalone TypeScript agent (v0.4.4) built on Pi-Agent SDK. Ink/React TUI, 10 slash commands, planning sandbox, categorized memory with FTS5 + vector search, 3-phase context compaction, JSON-RPC mode. Auto-launches KLayout. |
-| **Tools** (`tools/`) | Subprocess helpers: GDS→PNG, routing engine (numpy/scipy/scikit-image), design evaluator (gdstk/shapely). |
+| **Tools** (`tools/`) | Subprocess helpers: GDS→PNG, ordered-loop routing engine (numpy/scikit-image/klayout), nanodevice DRC + metric evaluator (gdstk/shapely). |
 
 ```
   Any MCP client                          KLayout GUI

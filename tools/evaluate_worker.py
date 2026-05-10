@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""evaluate_worker.py -- Configurable device design evaluator.
+"""evaluate_worker.py -- Nanodevice DRC + metric evaluator.
 
 CLI: python evaluate_worker.py config.json
 
@@ -15,7 +15,7 @@ Config JSON input:
     "output_path": "output.json"
 }
 
-Output JSON: {status, overall, checks: [{name, score, weight, detail}]}
+Output JSON: {status, overall, checks: [{name, score, weight, detail}], next_step_suggestion}
 """
 
 import sys

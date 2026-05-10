@@ -475,7 +475,7 @@ Removes shapes from the listed layers so you can re-route without touching devic
 
 ### Dependencies
 
-- `numpy`, `scipy`, `scikit-image` — backing `auto_route` subprocess
+- `numpy`, `scikit-image`, `klayout` — backing `auto_route` subprocess
 - Conda env: `instrMCPdev`
 
 ### Full Documentation
@@ -495,8 +495,8 @@ This is a pure-text orchestrator skill with no scripts directory. The agent disp
 2. PREPARE — run flake detection + GDS alignment (optional, only if microscope images provided)
 3. ANALYZE — study material regions, compute overlaps/exclusions
 4. DESIGN — create device geometry via `execute_script`
-5. ROUTE — connect contacts to bonding pads via `auto_route`; for dense layouts start with `dry_run=true` and re-call with `pin_pairs_override` when Hungarian matching assigns pins wrongly. Inspect each route with `route_inspect` to surface crossings.
-6. EVALUATE — run configurable evaluator with device-appropriate checks. Newer primitives worth knowing: `bulk_containment`, `arm_material_class`, `material_overlap_report`. The response's `next_step_suggestion` names the specific follow-up tool for any check scoring below 0.8.
+5. ROUTE — connect contacts to bonding pads via `auto_route`; for dense layouts start with `dry_run=true` to inspect the ordered-loop assignment and re-call with `pin_pairs_override` when the desired device topology differs. Inspect each route with `route_inspect` to surface crossings.
+6. EVALUATE — run the nanodevice DRC + metric evaluator with device-appropriate checks. Newer primitives worth knowing: `bulk_containment`, `arm_material_class`, `material_overlap_report`. The response's `next_step_suggestion` names the specific follow-up tool for any check scoring below 0.8.
 7. SAVE — export GDS + write result.json
 
 Steps are conditional: QUERY is skipped if all info is provided, PREPARE is skipped if no images are given, ROUTE is skipped if the device has no external contacts.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E: agent runs auto_route twice — first dry_run to see the Hungarian
+# E2E: agent runs auto_route twice — first dry_run to see the default
 # assignment, then pin_pairs_override to force a crossed pairing. Proves
 # the ml14 "manual pairing" workflow works end-to-end.
 set -euo pipefail
@@ -42,7 +42,7 @@ Using klayoutclaw MCP:
         L100/0 at (0,100)-(2,102)
         L101/0 at (50,0)-(52,2)
         L101/0 at (50,100)-(52,102)
-     (Two vertically-separated pairs. Hungarian will match them in
+     (Two vertically-separated pairs. The default ordered-loop assignment will match them in
      parallel: A0->B0 at y=0, A1->B1 at y=100. We want the crossed
      pairing: A0->B1, A1->B0.)
   3. auto_route with dry_run=true, pin_layer_a="100/0", pin_layer_b="101/0",
@@ -106,7 +106,7 @@ import json
 # The plugin's auto_route response includes summary stats but not per-path
 # geometry (paths are inserted into the layout, not returned). Compare the
 # override response's pair assignment against the dry_run's to prove the
-# override actually changed the Hungarian assignment.
+# override actually changed the default assignment.
 with open("/tmp/e2e_route_override.json") as f:
     r = json.load(f)
 with open("/tmp/e2e_route_override_dryrun.json") as f:
@@ -116,17 +116,17 @@ assert r["status"] in ("success", "partial"), r
 assert r["routed_pairs"] == 2, r
 assert not r.get("errors"), f"unexpected errors: {r['errors']}"
 
-# Dry run should have produced the parallel (Hungarian) pairing: (0,0)+(1,1)
+# Dry run should have produced the parallel default pairing: (0,0)+(1,1)
 dry_pairs = [(p["pin_a_idx"], p["pin_b_idx"]) for p in d["pairs"]]
 assert sorted(dry_pairs) == [(0, 0), (1, 1)], (
-    f"Hungarian dry_run unexpectedly matched crossed pairs: {dry_pairs}. "
+    f"default dry_run unexpectedly matched crossed pairs: {dry_pairs}. "
     f"The override's distinctness check below is meaningless.")
 
 # The override's resulting routed_pairs count + success status, combined
 # with the dry_run showing a different (parallel) baseline, proves the
 # override took effect. To further validate the geometry is crossed, query
 # the MCP for shapes on output_layer=10/0 and verify their endpoints span
-# the full y-range (not just the short y-slice Hungarian would produce).
+# the full y-range (not just the short y-slice default assignment would produce).
 import urllib.request
 MCP = "http://127.0.0.1:8765/mcp"
 code = """

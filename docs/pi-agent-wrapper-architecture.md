@@ -151,7 +151,8 @@ Other MCP servers use 2-level: `{server_key}.{tool_name}`.
 | `klayout.native.save_layout` | Save as GDS2 or OASIS |
 | `klayout.native.get_layout_info` | Layout summary (cells, layers, dbu) |
 | `klayout.native.screenshot` | Capture viewport as PNG |
-| `klayout.native.auto_route` | Autoroute pin pairs (subprocess) |
+| `klayout.native.auto_route` | Autoroute pin pairs with ordered-loop assignment + sequential pathfinding (subprocess) |
+| `klayout.native.evaluate_design` | Nanodevice DRC + metric evaluation (subprocess) |
 
 ### Domain Tool Groups (klayout.{group}.*)
 

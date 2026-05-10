@@ -3,7 +3,7 @@
 
 Drop-in replacement for tools/route_worker.py with:
 
-  - Ordered-loop pairing (cyclic monotonic DP) replacing Hungarian assignment.
+  - Ordered-loop pairing (cyclic monotonic DP) as the default assignment engine.
     Prevents inter-pair crossings BEFORE pathfinding runs. n=len(pin_a),
     m=len(pin_b), n<=m. Cost: sum of Euclidean distances.
 
@@ -22,7 +22,7 @@ Drop-in replacement for tools/route_worker.py with:
 Backward compat:
   - When `bus_pairs` is omitted: behaves like 1:1 pairing using ordered-loop.
   - When the caller supplies `pin_pairs_override`: that takes precedence
-    (no ordered-loop, no Hungarian).
+    (no automatic ordered-loop assignment).
   - All existing config keys (obs_safe_distance_um, path_safe_distance_um,
     map_resolution_um, sort_pairs, dry_run, per_pair_obstacle_layers,
     auto_map_resolution, etc.) continue to work.
@@ -443,9 +443,8 @@ def route(config: dict) -> dict:
 
     elif bus_pairs is None and bus_auto_threshold_um > 0.0:
         # Auto-bus detection: cluster pins on layer A that fall within the
-        # threshold into multi-source nets. Each cluster of A-pins shares
-        # its B-pin matches via a small-cost Hungarian among nearest B's.
-        # Implementation: use a union-find on pin distances.
+        # threshold, then assign each clustered A-pin to a nearest unused
+        # B-pin. Implementation: use a union-find on pin distances.
         threshold_dbu = bus_auto_threshold_um / dbu
         parent = list(range(n_a))
 
@@ -468,9 +467,8 @@ def route(config: dict) -> dict:
         clusters: dict[int, list[int]] = {}
         for i in range(n_a):
             clusters.setdefault(_find(i), []).append(i)
-        # Each cluster -> (cluster_a_idxs, sorted by closeness, picks first
-        # b for each by ordered_loop). Simplest: use cluster centroid as the
-        # source A and the cluster's nearest k B-pins as sinks where
+        # Each cluster -> (cluster_a_idxs, sorted by closeness). Use the
+        # cluster centroid to choose the nearest k available B pins, where
         # k = len(cluster). This collapses correctly to singleton when
         # threshold is too tight to merge.
         used_b: set[int] = set()
@@ -693,8 +691,9 @@ def route(config: dict) -> dict:
             conditional_overwrite(cost, damping, damping > 0, r0, c0,
                                   condition_fn=lambda e, n: (e > 0) & (e < n))
 
-    # C3: route longest nets first (sort_pairs_reverse=True default). Long
-    # pairs claim long corridors before short pairs squeeze in.
+    # Route assigned nets in a stable distance order. Default is shortest
+    # first; sort_pairs_reverse=True switches to longest first for layouts
+    # where long corridors should be claimed early.
     if sort_pairs and assignment_engine != "override":
         def primary_dist(net):
             a = pins_a[net["a_idx"]]

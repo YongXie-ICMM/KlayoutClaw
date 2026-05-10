@@ -11,7 +11,7 @@ KlayoutClaw/
 │   └── klayoutclaw_ui.lym        # KLayout autorun macro (UI panel + status bar)
 ├── tools/
 │   ├── gds_to_image.py           # GDS → PNG converter (gdstk + matplotlib)
-│   ├── route_worker.py           # Subprocess routing engine (numpy/scipy/scikit-image)
+│   ├── route_worker.py           # Subprocess ordered-loop routing engine (numpy/scikit-image/klayout)
 │   └── evaluate_worker.py        # Configurable device design evaluation (gdstk)
 ├── skills/
 │   ├── scripts/
@@ -127,9 +127,9 @@ KlayoutClaw/
 | `save_layout` | Save layout as GDS2 or OASIS |
 | `get_layout_info` | Layout summary info |
 | `screenshot` | Capture viewport as PNG (what the user sees) |
-| `auto_route` | Autoroute pin pairs (subprocess, needs conda env); supports dry_run preview, per_pair_obstacle_layers, auto_map_resolution |
+| `auto_route` | Autoroute pin pairs with ordered-loop assignment + sequential pathfinding (subprocess, needs conda env); supports dry_run preview, per_pair_obstacle_layers, auto_map_resolution |
 | `route_inspect` | Per-route metadata (contact/pad assignment, length, crossings) on a given layer; requires `route_layer`, `contact_layers`, `pad_layer` (no defaults). `route_id` aligns with `evaluate_design.contact_isolation.crossing_pairs`. |
-| `evaluate_design` | Evaluate device design quality via configurable check primitives (subprocess); includes `bulk_containment` + `arm_material_class` + `material_overlap_report` + `next_step_suggestion` |
+| `evaluate_design` | Nanodevice DRC + metric evaluation via configurable check primitives (subprocess); includes `bulk_containment` + `arm_material_class` + `material_overlap_report` + `next_step_suggestion` |
 | `validate_pixel_size` | Validate pixel_size against known objectives |
 | `close_layout_view` | Close one or more layout tabs to keep the server healthy (modes: current/others/all, or by index) |
 | `vc_init` | Initialise version control for current layout (mode: auto/memory/disk). Wraps G5 `RepoHandle`. |
@@ -147,7 +147,7 @@ See `docs/tools.md` for full parameter schemas.
 ## Architecture
 - `pya.QTcpServer` on Qt main thread — no Python threads, no GIL issues
 - MCP server itself has no external dependencies — only stdlib + pya
-- `auto_route` tool spawns a subprocess for heavy computation (numpy/scipy/scikit-image in conda env `instrMCPdev`)
+- `auto_route` tool spawns a subprocess for heavy computation (numpy/scikit-image/klayout in conda env `instrMCPdev`)
 - `evaluate_design` tool spawns a subprocess in the same `instrMCPdev` env (gdstk + shapely + numpy)
 - JSON-RPC 2.0 over HTTP (plain JSON, no SSE)
 - All pya calls execute on the main thread directly

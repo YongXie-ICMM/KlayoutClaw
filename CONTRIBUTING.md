@@ -43,7 +43,7 @@ bash tests/test_connection.sh
 
 - **`pya.QTcpServer`** on Qt main thread — no Python threads, no GIL issues
 - **No external dependencies** for the server — only Python stdlib + pya
-- **`auto_route`** spawns a subprocess for heavy computation (numpy/scipy/scikit-image in conda env `instrMCPdev`)
+- **`auto_route`** spawns a subprocess for heavy computation (numpy/scikit-image/klayout in conda env `instrMCPdev`)
 - **`evaluate_design`** also spawns a subprocess in `instrMCPdev` (gdstk + shapely + numpy)
 - **JSON-RPC 2.0** over HTTP (plain JSON, no SSE)
 - `.lym` XML: escape `<` `>` `&` as `&lt;` `&gt;` `&amp;` in Python code

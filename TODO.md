@@ -47,7 +47,7 @@
 
 ## v0.5: Autorouter
 - [x] Install routing deps (scikit-image, klayout standalone) in conda env
-- [x] Create `tools/route_worker.py` — subprocess routing engine (numpy/scipy/scikit-image)
+- [x] Create `tools/route_worker.py` — subprocess routing engine (numpy/scikit-image/klayout)
 - [x] Create `tests/create_hallbar_unrouted.py` — Hall bar with pin markers, no traces
 - [x] Add `auto_route` MCP tool to server plugin (subprocess-based)
 - [x] Create `tests/evaluate_routing.py` — structural validation of routed GDS
