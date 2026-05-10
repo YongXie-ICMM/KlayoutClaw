@@ -1,8 +1,17 @@
 _oracle_out/
-tools/__pycache__/
-tests/__pycache__/
+__pycache__/
 agent/node_modules/
 agent/dist/
+agent/package-lock.json
 .tmp/
 .scratch/
 agent/.tmp/
+
+# macOS / IDE noise
+.DS_Store
+.claude/worktrees/
+.klayout_roter/
+
+# Out-of-scope local artifacts
+paper/
+opencode.json
