@@ -1,53 +1,51 @@
 #!/usr/bin/env python
-"""Physics-knowledge-based graphite (or backgate-metal) detector.
+"""graphite.py — graphite/backgate detector for bottom_part images.
 
-The detector is generalist: it derives all expectations from the IMAGE plus
-two physics constraints, never from sample-fitted shape priors.
+Pipeline (adaptive throughout; no hand-tuned per-stack thresholds):
 
-Two principles always hold for the backgate (graphite or metal):
-
-    P1.  graphite_polygon  ⊆  bottom_hbn_polygon
-         (graphite is fully covered by bottom hBN)
-
-    P2.  graphite_polygon  ∩  graphene_polygon  ≠  ∅
-         (graphite must overlap graphene -- otherwise it isn't gating
-          anything)
-
-Algorithm:
-
-    search_region = bottom_hbn_mask                                 (P1)
-    seed          = bottom_hbn_mask  ∩  graphene_projected_to_bp    (P2)
-
-    if seed empty:
-        if --seed-points was supplied → use those (agent visual judgement)
-        else                          → use search_region as seed,
-                                          set low_confidence = true
-
-    Build per-image LAB colour models for graphite (sampled in seed) and
-    background bottom_hBN (sampled in search_region minus dilate(seed)).
-    Classify each pixel in search_region by relative Mahalanobis distance:
-    pixel is graphite iff d_seed < d_bg.  Keep the connected component
-    that contains the seed.  No absolute LAB / area / aspect thresholds.
+  1. Substrate sample = LAB peak of  H_corners × H_image × L
+     (H_corners and H_image are 3D LAB histograms; the L weight breaks
+      ties when both substrate and hBN are dense in corners).
+  2. Host mask: pixels with LAB distance to substrate > plateau-midpoint T*,
+     cleaned + 4-corner flood-fill.
+  3. Codex ridge pipeline on the multi-scale-MIN gradient of L:
+        percentile-clip(p50, p99.3) + sqrt
+        -> MAX of Frangi + Sato + Meijering (wide sigma range)
+        -> hysteresis (in-host p82, p96)
+        -> remove_small_objects with adaptive min_size (plateau in the
+           CC-area distribution).
+  4. Carve host \\ dilated(codex_edge) into connected components.
+  5. K-union: K-means at K in [3..n_ccs] on host LAB pixels; assign each
+     CC to nearest centroid; group same-cluster + spatially-adjacent CCs;
+     union across K, dedupe by mask IoU.
+  6. Score:
+        s_strip   = 1 - sqrt(lambda_min / lambda_max)  (PCA aspect)
+        s_central = mean(dt over candidate) / max(dt over host)
+        s_gray    = 1 - chroma / 30
+        s_contrast= min(1, dist_to_bulk_mode / 50)
+        s_cohere  = largest-CC fraction
+        score = 0.3*s_strip + 0.3*s_central + 0.15*s_gray + 0.15*s_contrast + 0.1*s_cohere
+  7. Refinement per candidate: iterative local-mean region grow.
+     For 5 iterations, frontier pixels with LAB close to the local mean
+     of nearby refined pixels are admitted; gated against bulk by
+     d_seed_local < lambda * d_bulk.
+  8. Output top-N candidates panel; pick rank --cluster-id as final mask.
 
 CLI:
-
-    conda run -n instrMCPdev python graphite.py \\
-        --image          <bottom_part.jpg> \\
-        --pixel-size     <um/px> \\
-        --output-dir     <path> \\
-        --bottom-hbn-mask <bottom_hbn_mask_bp.png>          (bottom_part coords) \\
-        [--graphene-mask <graphene_mask.png>]               (top_part coords) \\
-        [--warp-top      <align/warp_top.npy>]              (full_stack → top_part) \\
-        [--warp-bottom   <align/warp_sift_bottom.npy>]      (full_stack → bottom_part) \\
-        [--graphene-mirror]                                 (set if graphene was --mirror'd) \\
-        [--seed-points   "X1,Y1;X2,Y2;..."]                 (bottom_part px; agent override)
+    --image, --pixel-size, --output-dir          [required]
+    [--cluster-id    INT]   rank to pick (default 0)
+    [--top-n         INT]   candidates in panel (default 8, max 12)
+    [--refine-iters  INT]   region-grow iterations (default 5, max 10)
+    [--min-cc-um2    FLOAT] candidate area floor um^2 (default 20)
+    [--refine-lambda FLOAT] extension strictness (default 0.5)
 
 Outputs in --output-dir:
-    graphite_mask.png         (uint8, bottom_part coords)
-    graphite_contour.npy      (Nx2 float64, bottom_part px)
-    graphite_result.json      ({area_px, area_um2, low_confidence,
-                                seed_source, ...})
-    01_graphite_on_bottom.png (diagnostic overlay)
+    refined_candidates.png       top-N panel (our pipeline diagnostic)
+    graphite_mask.png            final binary mask (selected candidate)
+    graphite_contour.npy         (N, 2) float64, bottom_part px
+    graphite_result.json         sidecar: selected rank/score/area, top-N,
+                                 host/substrate/bulk info, low_confidence
+    01_graphite_on_bottom.png    selected contour over desaturated image
 """
 from __future__ import annotations
 
@@ -56,514 +54,915 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
+from sklearn.cluster import KMeans
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                 'nanodevice_flakedetect', 'scripts'))
-from core import morph_clean, flood_fill_holes, keep_largest_n, desaturate  # noqa: E402
+from core import morph_clean, keep_largest_n  # noqa: E402
 
 
-def _project_graphene_to_bottom_part(graphene_mask: np.ndarray,
-                                      bp_shape_hw: tuple[int, int],
-                                      fs_shape_hw: tuple[int, int],
-                                      warp_top: np.ndarray | None,
-                                      warp_bottom: np.ndarray | None,
-                                      mirror: bool) -> np.ndarray | None:
-    """Compose top_part → full_stack → bottom_part. Returns None if any warp missing."""
-    if warp_top is None or warp_bottom is None:
-        return None
-    g = graphene_mask.copy()
-    if mirror:
-        g = cv2.flip(g, 1)
-    fs_h, fs_w = fs_shape_hw
-    bp_h, bp_w = bp_shape_hw
-    # Step 1: top_part -> full_stack
-    g_fs = cv2.warpAffine(g, warp_top, (fs_w, fs_h), flags=cv2.INTER_NEAREST)
-    # Step 2: full_stack -> bottom_part. warp_bottom is full→bottom (cv2 dst→src);
-    #         to map full_stack image into bottom_part canvas we need M = bottom→full = inv(warp_bottom).
-    inv_bot = cv2.invertAffineTransform(warp_bottom)
-    g_bp = cv2.warpAffine(g_fs, inv_bot, (bp_w, bp_h), flags=cv2.INTER_NEAREST)
-    return g_bp
+# ---------------------------------------------------------------------------
+# Configuration (internal — not exposed via CLI)
+# ---------------------------------------------------------------------------
+
+SUBSTRATE_CORNER_FRACTION = 0.10
+HOST_MORPH_CLOSE_K = 11
+HOST_MORPH_OPEN_K = 5
+HOST_MIN_AREA_UM2 = 200.0
+
+# Codex hysteresis percentiles on ridge_max field
+HYSTERESIS_LOW_PCT = 82.0
+HYSTERESIS_HIGH_PCT = 96.0
+
+# K-union spatial-merge tolerance
+PROXIMITY_UM = 5.0
+DEDUPE_IOU = 0.70
+
+# Scoring weights
+SCORE_W_STRIP = 0.30
+SCORE_W_CENTRAL = 0.30
+SCORE_W_GRAY = 0.15
+SCORE_W_CONTRAST = 0.15
+SCORE_W_COHERE = 0.10
+SCORE_CHROMA_NORM = 30.0   # s_gray = 1 - chroma / SCORE_CHROMA_NORM
+SCORE_CONTRAST_NORM = 50.0  # s_contrast = min(1, contrast / SCORE_CONTRAST_NORM)
+
+# Refinement window for the local-mean region grow
+REFINE_WINDOW_PX = 7
+
+# Final mask cleanup + low-confidence threshold
+LOW_CONFIDENCE_FLOOR = 0.40
+
+# Default + clamp ranges for agent-controllable hyperparameters
+DEFAULT_TOP_N = 8
+MAX_TOP_N = 12
+DEFAULT_REFINE_ITERS = 5
+MAX_REFINE_ITERS = 10
 
 
-def _parse_seed_points(s: str | None) -> list[tuple[int, int]]:
-    if not s:
-        return []
-    out = []
-    for tok in s.split(';'):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            x, y = tok.split(',')
-            out.append((int(round(float(x))), int(round(float(y)))))
-        except ValueError:
-            print(f'WARN: ignoring malformed seed point {tok!r}', file=sys.stderr)
-    return out
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _seed_from_points(points: list[tuple[int, int]],
-                      hw: tuple[int, int],
-                      pixel_size_um: float,
-                      radius_um: float = 5.0) -> np.ndarray:
-    """Convert agent-provided (x,y) points into a seed mask via small disks.
+def flood_fill_holes_4corners(mask: np.ndarray) -> np.ndarray:
+    """Flood-fill holes seeded from all 4 image corners that lie on
+    substrate (mask == 0). Falls back to "largest substrate CC as outside"
+    when the host touches every corner."""
+    h, w = mask.shape[:2]
+    flood = mask.copy()
+    fill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    flooded_from_any = False
+    for sx, sy in corners:
+        if mask[sy, sx] == 0:
+            cv2.floodFill(flood, fill_mask, (sx, sy), 255)
+            flooded_from_any = True
+    if not flooded_from_any:
+        inv = cv2.bitwise_not(mask)
+        nl, labels, stats, _ = cv2.connectedComponentsWithStats(inv)
+        if nl > 1:
+            largest_id = int(np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1)
+            outside = (labels == largest_id).astype(np.uint8) * 255
+            holes = cv2.bitwise_and(inv, cv2.bitwise_not(outside))
+            return cv2.bitwise_or(mask, holes)
+        return mask
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
 
-    Default radius 5 µm: large enough to capture a few hundred LAB samples
-    around the seed location, small enough to fit confidently inside typical
-    graphite strips (≥10 µm wide) without spilling into bottom-hBN edges.
+
+def adaptive_plateau_threshold(values: np.ndarray,
+                                abs_floor: float = 20.0,
+                                ratio: float = 3.0,
+                                default: float = 64,
+                                skip_largest_if_multiple: bool = True
+                                ) -> float:
+    """Find first sufficiently-wide gap in sorted unique values; return
+    the gap midpoint. Used for adaptive min_size in codex pipeline."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size < 2:
+        return float(default)
+    drop_points = np.unique(arr)
+    if drop_points.size < 2:
+        return float(default)
+    gaps = np.diff(drop_points)
+    small_gaps = gaps[gaps <= np.percentile(gaps, 75)]
+    med_gap = (float(np.median(small_gaps)) if small_gaps.size > 0
+                else float(np.median(gaps)))
+    wide_thresh = max(abs_floor, ratio * med_gap)
+    plateaus = []
+    for i_g in range(gaps.size):
+        if gaps[i_g] >= wide_thresh:
+            lo = float(drop_points[i_g])
+            hi = float(drop_points[i_g + 1])
+            plateaus.append((lo, hi, hi - lo))
+    if not plateaus:
+        return float(default)
+    if skip_largest_if_multiple and len(plateaus) > 1:
+        largest_w = max(p[2] for p in plateaus)
+        usable = [p for p in plateaus if p[2] < largest_w]
+        if not usable:
+            usable = plateaus[:1]
+    else:
+        usable = plateaus
+    return (usable[0][0] + usable[0][1]) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# Substrate detection + host mask
+# ---------------------------------------------------------------------------
+
+
+def sample_substrate_lab(image_lab: np.ndarray
+                         ) -> tuple[np.ndarray, float, str]:
+    """Pick mu_sub from the joint LAB histogram of (1) 4-corner pixels,
+    (2) the whole image, weighted by (3) L brightness.
+
+    Per-corner means fail when a corner contains mixed substrate+flake.
+    The MODE (histogram peak) of corner pixels is the dominant material
+    there. To distinguish substrate from hBN when both are dense in
+    corners, we add two more factors:
+
+      - H_image: substrate is also globally present, so dense in image
+                 histogram. Pure-corner artefacts (dust) have low H_image.
+      - L:       substrate (Si/SiO2) is brighter than hBN in microscope
+                 images. Weighting by L breaks the tie when both
+                 materials are dense in corners and dense in image.
+
+    Score per LAB-histogram bin = H_corners x H_image x (L_bin / 255).
+    Argmax bin -> mu_sub at the bin centre.
     """
-    h, w = hw
-    seed = np.zeros((h, w), dtype=np.uint8)
-    r_px = max(2, int(round(radius_um / pixel_size_um)))
-    for x, y in points:
-        if 0 <= x < w and 0 <= y < h:
-            cv2.circle(seed, (x, y), r_px, 255, -1)
-    return seed
+    from scipy.ndimage import gaussian_filter
+    h, w = image_lab.shape[:2]
+    pw = max(20, int(w * SUBSTRATE_CORNER_FRACTION))
+    ph = max(20, int(h * SUBSTRATE_CORNER_FRACTION))
+    corners_pix = np.vstack([
+        image_lab[:ph, :pw].reshape(-1, 3),
+        image_lab[:ph, w - pw:].reshape(-1, 3),
+        image_lab[h - ph:, :pw].reshape(-1, 3),
+        image_lab[h - ph:, w - pw:].reshape(-1, 3),
+    ]).astype(np.float32)
+    image_pix = image_lab.reshape(-1, 3).astype(np.float32)
+    rng = [(0, 256), (0, 256), (0, 256)]
+    nbins = 32
+    H_c, edges = np.histogramdd(corners_pix, bins=nbins, range=rng)
+    H_i, _ = np.histogramdd(image_pix, bins=nbins, range=rng)
+    H_c = gaussian_filter(H_c, sigma=1.0)
+    H_i = gaussian_filter(H_i, sigma=1.0)
+    H_c_n = H_c / max(H_c.sum(), 1.0)
+    H_i_n = H_i / max(H_i.sum(), 1.0)
+    L_centers = (edges[0][:-1] + edges[0][1:]) / 2.0
+    L_w = (L_centers / 255.0).astype(np.float32)
+    score = H_c_n * H_i_n * L_w[:, None, None]
+    peak_idx = np.unravel_index(np.argmax(score), score.shape)
+    mu_sub = np.array([
+        (edges[d][peak_idx[d]] + edges[d][peak_idx[d] + 1]) / 2.0
+        for d in range(3)
+    ], dtype=np.float32)
+    std_total = float(np.std(corners_pix, axis=0).sum())
+    return mu_sub, std_total, 'corner_image_L_mode'
 
 
-def _mahalanobis_logp(image_lab: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
-    """Per-pixel negative-log-likelihood under a 3D Gaussian (LAB).
+def auto_t_star(dist: np.ndarray) -> float:
+    """Multi-scale local-baseline peak detection on dA(T)/dT.
 
-    Returns an HxW float32 array. Lower = more likely under (mu, cov).
-    Regularised to avoid singular covariance.
+    Cumulative substrate-pixel curve area(T) = count(pixels with
+    dist <= T). Smooth and differentiate. Substrate produces a wide
+    low-T peak; the first flake material produces a separate peak at
+    higher T. T* lives in the plateau between them — at the midpoint of
+    the two peaks' inner feet.
     """
-    cov_reg = cov + np.eye(3, dtype=np.float64) * 1e-2
-    cov_inv = np.linalg.inv(cov_reg)
-    diff = image_lab.astype(np.float64) - mu  # HxWx3
-    # Mahalanobis: diff @ cov_inv @ diff^T per pixel
-    # Vectorised: reshape to N×3, then einsum
-    h, w, _ = image_lab.shape
-    flat = diff.reshape(-1, 3)
-    m = np.einsum('ni,ij,nj->n', flat, cov_inv, flat)
-    return m.reshape(h, w).astype(np.float32)
-
-
-def _stats_from_mask(image_lab: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    """Compute (mu, cov) of LAB pixels inside `mask`. Returns None if too few pixels."""
-    pix = image_lab[mask > 0].astype(np.float64)
-    if len(pix) < 30:
-        return None
-    mu = pix.mean(axis=0)
-    cov = np.cov(pix, rowvar=False)
-    if cov.ndim == 0:
-        cov = np.array([[float(cov)]])
-    return mu, cov
-
-
-def detect(image_bgr: np.ndarray,
-           bottom_hbn_mask: np.ndarray,
-           graphene_mask_bp: np.ndarray | None,
-           pixel_size_um: float,
-           manual_seed_points: list[tuple[int, int]] | None = None) -> dict:
-    """Physics-driven graphite detection.
-
-    Args
-    ----
-    image_bgr : HxWx3 uint8
-        bottom_part microscope image.
-    bottom_hbn_mask : HxW uint8
-        Bottom-hBN footprint in bottom_part pixel coords (P1 search domain).
-    graphene_mask_bp : HxW uint8 or None
-        Graphene mask projected into bottom_part pixel coords. None if upstream
-        align/projection is unavailable.
-    pixel_size_um : float
-        Microscope pixel size in µm/px.
-    manual_seed_points : list of (x, y) or None
-        Optional agent-supplied seed pixels (bottom_part coords).
-
-    Returns
-    -------
-    dict with keys: mask, contour, low_confidence, seed_source, seed_area_um2,
-    bg_area_um2, n_search_pixels.
-    """
-    h, w = image_bgr.shape[:2]
-    out: dict = {'mask': np.zeros((h, w), np.uint8), 'contour': None,
-                 'low_confidence': False, 'seed_source': None}
-
-    search_region = (bottom_hbn_mask > 0).astype(np.uint8) * 255
-    n_search = int(search_region.sum() / 255)
-    out['n_search_pixels'] = n_search
-    if n_search < 100:
-        out['low_confidence'] = True
-        out['seed_source'] = 'empty_search'
-        return out
-
-    # --- seed selection ----------------------------------------------------
-    seed_source: str
-    if manual_seed_points:
-        seed = _seed_from_points(manual_seed_points, (h, w), pixel_size_um)
-        seed = cv2.bitwise_and(seed, search_region)
-        seed_source = 'manual_points'
-    elif graphene_mask_bp is not None and graphene_mask_bp.any():
-        # P2 seed: "inner region of graphene" -- centroid of (eroded graphene
-        # ∩ bottom_hBN), placed as a small disk (point-style seed). A REGION
-        # seed dilutes the graphite colour signature with bottom_hBN-edge
-        # pixels which makes the classification boundary too permissive
-        # (verified: 0.10 mean IoU on bench). A point seed at the centroid
-        # of the inner overlap gives the algorithm a tight initial colour
-        # model -- the same approach that works at 0.40 mean IoU when an
-        # agent supplies the seed manually. The difference between this
-        # auto-seed and agent-seed is just where the centroid lands; if
-        # graphene-projection alignment is good, they converge.
-        erode_um = 5.0
-        erode_px = max(2, int(round(erode_um / pixel_size_um)))
-        ek = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
-        graphene_inner = cv2.erode(
-            (graphene_mask_bp > 0).astype(np.uint8) * 255, ek)
-        intersect_inner = cv2.bitwise_and(graphene_inner, search_region)
-        intersect_full = cv2.bitwise_and(
-            (graphene_mask_bp > 0).astype(np.uint8) * 255, search_region)
-        target = intersect_inner if (intersect_inner > 0).sum() >= 30 \
-            else intersect_full
-        if (target > 0).sum() < 30:
-            seed = np.zeros((h, w), dtype=np.uint8)
-            seed_source = 'empty_intersection'
-        else:
-            # Multi-point seeding: spread K seed disks across graphene ∩
-            # bottom_hBN at the K darkest pixels with min spacing. Carbon
-            # absorbs more light than hBN (generic optical property), so the
-            # darkest pixels in the intersection are most likely on actual
-            # graphite. Spacing prevents all K seeds from clustering at one
-            # spot. With multiple seeds, if any single seed mis-lands on a
-            # graphite/hBN boundary, others elsewhere on pure graphite still
-            # anchor the colour model correctly. The union of CCs from all
-            # seeds captures the full graphite extent.
-            lab_pre = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-            L = lab_pre[:, :, 0].astype(np.float32)
-            min_spacing_um = 8.0
-            min_spacing_px = max(2, int(round(min_spacing_um / pixel_size_um)))
-            n_seeds = 5  # generic, not sample-tuned
-            # Mask L to only the intersection
-            L_in_target = L.copy()
-            L_in_target[target == 0] = 1e9
-            seed_centers: list[tuple[int, int]] = []
-            # Greedy farthest-first by darkness: each iteration find the
-            # darkest remaining pixel that's >= min_spacing from all existing
-            # seed centers.
-            blocked = np.zeros((h, w), dtype=bool)
-            for _ in range(n_seeds):
-                masked = L_in_target.copy()
-                masked[blocked] = 1e9
-                if not np.isfinite(masked).any() or masked.min() >= 1e9:
+    from scipy.ndimage import gaussian_filter1d
+    ts = np.arange(0.0, 81.0, 1.0)
+    flat = dist.ravel()
+    areas = np.array([int(np.count_nonzero(flat <= t)) for t in ts],
+                     dtype=np.float64)
+    areas_sm = gaussian_filter1d(areas, sigma=2.0)
+    dA = np.diff(areas_sm)
+    n = len(dA)
+    if dA.max() <= 0:
+        return float(ts[-1])
+    Ws = (5, 10, 15, 20)
+    cluster_count: dict[int, int] = {}
+    cluster_members: dict[int, list[int]] = {}
+    tol = 2
+    for W in Ws:
+        baseline = np.array([float(dA[max(0, i - W):min(n, i + W + 1)].min())
+                              for i in range(n)])
+        for i in range(1, n - 1):
+            if dA[i] <= dA[i - 1] or dA[i] < dA[i + 1]:
+                continue
+            rise = dA[i] - baseline[i]
+            if rise < 500.0:
+                continue
+            if dA[i] < 2.5 * (baseline[i] + 1.0):
+                continue
+            matched = None
+            for c in cluster_count:
+                if abs(c - i) <= tol:
+                    matched = c
                     break
-                idx = int(np.argmin(masked))
-                cy, cx = divmod(idx, w)
-                if target[cy, cx] == 0:
-                    break
-                seed_centers.append((cx, cy))
-                # Block a disk of radius min_spacing around this seed.
-                cv2.circle(blocked.view(np.uint8), (cx, cy),
-                           min_spacing_px, 1, -1)
-            if not seed_centers:
-                seed = np.zeros((h, w), dtype=np.uint8)
-                seed_source = 'empty_seed_search'
+            if matched is None:
+                cluster_count[i] = 1
+                cluster_members[i] = [i]
             else:
-                seed = _seed_from_points(seed_centers, (h, w), pixel_size_um)
-                seed = cv2.bitwise_and(seed, target)
-                out['n_auto_seeds'] = len(seed_centers)
-                out['auto_seed_centers'] = seed_centers
-                seed_source = ('graphene_inner_multidark'
-                               if (intersect_inner > 0).sum() >= 30
-                               else 'graphene_full_multidark_fallback')
-    else:
-        seed = np.zeros((h, w), dtype=np.uint8)
-        seed_source = 'none'
+                cluster_count[matched] += 1
+                cluster_members[matched].append(i)
+    peaks = sorted(int(np.median(cluster_members[a]))
+                    for a, c in cluster_count.items() if c >= 2)
+    if len(peaks) < 2:
+        if peaks:
+            return float(ts[peaks[0]])
+        return float(ts[int(np.argmax(dA))])
+    sp, fp = peaks[0], peaks[1]
 
-    if (seed > 0).sum() < 30:
-        # P2 unreachable — fall back to whole search region as seed and flag.
-        seed = search_region.copy()
-        seed_source = (seed_source + '_fallback_to_search_region') \
-            if seed_source != 'none' else 'fallback_to_search_region'
-        out['low_confidence'] = True
+    def walk(p: int, direction: int, frac: float) -> int:
+        peak_h = float(dA[p])
+        target = frac * peak_h
+        eps = 1e-6 * peak_h + 1.0
+        i = p
+        min_seen = peak_h
+        while True:
+            ni = i + direction
+            if ni < 0 or ni >= n:
+                return i
+            v = float(dA[ni])
+            if v <= target:
+                return ni
+            if v > min_seen + eps:
+                return i
+            if v < min_seen:
+                min_seen = v
+            i = ni
 
-    out['seed_source'] = seed_source
-    out['seed_area_um2'] = float((seed > 0).sum() * pixel_size_um * pixel_size_um)
+    rf = walk(sp, +1, 0.15)
+    lf = walk(fp, -1, 0.15)
+    if lf <= rf:
+        between = dA[sp:fp + 1]
+        return float(ts[sp + int(np.argmin(between))])
+    return float(ts[(rf + lf) // 2])
 
-    # --- per-image LAB colour models --------------------------------------
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-    seed_stats = _stats_from_mask(lab, seed)
 
-    # Background = search_region minus the seed (dilated to avoid contaminating
-    # the bg sample with graphite-bleed pixels at the seed boundary).
-    bleed_um = 3.0
-    bleed_px = max(2, int(round(bleed_um / pixel_size_um)))
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                  (2 * bleed_px + 1, 2 * bleed_px + 1))
-    seed_dilated = cv2.dilate(seed, k)
-    bg_mask = cv2.bitwise_and(search_region, cv2.bitwise_not(seed_dilated))
-    bg_stats = _stats_from_mask(lab, bg_mask)
-    out['bg_area_um2'] = float((bg_mask > 0).sum() * pixel_size_um * pixel_size_um)
+def compute_host(image_bgr: np.ndarray,
+                 pixel_size: float
+                 ) -> tuple[np.ndarray, np.ndarray,
+                            np.ndarray, str, float]:
+    image_lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    mu_sub, _, corner = sample_substrate_lab(image_lab)
+    dist = np.linalg.norm(image_lab.astype(np.float32) - mu_sub, axis=2)
+    t_star = auto_t_star(dist)
+    raw = (dist > t_star).astype(np.uint8) * 255
+    host = morph_clean(raw, close_k=HOST_MORPH_CLOSE_K, open_k=HOST_MORPH_OPEN_K)
+    min_area_px = max(500, int(HOST_MIN_AREA_UM2 / (pixel_size ** 2)))
+    host = keep_largest_n(host, n=1, min_area=min_area_px)
+    host = flood_fill_holes_4corners(host)
+    return host, image_lab, mu_sub, corner, t_star
 
-    if seed_stats is None or bg_stats is None:
-        # Not enough pixels to characterise either class. Output the seed as-is.
-        cleaned = morph_clean(seed, close_k=3, open_k=3)
-        cleaned = keep_largest_n(cleaned, n=1, min_area=50)
-        out['mask'] = cleaned
-        cnts, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-        out['contour'] = max(cnts, key=cv2.contourArea) if cnts else None
-        out['low_confidence'] = True
-        return out
 
-    # --- iterative region grow from seed by LAB Mahalanobis distance -----
-    #
-    # No fitted thresholds. At each step:
-    #   1. Refit (mu, cov) from the current graphite mask.
-    #   2. Compute d_seed (Mahalanobis to current model) for all pixels.
-    #   3. Accept pixels with d_seed < `mahal_thresh` (3-sigma in LAB), AND
-    #      inside the search region (P1), AND connected to the seed.
-    #   4. Repeat until convergence.
-    #
-    # `mahal_thresh` = 9.0 corresponds to 3 standard deviations under the
-    # current Gaussian model -- a generic statistical cutoff, not a
-    # sample-fitted parameter. The seed's mu/cov widens as the mask grows,
-    # so the model captures legitimate colour gradients across a real flake.
-    #
-    # We also compare to a BG reference (sampled far from the seed inside
-    # bottom_hBN) but only as a sanity flag: if bg and seed converge to
-    # similar colour, mark low_confidence. The classification itself does
-    # NOT depend on bg.
-    # Sample bg colour FAR from any seed pixel inside bottom_hBN. Used only
-    # as a sanity flag (low_confidence) -- not in the classification rule.
-    far_um = 10.0
-    far_px = max(3, int(round(far_um / pixel_size_um)))
-    far_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * far_px + 1, 2 * far_px + 1))
-    seed_far = cv2.dilate(seed, far_k)
-    bg_mask_far = cv2.bitwise_and(search_region, cv2.bitwise_not(seed_far))
-    bg_stats_fixed = _stats_from_mask(lab, bg_mask_far)
-    bg_mu = bg_stats_fixed[0] if bg_stats_fixed is not None else None
+# ---------------------------------------------------------------------------
+# Codex ridge pipeline
+# ---------------------------------------------------------------------------
 
-    # Region grow with FIXED initial seed colour model:
-    #   The initial seed disk gives us (mu_0, cov_0) -- the per-image colour
-    #   model for "what graphite looks like AT THE SEED LOCATION". We do NOT
-    #   refit (mu, cov) during iteration; doing so lets the model widen and
-    #   absorb bare bottom_hBN colours, especially on stacks where graphite
-    #   and hBN have partial colour overlap. With (mu_0, cov_0) fixed, the
-    #   3-sigma decision boundary is anchored to the local colour the agent
-    #   (or graphene-projection) actually pointed at.
-    #
-    #   Iteration is only used to GROW the connected component: each step,
-    #   classify pixels by d_seed < mahal_thresh, take CCs touching the seed
-    #   or the current mask, repeat until convergence.
-    mahal_thresh = 9.0
-    if bg_mu is not None:
-        out['lab_separation'] = float(np.linalg.norm(seed_stats[0] - bg_mu))
-    else:
-        out['lab_separation'] = 0.0
-    if bg_mu is not None and out['lab_separation'] < 3.0:
-        out['low_confidence'] = True
 
-    # Multi-seed independent classification:
-    #   Process each connected component of the seed mask independently. For
-    #   each, refit (mu, cov) from JUST THAT CC's pixels, narrow cov by 0.5,
-    #   classify the search region by Mahalanobis < 9.0, take the CC that
-    #   contains this seed, and OR-merge into the running output. This is
-    #   the user's "multi-point seeding" design: a single mis-landed seed
-    #   no longer pollutes the colour model for the others, and the union
-    #   of per-seed outputs covers graphite's full extent even when colour
-    #   varies along the flake.
-    nl_seed, seed_lab, _, _ = cv2.connectedComponentsWithStats(
-        (seed > 0).astype(np.uint8) * 255)
-    final = np.zeros((h, w), dtype=np.uint8)
-    n_used = 0
-    for i in range(1, nl_seed):
-        seed_i = (seed_lab == i).astype(np.uint8) * 255
-        if int(seed_i.sum() / 255) < 10:
-            continue
-        s_stats_i = _stats_from_mask(lab, seed_i)
-        if s_stats_i is None:
-            continue
-        s_mu_i, s_cov_i = s_stats_i
-        s_cov_i_narrow = s_cov_i * 0.5
-        d_seed_i = _mahalanobis_logp(lab, s_mu_i, s_cov_i_narrow)
-        candidate_i = ((d_seed_i < mahal_thresh) & (search_region > 0)).astype(np.uint8) * 255
-        # Take only the CC of candidate_i that contains seed_i.
-        nl_c, lab_c, _, _ = cv2.connectedComponentsWithStats(candidate_i)
-        seed_i_mask = (seed_i > 0)
-        for j in range(1, nl_c):
-            comp = (lab_c == j)
-            if (comp & seed_i_mask).any():
-                final[comp] = 255
-        n_used += 1
-    current = final
-    out['n_seeds_classified'] = n_used
-    out['final_area_px'] = int((current > 0).sum())
-    if bg_mu is not None and out['lab_separation'] < 3.0:
-        # graphite colour ≈ bottom_hBN colour: result not trustworthy.
-        out['low_confidence'] = True
+def compute_ms_min(image_lab: np.ndarray, host: np.ndarray) -> np.ndarray:
+    """Multi-scale MIN of the L-channel Sobel gradient at sigma in
+    (1, 2, 4, 8), each normalised to its in-host p99 and clipped to [0,1].
+    A pixel survives only if it is a strong gradient at EVERY scale."""
+    L = image_lab[:, :, 0]
+    sigmas = (1.0, 2.0, 4.0, 8.0)
+    fields = []
+    for sigma in sigmas:
+        Lb = cv2.GaussianBlur(L, (0, 0), sigma)
+        gx = cv2.Sobel(Lb, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(Lb, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        in_host = mag[host > 0]
+        vmax = float(np.percentile(in_host, 99.0)) if in_host.size > 0 else 1.0
+        fields.append(np.clip(mag / max(vmax, 1.0), 0.0, 1.0))
+    return np.stack(fields, axis=0).min(axis=0)
 
-    # CC cleanup: keep CCs overlapping the seed (multiple is fine).
-    cleaned = morph_clean(current, close_k=3, open_k=3)
-    nl, lab_arr, _, _ = cv2.connectedComponentsWithStats(cleaned)
-    final = np.zeros_like(cleaned)
-    seed_pixels = (seed > 0)
+
+def codex_ridge_pipeline(ms_min: np.ndarray, host: np.ndarray
+                          ) -> tuple[np.ndarray, np.ndarray, int]:
+    """Codex faint-strip enhancement on the ms_min gradient.
+
+    Returns (ridge_max, binary_edge_final, adaptive_min_size_px).
+      ridge_max          [0, 1] continuous heatmap after clip+gamma+
+                         Frangi/Sato/Meijering MAX
+      binary_edge_final  uint8 0/255 binary edge after hysteresis +
+                         adaptive remove_small_objects
+      adaptive_min_size_px  the auto-picked min_size used to clean
+                         hysteresis output (plateau in CC-area distrib)
+    """
+    from skimage.filters import (frangi, sato, meijering,
+                                  apply_hysteresis_threshold)
+    from skimage.morphology import remove_small_objects
+    host_bool = host > 0
+    vals = ms_min[host_bool]
+    lo = float(np.percentile(vals, 50))
+    hi = float(np.percentile(vals, 99.3))
+    x = np.clip((ms_min - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    x = np.sqrt(x).astype(np.float32)
+    sigmas = (1, 2, 3, 4, 6)
+    r1 = frangi(x, sigmas=sigmas, alpha=0.7, beta=0.9,
+                black_ridges=False).astype(np.float32)
+    r2 = sato(x, sigmas=sigmas, black_ridges=False).astype(np.float32)
+    r3 = meijering(x, sigmas=(1, 2, 3),
+                    black_ridges=False).astype(np.float32)
+
+    def _norm(a: np.ndarray) -> np.ndarray:
+        m = float(a[host_bool].max()) if host_bool.any() else float(a.max())
+        return a / max(m, 1e-6)
+
+    ridge_max = (np.maximum.reduce([_norm(r1), _norm(r2), _norm(r3)])
+                  * host_bool).astype(np.float32)
+    v = ridge_max[host_bool]
+    low = float(np.percentile(v, HYSTERESIS_LOW_PCT))
+    high = float(np.percentile(v, HYSTERESIS_HIGH_PCT))
+    edge_hys = apply_hysteresis_threshold(ridge_max, low, high) & host_bool
+
+    cc_n0, _, cc_stats0, _ = cv2.connectedComponentsWithStats(
+        edge_hys.astype(np.uint8))
+    plateau_centre = 64
+    if cc_n0 > 1:
+        areas = cc_stats0[1:, cv2.CC_STAT_AREA]
+        plateau_centre = int(adaptive_plateau_threshold(
+            areas, abs_floor=20.0, ratio=3.0, default=64,
+            skip_largest_if_multiple=True))
+    edge_final = remove_small_objects(edge_hys, min_size=plateau_centre)
+    return ridge_max, (edge_final.astype(np.uint8) * 255), plateau_centre
+
+
+# ---------------------------------------------------------------------------
+# Carving + K-union
+# ---------------------------------------------------------------------------
+
+
+def carve_regions(host: np.ndarray, edge: np.ndarray,
+                  pixel_size: float, min_cc_um2: float
+                  ) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Return (lab_r, cc_records) where lab_r is a synthetic label map
+    and cc_records is [(id, area_px)] sorted by area desc."""
+    dilate_px = max(1, int(round(0.5 / pixel_size)))
+    kdil = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
+    open_k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    min_cc_px = int(min_cc_um2 / (pixel_size ** 2))
+    edge_dilated = cv2.dilate(edge, kdil)
+    regions_raw = cv2.bitwise_and(host, cv2.bitwise_not(edge_dilated))
+    regions_cleaned = cv2.morphologyEx(regions_raw, cv2.MORPH_OPEN, open_k3)
+    nl, lab_native, stats, _ = cv2.connectedComponentsWithStats(regions_cleaned)
+    keep = []
     for i in range(1, nl):
-        comp = (lab_arr == i)
-        if comp.sum() < 30:
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        if a >= min_cc_px:
+            keep.append((i, a))
+    keep.sort(key=lambda x: -x[1])
+    lab_r = np.zeros(host.shape, dtype=np.int32)
+    cc_records = []
+    for new_id, (old_id, area) in enumerate(keep, start=1):
+        lab_r[lab_native == old_id] = new_id
+        cc_records.append((new_id, area))
+    return lab_r, cc_records
+
+
+def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
+            cc_records: list[tuple[int, int]], pixel_size: float
+            ) -> list[dict[str, Any]]:
+    """K-means at K in [3..n_ccs] on host LAB pixels. For each K, group
+    same-cluster non-bulk CCs that are spatially adjacent (within
+    PROXIMITY_UM). Union groups across K, dedupe by mask IoU."""
+    if not cc_records:
+        return []
+    host_pix = image_lab[host > 0].reshape(-1, 3).astype(np.float32)
+    cc_mean_lab: dict[int, np.ndarray] = {}
+    for lab_id, _ in cc_records:
+        mask = (lab_r == lab_id)
+        if not mask.any():
             continue
-        if (comp & seed_pixels).any():
-            final[comp] = 255
+        cc_mean_lab[lab_id] = image_lab[mask].reshape(-1, 3) \
+            .astype(np.float32).mean(axis=0)
 
-    if final.sum() == 0:
-        cleaned_largest = keep_largest_n(cleaned, n=1, min_area=50)
-        final = cleaned_largest
-        out['low_confidence'] = True
+    n_ccs = len(cc_records)
+    K_max = max(6, n_ccs)
+    K_range = tuple(range(3, K_max + 1))
+    all_K_results: list[dict[str, Any]] = []
+    for K_try in K_range:
+        try:
+            kt = KMeans(n_clusters=K_try, n_init=4, random_state=42)
+            kt.fit(host_pix)
+        except Exception:
+            continue
+        bulk_id = int(np.argmax(np.bincount(kt.labels_, minlength=K_try)))
+        cc_to_c = {}
+        for lab_id, mean_lab in cc_mean_lab.items():
+            dists = np.linalg.norm(kt.cluster_centers_ - mean_lab, axis=1)
+            cc_to_c[lab_id] = int(np.argmin(dists))
+        all_K_results.append({
+            'K': K_try, 'bulk_id': bulk_id,
+            'centers': kt.cluster_centers_, 'cc_to_c': cc_to_c,
+        })
+    if not all_K_results:
+        return []
 
-    final = flood_fill_holes(final)
+    prox_dilate_px = max(1, int(PROXIMITY_UM / pixel_size / 2))
+    prox_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * prox_dilate_px + 1, 2 * prox_dilate_px + 1))
 
-    out['mask'] = final
-    cnts, _ = cv2.findContours(final, cv2.RETR_EXTERNAL,
-                                cv2.CHAIN_APPROX_SIMPLE)
-    out['contour'] = max(cnts, key=cv2.contourArea) if cnts else None
-    return out
+    raw_candidates: list[dict[str, Any]] = []
+    for kres in all_K_results:
+        cluster_to_ccs: dict[int, list[int]] = {}
+        for lab_id, c in kres['cc_to_c'].items():
+            if c == kres['bulk_id']:
+                continue
+            cluster_to_ccs.setdefault(c, []).append(lab_id)
+        for cluster_id, lab_ids in cluster_to_ccs.items():
+            if len(lab_ids) == 1:
+                subgroups = [lab_ids]
+            else:
+                masks_d = [cv2.dilate(
+                    (lab_r == lid).astype(np.uint8) * 255, prox_kernel)
+                            for lid in lab_ids]
+                masks_raw = [(lab_r == lid).astype(np.uint8) * 255
+                              for lid in lab_ids]
+                n_cc = len(lab_ids)
+                parent = list(range(n_cc))
+
+                def find(x: int, parent: list[int] = parent) -> int:
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
+
+                for i in range(n_cc):
+                    for j in range(i + 1, n_cc):
+                        if (cv2.bitwise_and(masks_d[i], masks_raw[j]) > 0).any():
+                            ra, rb = find(i), find(j)
+                            if ra != rb:
+                                parent[ra] = rb
+                sg_dict: dict[int, list[int]] = {}
+                for i in range(n_cc):
+                    r = find(i)
+                    sg_dict.setdefault(r, []).append(lab_ids[i])
+                subgroups = list(sg_dict.values())
+            for sg in subgroups:
+                merged_mask = np.zeros_like(host)
+                for lid in sg:
+                    merged_mask[lab_r == lid] = 255
+                if (merged_mask > 0).sum() == 0:
+                    continue
+                raw_candidates.append({
+                    'source_K': kres['K'], 'cluster_id': cluster_id,
+                    'mu_lab': kres['centers'][cluster_id],
+                    'mask': merged_mask, 'lab_ids': sg,
+                })
+
+    raw_candidates.sort(key=lambda r: -int((r['mask'] > 0).sum()))
+    unique: list[dict[str, Any]] = []
+    for c in raw_candidates:
+        is_dup = False
+        for u in unique:
+            inter = int((c['mask'] & u['mask']).sum())
+            union = int((c['mask'] | u['mask']).sum())
+            if union > 0 and inter / union >= DEDUPE_IOU:
+                u['source_Ks'].add(c['source_K'])
+                is_dup = True
+                break
+        if not is_dup:
+            c['source_Ks'] = {c['source_K']}
+            unique.append(c)
+    return unique
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Bulk-mode + scoring
+# ---------------------------------------------------------------------------
+
+
+def compute_bulk_mode(image_lab: np.ndarray, host: np.ndarray) -> np.ndarray:
+    """Mode of the host LAB histogram (peak density)."""
+    from scipy.ndimage import gaussian_filter
+    host_pix = image_lab[host > 0].reshape(-1, 3).astype(np.float32)
+    hist, edges = np.histogramdd(host_pix, bins=32,
+                                  range=[(0, 256), (0, 256), (0, 256)])
+    hist = gaussian_filter(hist, sigma=1.0)
+    peak = np.unravel_index(np.argmax(hist), hist.shape)
+    return np.array([
+        (edges[d][peak[d]] + edges[d][peak[d] + 1]) / 2.0
+        for d in range(3)
+    ], dtype=np.float32)
+
+
+def score_candidates(merged_candidates: list[dict[str, Any]],
+                     image_lab: np.ndarray, host: np.ndarray,
+                     bulk_mu_lab: np.ndarray, pixel_size: float
+                     ) -> list[dict[str, Any]]:
+    """Compute 5 score components per candidate and sort by score desc."""
+    host_dt = cv2.distanceTransform(host, cv2.DIST_L2, 5)
+    max_dt = float(host_dt.max()) if host_dt.max() > 0 else 1.0
+    for c in merged_candidates:
+        # area + mean_lab + cohere
+        merged_mask = c['mask']
+        merged_lab_pix = image_lab[merged_mask > 0].reshape(-1, 3) \
+            .astype(np.float32)
+        c['mean_lab'] = merged_lab_pix.mean(axis=0)
+        c['contrast_vs_bulk'] = float(np.linalg.norm(c['mean_lab'] - bulk_mu_lab))
+        area_px = int((merged_mask > 0).sum())
+        c['area_px'] = area_px
+        c['area_um2'] = area_px * pixel_size * pixel_size
+        nl_m, _, st_m, _ = cv2.connectedComponentsWithStats(merged_mask)
+        max_cc = max((int(st_m[i, cv2.CC_STAT_AREA]) for i in range(1, nl_m)),
+                     default=0)
+        c['cohere'] = max_cc / max(1, area_px)
+
+        # s_strip from PCA aspect
+        pix_idx = np.argwhere(merged_mask > 0)
+        if pix_idx.shape[0] >= 5:
+            cov = np.cov(pix_idx.T.astype(np.float64))
+            eigs = np.linalg.eigvalsh(cov)
+            lam_max = float(max(eigs))
+            lam_min = float(max(min(eigs), 1e-6))
+            c['s_strip'] = 1.0 - float(np.sqrt(lam_min / lam_max))
+            c['aspect'] = float(np.sqrt(lam_max / lam_min))
+        else:
+            c['s_strip'] = 0.0
+            c['aspect'] = 1.0
+
+        # s_central from distance transform inside host
+        c['s_central'] = (float(host_dt[merged_mask > 0].mean()) / max_dt
+                          if area_px > 0 else 0.0)
+
+        # s_gray from chromatic neutrality (a,b channels)
+        a = float(c['mean_lab'][1])
+        b = float(c['mean_lab'][2])
+        c['chroma'] = float(np.sqrt((a - 128.0) ** 2 + (b - 128.0) ** 2))
+        c['s_gray'] = max(0.0, 1.0 - c['chroma'] / SCORE_CHROMA_NORM)
+
+        # s_contrast
+        c['s_contrast'] = min(1.0, c['contrast_vs_bulk'] / SCORE_CONTRAST_NORM)
+
+        c['score'] = (SCORE_W_STRIP * c['s_strip']
+                      + SCORE_W_CENTRAL * c['s_central']
+                      + SCORE_W_GRAY * c['s_gray']
+                      + SCORE_W_CONTRAST * c['s_contrast']
+                      + SCORE_W_COHERE * c['cohere'])
+    merged_candidates.sort(key=lambda c: -c['score'])
+    return merged_candidates
+
+
+# ---------------------------------------------------------------------------
+# Iterative local-mean region grow refinement
+# ---------------------------------------------------------------------------
+
+
+def refine_candidates(merged_candidates: list[dict[str, Any]],
+                      image_lab: np.ndarray, host: np.ndarray,
+                      bulk_mu_lab: np.ndarray,
+                      iters: int, lam: float, pixel_size: float) -> None:
+    """For each candidate, iteratively grow its mask outward across host
+    pixels whose LAB matches the LOCAL mean of nearby refined pixels.
+
+    The growth front is gated against bulk by d_local < lam * d_bulk, so
+    a candidate with seed near bulk colour won't run away into bulk.
+    """
+    image_lab_f = image_lab.astype(np.float32)
+    d_bulk_full = np.linalg.norm(image_lab_f - bulk_mu_lab,
+                                  axis=-1).astype(np.float32)
+    dil3 = np.ones((3, 3), np.uint8)
+    open_k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    keep_min_area_px = int(30.0 / (pixel_size ** 2))
+    for c in merged_candidates:
+        refined = (c['mask'] > 0).astype(np.uint8) * 255
+        for _ in range(iters):
+            dilated = cv2.dilate(refined, dil3)
+            frontier = ((dilated > 0) & (refined == 0) & (host > 0))
+            if not frontier.any():
+                break
+            ref_f = (refined > 0).astype(np.float32)
+            sum_lab = cv2.boxFilter(image_lab_f * ref_f[..., None], ddepth=-1,
+                                     ksize=(REFINE_WINDOW_PX, REFINE_WINDOW_PX),
+                                     normalize=False)
+            count = cv2.boxFilter(ref_f, ddepth=-1,
+                                   ksize=(REFINE_WINDOW_PX, REFINE_WINDOW_PX),
+                                   normalize=False)
+            safe = count > 0
+            local_mean = np.zeros_like(image_lab_f)
+            local_mean[safe] = sum_lab[safe] / count[safe][..., None]
+            d_local = np.linalg.norm(image_lab_f - local_mean,
+                                      axis=-1).astype(np.float32)
+            add = frontier & safe & (d_local < lam * d_bulk_full)
+            if not add.any():
+                break
+            refined = refined | (add.astype(np.uint8) * 255)
+        refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, open_k5)
+        refined = keep_largest_n(refined, n=1, min_area=keep_min_area_px)
+        c['refined_mask'] = refined
+        c['refined_area_px'] = int((refined > 0).sum())
+        c['refined_area_um2'] = (c['refined_area_px']
+                                  * pixel_size * pixel_size)
+
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+
+_PALETTE = [(0, 200, 255), (0, 255, 0), (0, 0, 255),
+            (255, 0, 0), (255, 0, 255), (255, 255, 0),
+            (255, 128, 0), (128, 255, 128),
+            (0, 128, 255), (200, 0, 255),
+            (128, 128, 255), (255, 128, 128)]
+
+
+def draw_refined_candidates(image_bgr: np.ndarray,
+                            ranked: list[dict[str, Any]],
+                            top_n: int, sel_rank: int) -> np.ndarray:
+    """Grid panel: each of the top_n candidates shown with its refined
+    mask outlined on a desaturated background; rank, area, score
+    annotated. The selected rank gets a highlighted border."""
+    h_img, w_img = image_bgr.shape[:2]
+    n_show = min(top_n, len(ranked))
+    if n_show <= 0:
+        return image_bgr.copy()
+    n_cols = 3 if n_show > 4 else min(n_show, 2)
+    n_rows = (n_show + n_cols - 1) // n_cols
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    desat = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    base = cv2.addWeighted(image_bgr, 0.35, desat, 0.65, 0)
+    panels = []
+    for rank in range(n_show):
+        c = ranked[rank]
+        mask = c.get('refined_mask', c['mask'])
+        col = _PALETTE[rank % len(_PALETTE)]
+        panel = base.copy()
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(panel, cnts, -1, col, 2)
+        overlay = panel.copy()
+        cv2.drawContours(overlay, cnts, -1, col, -1)
+        panel = cv2.addWeighted(overlay, 0.30, panel, 0.70, 0)
+        if rank == sel_rank:
+            cv2.rectangle(panel, (0, 0), (w_img - 1, h_img - 1),
+                          (0, 255, 255), 8)
+        label1 = (f"#{rank}  area={c.get('refined_area_um2', c['area_um2']):.0f}um2 "
+                  f"asp={c.get('aspect', 0.0):.1f}")
+        label2 = (f"strip={c.get('s_strip', 0.0):.2f} "
+                  f"central={c.get('s_central', 0.0):.2f} "
+                  f"gray={c.get('s_gray', 0.0):.2f} "
+                  f"score={c['score']:.2f}")
+        cv2.rectangle(panel, (0, 0), (w_img, 70), (20, 20, 20), -1)
+        cv2.putText(panel, label1, (12, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(panel, label2, (12, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (220, 220, 220), 1, cv2.LINE_AA)
+        panels.append(panel)
+    panel_h = max(1, h_img // n_rows)
+    panel_w = max(1, w_img // n_cols)
+    fitted = [cv2.resize(p, (panel_w, panel_h),
+                          interpolation=cv2.INTER_AREA) for p in panels]
+    while len(fitted) < n_rows * n_cols:
+        fitted.append(np.zeros_like(fitted[0]))
+    rows = [np.hstack(fitted[i * n_cols:(i + 1) * n_cols])
+            for i in range(n_rows)]
+    return np.vstack(rows)
+
+
+def draw_final_overlay(image_bgr: np.ndarray, host: np.ndarray,
+                       contour: np.ndarray | None) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    desat = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    base = cv2.addWeighted(image_bgr, 0.5, desat, 0.5, 0)
+    base[host == 0] = (base[host == 0] * 0.6).astype(np.uint8)
+    if contour is not None:
+        cv2.drawContours(base, [contour], -1, (0, 200, 255), 3)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
     p = argparse.ArgumentParser(
-        description='Physics-knowledge-based graphite/backgate detector')
-    p.add_argument('--image', required=True,
-                   help='bottom_part microscope image')
+        description='Graphite/backgate detector on bottom_part')
+    p.add_argument('--image', required=True)
     p.add_argument('--pixel-size', type=float, required=True)
     p.add_argument('--output-dir', required=True)
-    p.add_argument('--bottom-hbn-mask', required=True,
-                   help='bottom_hBN footprint in bottom_part pixel coords (.png)')
-    p.add_argument('--graphene-mask', default=None,
-                   help='graphene mask in top_part coords (.png). Optional but '
-                        'strongly recommended -- enables P2 seeding.')
-    p.add_argument('--warp-top', default=None,
-                   help='align/warp_top.npy (full_stack → top_part)')
-    p.add_argument('--warp-bottom', default=None,
-                   help='align/warp_sift_bottom.npy (full_stack → bottom_part)')
-    p.add_argument('--full-stack-image', default=None,
-                   help='full_stack_raw.jpg (only needed for shape reference '
-                        'when projecting graphene)')
-    p.add_argument('--graphene-mirror', action='store_true',
-                   help='Set if graphene was detected with --mirror.')
-    p.add_argument('--seed-points', default=None,
-                   help='"X1,Y1;X2,Y2;..." in bottom_part px. Agent visual '
-                        'override when auto-seed (P2 intersection) is empty.')
-    # CLI compat (unused)
-    p.add_argument('--cluster-id', type=int, default=None)
-    p.add_argument('--n-sub-clusters', type=int, default=None)
-    p.add_argument('--min-area', type=int, default=None)
+    p.add_argument('--cluster-id', type=int, default=0,
+                   help='Rank to pick as final graphite (0 = top score).')
+    p.add_argument('--top-n', type=int, default=DEFAULT_TOP_N,
+                   help=f'Candidates in panel (default {DEFAULT_TOP_N}, '
+                        f'max {MAX_TOP_N}).')
+    p.add_argument('--refine-iters', type=int, default=DEFAULT_REFINE_ITERS,
+                   help=f'Region-grow iterations (default {DEFAULT_REFINE_ITERS}, '
+                        f'max {MAX_REFINE_ITERS}).')
+    p.add_argument('--min-cc-um2', type=float, default=20.0,
+                   help='Carved-CC area floor in um^2 (default 20).')
+    p.add_argument('--refine-lambda', type=float, default=0.5,
+                   help='LAB extension strictness in refinement '
+                        '(d_seed < lambda * d_bulk; default 0.5).')
     args = p.parse_args()
 
+    top_n = max(1, min(int(args.top_n), MAX_TOP_N))
+    refine_iters = max(1, min(int(args.refine_iters), MAX_REFINE_ITERS))
+
     img_path = os.path.abspath(os.path.expanduser(args.image))
-    img = cv2.imread(img_path)
-    if img is None:
+    image = cv2.imread(img_path)
+    if image is None:
         print(f'ERROR: cannot read image: {img_path}', file=sys.stderr)
-        sys.exit(1)
-    h, w = img.shape[:2]
-
-    bhbn = cv2.imread(os.path.abspath(os.path.expanduser(args.bottom_hbn_mask)),
-                       cv2.IMREAD_GRAYSCALE)
-    if bhbn is None:
-        print(f'ERROR: cannot read bottom_hbn mask: {args.bottom_hbn_mask}',
-              file=sys.stderr)
-        sys.exit(1)
-    if bhbn.shape != (h, w):
-        # Bottom_hBN mask must already be in bottom_part coords. If it isn't
-        # (size mismatch), fail loudly rather than silently warping.
-        print(f'ERROR: bottom_hbn mask shape {bhbn.shape} != image shape {(h, w)}.\n'
-              f'  Expected the bottom_part-coords mask (bottom_hbn_mask_bp.png).',
-              file=sys.stderr)
-        sys.exit(1)
-
-    graphene_bp: np.ndarray | None = None
-    if args.graphene_mask:
-        gm = cv2.imread(os.path.abspath(os.path.expanduser(args.graphene_mask)),
-                         cv2.IMREAD_GRAYSCALE)
-        if gm is None:
-            print(f'WARN: cannot read graphene mask {args.graphene_mask}; '
-                  'continuing without P2 seed.', file=sys.stderr)
-        elif args.warp_top and args.warp_bottom and args.full_stack_image:
-            wt = np.load(os.path.abspath(os.path.expanduser(args.warp_top)))
-            wb = np.load(os.path.abspath(os.path.expanduser(args.warp_bottom)))
-            fs = cv2.imread(os.path.abspath(os.path.expanduser(args.full_stack_image)))
-            if fs is None:
-                print('WARN: cannot read full_stack image; skipping graphene '
-                      'projection.', file=sys.stderr)
-            else:
-                fs_h, fs_w = fs.shape[:2]
-                graphene_bp = _project_graphene_to_bottom_part(
-                    gm, (h, w), (fs_h, fs_w), wt, wb, args.graphene_mirror)
-        else:
-            print('WARN: --graphene-mask given but --warp-top / --warp-bottom / '
-                  '--full-stack-image missing; cannot project graphene to '
-                  'bottom_part coords. Continuing without P2 seed.',
-                  file=sys.stderr)
-
-    seed_pts = _parse_seed_points(args.seed_points)
+        return 1
+    h, w = image.shape[:2]
+    pixel_size = float(args.pixel_size)
 
     out_dir = Path(os.path.abspath(os.path.expanduser(args.output_dir)))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    result = detect(img, bhbn, graphene_bp, args.pixel_size,
-                    manual_seed_points=seed_pts)
-
-    final = result['mask']
-    contour = result['contour']
-
-    if contour is None or (final > 0).sum() == 0:
-        # Truly no signal anywhere. Emit empty-but-honest result.
-        print('WARN: graphite detector produced an empty mask (low_confidence). '
-              'No CC inside bottom_hbn matches the seed colour model.',
-              file=sys.stderr)
-        cv2.imwrite(str(out_dir / 'graphite_mask.png'), np.zeros((h, w), np.uint8))
+    # 1-2. Host detection
+    host, image_lab, mu_sub, sub_corner, t_star = compute_host(
+        image, pixel_size)
+    host_area_px = int((host > 0).sum())
+    host_area_um2 = host_area_px * pixel_size * pixel_size
+    print(f'host: {host_area_um2:.0f} um2  corner={sub_corner}  '
+          f'T*={t_star:.1f}  mu_sub_LAB=['
+          f'{mu_sub[0]:.0f},{mu_sub[1]:.0f},{mu_sub[2]:.0f}]')
+    if host_area_px < max(500, int(HOST_MIN_AREA_UM2 / (pixel_size ** 2))):
+        print('ERROR: host region too small', file=sys.stderr)
+        cv2.imwrite(str(out_dir / 'graphite_mask.png'),
+                    np.zeros((h, w), np.uint8))
         np.save(str(out_dir / 'graphite_contour.npy'),
                 np.zeros((0, 2), dtype=np.float64))
-        diag = desaturate(img, factor=0.4)
-        cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'), diag)
-        cv2.imwrite(str(out_dir / '00_graphite_candidates.png'), diag)
-        sidecar = {'area_px': 0, 'area_um2': 0.0, 'low_confidence': True,
-                   'seed_source': result.get('seed_source'),
-                   'reason': 'empty_after_classification'}
-        (out_dir / 'graphite_result.json').write_text(json.dumps(sidecar, indent=2))
-        return
+        (out_dir / 'graphite_result.json').write_text(json.dumps({
+            'area_px': 0, 'area_um2': 0.0, 'pixel_size_um': pixel_size,
+            'host': {'area_um2': round(host_area_um2, 2)},
+            'substrate': {'corner': sub_corner,
+                          'mu_lab': [float(x) for x in mu_sub.tolist()]},
+            'selected': None, 'top_candidates': [],
+            'low_confidence': True,
+        }, indent=2))
+        return 2
+
+    # 3. Codex ridge pipeline
+    ms_min = compute_ms_min(image_lab, host)
+    _, codex_edge, codex_min_size = codex_ridge_pipeline(ms_min, host)
+    print(f'codex: adaptive min_size={codex_min_size} px  '
+          f'edge px={int((codex_edge > 0).sum())}')
+
+    # 4. Carve regions
+    lab_r, cc_records = carve_regions(host, codex_edge, pixel_size,
+                                       args.min_cc_um2)
+    print(f'carved CCs: {len(cc_records)} '
+          f'(min_size={args.min_cc_um2:.0f} um^2)')
+
+    # 5. K-union
+    merged = k_union(image_lab, host, lab_r, cc_records, pixel_size)
+
+    # 6. Score
+    bulk_mu_lab = compute_bulk_mode(image_lab, host)
+    print(f'bulk_mu_LAB=[{bulk_mu_lab[0]:.0f},'
+          f'{bulk_mu_lab[1]:.0f},{bulk_mu_lab[2]:.0f}]')
+    ranked = score_candidates(merged, image_lab, host, bulk_mu_lab, pixel_size)
+
+    # 7. Refine
+    refine_candidates(ranked, image_lab, host, bulk_mu_lab,
+                       iters=refine_iters, lam=args.refine_lambda,
+                       pixel_size=pixel_size)
+
+    print(f'merged candidates: {len(ranked)}')
+    for rank in range(min(len(ranked), top_n)):
+        c = ranked[rank]
+        print(f'  #{rank}: area={c["area_um2"]:.0f}um2 -> '
+              f'refined={c["refined_area_um2"]:.0f}um2  '
+              f's_strip={c["s_strip"]:.2f}(asp={c["aspect"]:.1f}) '
+              f's_central={c["s_central"]:.2f} '
+              f's_gray={c["s_gray"]:.2f}(c={c["chroma"]:.0f}) '
+              f'score={c["score"]:.3f}')
+
+    # --- Final selection + outputs ---
+    sel_rank = int(args.cluster_id)
+    low_confidence = False
+    if not ranked:
+        print('ERROR: no candidates after scoring.', file=sys.stderr)
+        sel = None
+        low_confidence = True
+    elif sel_rank < 0 or sel_rank >= len(ranked):
+        print(f'WARN: --cluster-id={sel_rank} out of range '
+              f'[0, {len(ranked) - 1}]; falling back to 0',
+              file=sys.stderr)
+        sel_rank = 0
+        sel = ranked[0]
+        low_confidence = True
+    else:
+        sel = ranked[sel_rank]
+
+    # Always write refined_candidates panel (the diagnostic for agents)
+    cv2.imwrite(str(out_dir / 'refined_candidates.png'),
+                draw_refined_candidates(image, ranked, top_n, sel_rank))
+
+    if sel is None:
+        cv2.imwrite(str(out_dir / 'graphite_mask.png'),
+                    np.zeros((h, w), np.uint8))
+        np.save(str(out_dir / 'graphite_contour.npy'),
+                np.zeros((0, 2), dtype=np.float64))
+        cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'),
+                    draw_final_overlay(image, host, None))
+        (out_dir / 'graphite_result.json').write_text(json.dumps({
+            'area_px': 0, 'area_um2': 0.0, 'pixel_size_um': pixel_size,
+            'host': {'area_um2': round(host_area_um2, 2),
+                     'mu_bulk_lab': [float(x) for x in bulk_mu_lab.tolist()]},
+            'substrate': {'corner': sub_corner,
+                          'mu_lab': [float(x) for x in mu_sub.tolist()]},
+            'selected': None, 'top_candidates': [],
+            'low_confidence': True,
+            'params': {'cluster_id': args.cluster_id, 'top_n': top_n,
+                       'refine_iters': refine_iters,
+                       'min_cc_um2': args.min_cc_um2,
+                       'refine_lambda': args.refine_lambda},
+        }, indent=2))
+        return 3
+
+    final = sel['refined_mask']
+    cnts, _ = cv2.findContours(final, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(cnts, key=cv2.contourArea) if cnts else None
+    area_px = int((final > 0).sum())
+    area_um2 = round(area_px * pixel_size * pixel_size, 2)
+    if sel['score'] < LOW_CONFIDENCE_FLOOR:
+        low_confidence = True
 
     cv2.imwrite(str(out_dir / 'graphite_mask.png'), final)
-    contour_2d = contour.reshape(-1, 2).astype(np.float64)
-    np.save(str(out_dir / 'graphite_contour.npy'), contour_2d)
+    if contour is not None:
+        np.save(str(out_dir / 'graphite_contour.npy'),
+                contour.reshape(-1, 2).astype(np.float64))
+    else:
+        np.save(str(out_dir / 'graphite_contour.npy'),
+                np.zeros((0, 2), dtype=np.float64))
+    cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'),
+                draw_final_overlay(image, host, contour))
 
-    diag = desaturate(img, factor=0.4)
-    # Draw the bottom_hBN search region in faint blue + seed in faint magenta
-    # + the final graphite contour in yellow so the diagnostic shows the
-    # full reasoning chain at a glance.
-    bhbn_contours, _ = cv2.findContours((bhbn > 0).astype(np.uint8) * 255,
-                                        cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(diag, bhbn_contours, -1, (200, 100, 0), 1)
-    if graphene_bp is not None:
-        gp_contours, _ = cv2.findContours(
-            (graphene_bp > 0).astype(np.uint8) * 255,
-            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(diag, gp_contours, -1, (180, 0, 180), 1)
-    cv2.drawContours(diag, [contour], -1, (0, 200, 255), 2)
-    cv2.imwrite(str(out_dir / '01_graphite_on_bottom.png'), diag)
-    cv2.imwrite(str(out_dir / '00_graphite_candidates.png'), diag)
+    top_list = []
+    for rank in range(min(len(ranked), top_n)):
+        c = ranked[rank]
+        top_list.append({
+            'rank': rank,
+            'area_um2': round(c['area_um2'], 2),
+            'refined_area_um2': round(c['refined_area_um2'], 2),
+            'mean_lab': [round(float(x), 1) for x in c['mean_lab'].tolist()],
+            's_strip': round(c['s_strip'], 3),
+            's_central': round(c['s_central'], 3),
+            's_gray': round(c['s_gray'], 3),
+            's_contrast': round(c['s_contrast'], 3),
+            's_cohere': round(c['cohere'], 3),
+            'aspect': round(c['aspect'], 2),
+            'chroma': round(c['chroma'], 2),
+            'contrast_vs_bulk': round(c['contrast_vs_bulk'], 2),
+            'score': round(c['score'], 4),
+            'source_Ks': sorted(c.get('source_Ks', [])),
+            'lab_ids': c.get('lab_ids', []),
+        })
 
-    area_px = int((final > 0).sum())
-    area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
     sidecar = {
         'area_px': area_px,
         'area_um2': area_um2,
-        'low_confidence': bool(result.get('low_confidence', False)),
-        'seed_source': result.get('seed_source'),
-        'seed_area_um2': result.get('seed_area_um2'),
-        'bg_area_um2': result.get('bg_area_um2'),
-        'lab_separation': result.get('lab_separation'),
-        'n_search_pixels': result.get('n_search_pixels'),
-        'manual_seed_points': seed_pts if seed_pts else None,
+        'pixel_size_um': pixel_size,
+        'selected': {
+            'rank': sel_rank,
+            'score': round(sel['score'], 4),
+            'area_um2': round(sel['refined_area_um2'], 2),
+        },
+        'host': {
+            'area_um2': round(host_area_um2, 2),
+            'mu_bulk_lab': [round(float(x), 2) for x in bulk_mu_lab.tolist()],
+            't_star': round(float(t_star), 2),
+        },
+        'substrate': {
+            'corner': sub_corner,
+            'mu_lab': [round(float(x), 2) for x in mu_sub.tolist()],
+        },
+        'top_candidates': top_list,
+        'low_confidence': bool(low_confidence),
+        'params': {
+            'cluster_id': args.cluster_id,
+            'top_n': top_n,
+            'refine_iters': refine_iters,
+            'min_cc_um2': args.min_cc_um2,
+            'refine_lambda': args.refine_lambda,
+        },
     }
-    (out_dir / 'graphite_result.json').write_text(json.dumps(sidecar, indent=2))
-    print(f'OK: graphite area={area_um2}um² ({area_px}px) '
-          f'seed={result.get("seed_source")} '
-          f'low_confidence={result.get("low_confidence")}')
+    (out_dir / 'graphite_result.json').write_text(
+        json.dumps(sidecar, indent=2))
+
+    print(f'OK: selected #{sel_rank} area={area_um2}um2 '
+          f'score={sel["score"]:.3f} low_confidence={low_confidence}')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

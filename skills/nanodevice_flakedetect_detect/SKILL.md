@@ -7,26 +7,20 @@ description: Detect individual material layers (graphite, graphene, bottom hBN, 
 
 Detect each material from its optimal source image. Four independent scripts, one per material.
 
-- **graphite** (or backgate-metal) — three first-class candidate detectors. The agent picks one based on stack appearance and upstream artifacts:
-  - `graphite.py` — **physics-driven** (default): search inside `bottom_hBN` (P1), seed from `bottom_hBN ∩ graphene-projection` or from agent-supplied seed points (P2), grow by LAB Mahalanobis. No fitted priors.
-  - `graphite_c3.py` — **priors ensemble**: B1 logistic + B2 multi-K K-means + B3 threshold sweep, scored against fitted shape priors. Sample-tuned. Use when the stack matches the AH/ml training distribution.
-  - `graphite_baseline.py` — **legacy K-means darkest cluster** with `--cluster-id` agent override. Sanity-check baseline.
+- **graphite** (or backgate-metal) — `graphite.py`. Single adaptive pipeline that produces a ranked list of candidates and lets the agent pick which one is graphite via `--cluster-id` (vision-required). All other parameters are knobs the agent can tune ONLY when the candidate the agent wanted to pick isn't in the top-N panel.
 - **graphene** — K-means sub-clustering inside the top-flake mask, brightest cluster.
 - **bottom_hBN** — multi-K (4/6/8) K-means + HSV-gate union candidates over GT-fitted priors. Picks the highest-scoring candidate.
 - **top_hBN** — copies the footprint from the align step.
 
-`graphite.py` (physics-driven) requires `--bottom-hbn-mask` and accepts `--graphene-mask` (auto-seed) and/or `--seed-points` (agent override). The legacy `--cluster-id` / `--n-sub-clusters` / `--n-clusters` flags are kept for CLI compatibility but **ignored** by `graphite_c3.py` and `bottom_hbn.py`; the ensemble / scorer selects automatically. `graphene.py` and `graphite_baseline.py` still respect `--cluster-id`.
-
 ### Never-empty fallback
 
-All three graphite candidate scripts always emit a real-sized blob. When all internal scoring gates reject every candidate (or when the physics seed produces no connected region), the script falls back: physics→ uses the supplied seed mask (or whole bottom_hBN) as a low-confidence guess; C3 → highest-scored non-empty mask; bottom_hbn → largest CC of the loose color gate. All set `low_confidence: true` in the result JSON. This replaces the old behaviour of writing a 5×5 px placeholder / empty mask, which silently broke downstream combine on stacks like HM05 / HM06 / HM07. Orchestrators should treat `low_confidence: true` as a signal to escalate to vision-review rather than as a hard failure.
+`graphite.py` always emits a real-sized blob. If a stack produces zero candidates after scoring, the script writes an empty mask with `low_confidence: true`. Orchestrators should treat `low_confidence: true` as a signal to escalate to vision-review rather than as a hard failure.
 
 ## Prerequisites
 
 - Conda env with opencv, numpy, scikit-learn
 - Source images for each material
-- For `graphite.py` (physics-driven): `bottom_hbn_mask_bp.png` from a *prior* `bottom_hbn.py` run (it now writes both full-stack and bottom-part-coords masks). Optional but recommended: `graphene_mask.png` + `warp_top.npy` + `warp_sift_bottom.npy` + `full_stack_raw.jpg` for the P2 auto-seed.
-- For `graphite_c3.py` and `graphite_baseline.py`: just `bottom_part.jpg` (each runs its own host-region segmentation).
+- For `graphite.py`: just `bottom_part.jpg` + pixel size. The script runs its own substrate / host detection — no upstream dependencies.
 - For `bottom_hbn.py`: `warp_sift_bottom.npy` from the align step + `full_stack_raw.jpg` for warp target.
 - For `top_hbn.py`: `footprint_mask.png` from the align step.
 - All scripts: `conda run -n instrMCPdev python <script>`
@@ -35,12 +29,12 @@ All three graphite candidate scripts always emit a real-sized blob. When all int
 
 ## Agent Workflow
 
-**Pipeline ordering changed**: `graphite.py` (physics) depends on the bottom_hbn output and (optionally) on the graphene + top-alignment outputs. Run order:
+All four detectors are independent — `bottom_hbn.py`, `graphene.py`, `top_hbn.py`, and `graphite.py` can run in parallel.
 
 ```
 1. Run bottom_hbn.py on bottom_part (needs warp_sift_bottom.npy + full_stack_raw)
-   → Writes BOTH bottom_hbn_mask.png (full_stack coords) and
-     bottom_hbn_mask_bp.png (bottom_part coords; consumed by graphite.py).
+   → Writes bottom_hbn_mask.png (full_stack coords) + bottom_hbn_mask_bp.png
+     (bottom_part coords).
    → Inspect bottom_hbn_result.json: check `low_confidence`, `fallback_source`.
 
 2. Run graphene.py on top_part [--mirror]
@@ -48,85 +42,90 @@ All three graphite candidate scripts always emit a real-sized blob. When all int
 
 3. Run top_hbn.py (copies footprint from align) → 04_top_hbn_footprint.png.
 
-4. Run graphite.py on bottom_part — pick a candidate detector:
-   ├─ graphite.py (physics, default): pass --bottom-hbn-mask and (preferred)
-   │  --graphene-mask + warps so the auto-seed via P2 works. If outline
-   │  looks wrong, re-run with --seed-points "X,Y" (agent visual judgement).
-   ├─ graphite_c3.py: priors-based ensemble. Use as a second opinion or
-   │  when stack matches AH/ml training distribution.
-   └─ graphite_baseline.py: legacy K-means darkest cluster + --cluster-id.
-   → Inspect graphite_result.json: low_confidence flag, seed_source,
-     lab_separation. Treat low_confidence outputs as hints, not authoritative.
+4. Run graphite.py on bottom_part:
+   → First run with defaults; review refined_candidates.png.
+   → Pick the candidate that is visually graphite via --cluster-id <rank>.
+   → If graphite isn't in the top-8 panel, tune the other parameters
+     described below (--top-n, --refine-iters, --min-cc-um2, --refine-lambda).
 
 5. Assemble detections.json (see template below).
 ```
 
-`bottom_hbn`, `graphene`, `top_hbn` can still run in parallel; only `graphite.py` (physics) is sequential because it consumes their outputs.
-
 ---
 
-## Graphite Detection — Three Candidate Detectors
+## Graphite Detection — `graphite.py`
 
-The graphite (or backgate-metal) detection problem has three first-class candidate scripts. **The agent picks which to run** based on the stack's appearance and what upstream artifacts are available. All three live in `skills/nanodevice_flakedetect_detect/scripts/` and share the same output filenames so they're drop-in compatible with the rest of the pipeline.
+One adaptive pipeline. Every per-stack threshold is data-driven — no priors, no sample-tuned constants. The script produces a ranked list of candidates (`refined_candidates.png`) and the agent picks which one is the graphite via `--cluster-id`.
 
-| Script | Approach | When to pick |
-|--------|---------|--------------|
-| `graphite.py` (default) | **Physics-driven**, principle-based: search inside `bottom_hBN` (P1), seed from `bottom_hBN ∩ graphene-projection` or from agent-supplied seed points (P2), grow by relative LAB-Mahalanobis. No fitted priors. | First choice. Works without any sample-tuned thresholds; graphite shape & area are unconstrained. |
-| `graphite_c3.py` | **Priors ensemble**: three sub-detectors (B1 logistic regression, B2 multi-K K-means, B3 threshold sweep) scored against `graphite_shape_priors.json` / `graphite_priors.json` / `graphite_classifier.json`. Hard gates `aspect ≥ 3.5` and `area ∈ [145, 3577] µm²`. | When the stack matches the priors training set (ML/AH/QH stacks where graphite is a thin elongated dark strip ≤3000 µm² inside cyan hBN). Fastest to run; deterministic per-image. |
-| `graphite_baseline.py` | Original simple K-means: HSV-cyan host region, k=4 sub-clusters in LAB, pick darkest. Two-pass with `--cluster-id` agent override. | Sanity-check baseline. Useful when the other two disagree and you need a third opinion. |
+**Pipeline overview** (each step is internally adaptive):
 
-### Picking between candidates
+1. **Substrate**: pick `mu_sub` from the joint LAB histogram `H_corners × H_image × L`. Per-corner means fail when corners are mixed; histogram modes plus the L-brightness factor pick the brightest material that appears in BOTH the corners and the image at large.
+2. **Host mask** = pixels with LAB distance to `mu_sub` above a plateau-midpoint T*. Multi-scale local-baseline peak detection on `dA(T)/dT`; T* lives in the valley between the substrate peak and the first-flake peak.
+3. **Codex ridge map**: `ms_min` gradient → percentile clip + sqrt gamma → MAX of Frangi + Sato + Meijering → hysteresis (in-host p82, p96) → adaptive `remove_small_objects` (plateau in the CC-area distribution).
+4. **Carve** `host \ dilated(codex_edge)` → connected components.
+5. **K-union**: K-means at `K ∈ [3 .. n_ccs]`; group same-cluster + spatially-adjacent CCs; union across K with IoU dedupe.
+6. **Score** each merged candidate:
+   - `s_strip = 1 − √(λ_min / λ_max)` from PCA on pixel positions (graphite is a strip)
+   - `s_central = mean(distance_transform) / max(dt)` over the candidate (real flakes deposit toward host centre)
+   - `s_gray = 1 − chroma / 30` from the candidate's mean a,b
+   - `s_contrast = min(1, dist_to_bulk_mode / 50)`
+   - `s_cohere` = largest-CC fraction
+   - `score = 0.3·strip + 0.3·central + 0.15·gray + 0.15·contrast + 0.1·cohere`
+7. **Refine** each candidate via 5 iterations of local-mean region grow (frontier pixel admitted if its LAB is close to the LOCAL mean of nearby refined pixels, gated against bulk by `d_local < λ · d_bulk`).
+8. **Output** the top-N panel + selected mask.
 
-```
-Is bottom_hBN_mask available (always)? Is graphene mask + warps available (post-detect/align)?
-  ├─ Yes to both → run graphite.py with --bottom-hbn-mask + --graphene-mask + --warp-top + --warp-bottom + --full-stack-image. Inspect graphite_result.json: low_confidence=false + winner_score absent (physics has no score). If outline looks correct → DONE.
-  ├─ Outline wrong → re-run graphite.py with --seed-points "X,Y" (agent visual judgement, bottom_part px coords). The manual seed always overrides graphene auto-seed.
-  └─ Both auto AND manual seed produce poor outline → run graphite_c3.py as a second opinion. If C3's winner_score > 0.5 and the outline is plausible, accept it.
-```
+### Parameters
 
-When the agent disagrees with all three candidates, it's expected to commit a manual mask via `skills/nanodevice_flakedetect_detect/scripts/commit_mask.py` (manual override path).
+| Flag | Default | Range | When to touch |
+|---|---|---|---|
+| **`--cluster-id`** | `0` | `0 .. top_n-1` | **Most frequently used.** The agent inspects `refined_candidates.png` visually and sets this to the rank that IS the graphite. The auto-pick (rank 0) is the highest-scoring strip-shaped non-bulk candidate; agent vision is the ground truth. |
+| `--top-n` | `8` | `1 .. 12` | Show MORE candidates in the panel when graphite isn't in the default top-8 list (rare). The JSON sidecar also reports `top_n` candidates so the agent can read scores even outside the panel. |
+| `--refine-iters` | `5` | `1 .. 10` | Increase ONLY if the refined contour visibly under-grows (truncated at the rough region's boundary) — usually because the flake has a gradual colour gradient that needs more iterations to walk through. Decrease only if a candidate is over-growing into bulk (rare with current λ). |
+| `--min-cc-um2` | `20` | `10 .. 50` | Lower when a small graphite gets thrown out at the carving step — typical signal: the desired candidate appears in `01_graphite_on_bottom.png` but not in `refined_candidates.png`. Raise only when many tiny noise CCs clutter the panel. |
+| `--refine-lambda` | `0.5` | `0.3 .. 1.0` | Lower (0.3) if a candidate is flooding into bulk during refinement. Raise (0.7+) ONLY if the candidate is under-growing AND `refine-iters` already at max — the candidate's colour is unusually close to bulk and needs the LAB test relaxed. |
 
-### `graphite.py` — physics-driven (default)
+`--cluster-id` is the only parameter the agent uses every run. **Everything else is fallback** for the case where the agent looked at `refined_candidates.png` and the graphite it wants to pick isn't there — at which point the agent reasons about *why* (too small? excluded by area floor? not refined enough? flooded?) and adjusts the appropriate parameter.
 
-**Principles encoded**:
-
-- **P1.** `graphite_polygon ⊆ bottom_hBN_polygon` — search domain is the bottom_hBN footprint.
-- **P2.** `graphite_polygon ∩ graphene_polygon ≠ ∅` — seed at `bottom_hBN ∩ graphene-projection` (or agent-supplied points).
-
-**Algorithm**: build a per-image Gaussian colour model from the seed disk (initial 5 µm), then grow the connected component of pixels with LAB-Mahalanobis distance to the *fixed initial seed model* below 9.0 (3-sigma). No iterative re-fit (prevents the model from widening into bare bottom_hBN). No absolute LAB / area / aspect thresholds. Final dilation 0.5 µm.
-
-```bash
-# Auto-seed via graphene projection
-conda run -n instrMCPdev python graphite.py \
-    --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
-    --bottom-hbn-mask <align/bottom_hbn_mask_bp.png> \
-    --graphene-mask <detect/graphene_mask.png> --graphene-mirror \
-    --warp-top <align/warp_top.npy> \
-    --warp-bottom <align/warp_sift_bottom.npy> \
-    --full-stack-image <input/full_stack_raw.jpg>
-
-# Agent-supplied seed point(s) — overrides auto-seed
-conda run -n instrMCPdev python graphite.py \
-    --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
-    --bottom-hbn-mask <align/bottom_hbn_mask_bp.png> \
-    --seed-points "1234,567"
-```
-
-**Key result fields** (`graphite_result.json`):
-- `seed_source` — `bottom_hbn_intersect_graphene`, `manual_points`, `manual_points_fallback_to_search_region`, etc.
-- `low_confidence: true` — auto-seed was empty / the colour model couldn't separate graphite from bg / classification produced no CC connected to the seed. Spawn vision-review and consider supplying `--seed-points` manually.
-- `lab_separation` — Euclidean distance between seed_mu and bg_mu in LAB. < 3.0 means graphite & bottom_hBN colours are effectively indistinguishable in this image; treat output as a hint only.
-
-### `graphite_c3.py` — priors ensemble (alternate)
-
-Method, hard gates, and confidence score as in §"C3 Ensemble" of the previous design (preserved here for orthogonal-comparison runs). Same CLI as `graphite.py` minus the `--bottom-hbn-mask` / `--graphene-mask` / `--warp-*` arguments — C3 derives its own host-region HSV gate from `bottom_part.jpg` directly. Uses `graphite_shape_priors.json` etc. at the repo root. **Strictly sample-tuned** — fails on stacks outside the AH/ml training distribution.
+### Usage
 
 ```bash
-conda run -n instrMCPdev python graphite_c3.py \
+# First pass — auto-pick top, generate refined_candidates.png for review
+conda run -n instrMCPdev python graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path>
+
+# Agent reviewed the panel — graphite is rank #2 in the panel
+conda run -n instrMCPdev python graphite.py \
+    --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
+    --cluster-id 2
+
+# Graphite not in top-8: raise top-n + lower area floor to expose more candidates
+conda run -n instrMCPdev python graphite.py \
+    --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
+    --top-n 12 --min-cc-um2 10
+
+# Refined contour visibly truncated at the rough region's boundary
+conda run -n instrMCPdev python graphite.py \
+    --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
+    --cluster-id 0 --refine-iters 8
 ```
 
-**Outputs (all three candidates)**: `graphite_mask.png`, `graphite_contour.npy`, `graphite_result.json`, `00_graphite_candidates.png`, `01_graphite_on_bottom.png`
+### Outputs
+
+| File | Purpose |
+|---|---|
+| **`refined_candidates.png`** | Top-N panel with refined masks, scores, aspect, gray/strip/central components. The selected `--cluster-id` rank is bordered yellow. Inspect this first. |
+| `graphite_mask.png` | Final binary mask (uint8, bottom_part coords) of the selected candidate. |
+| `graphite_contour.npy` | (N, 2) float64 contour points in bottom_part px. |
+| `graphite_result.json` | Sidecar: selected rank/score/area, top-N list with all score components, host area + bulk mu_LAB, substrate corner + mu_LAB, T*, `low_confidence` flag, params used. |
+| `01_graphite_on_bottom.png` | Selected candidate's contour over a desaturated image — quick visual sanity check on the final outline. |
+
+### Reading `graphite_result.json`
+
+- `selected.rank` / `selected.score` — the candidate written to `graphite_mask.png`
+- `low_confidence: true` when `score < 0.40` or when carving produced no candidates — the orchestrator should escalate to vision-review
+- `top_candidates[]` — full list (length up to `top_n`) with `score`, `s_strip`, `s_central`, `s_gray`, `s_contrast`, `s_cohere`, `aspect`, `chroma`, `contrast_vs_bulk`, `area_um2`, `refined_area_um2`, `source_Ks` (which K values produced the candidate), `lab_ids` (which carved CCs were merged)
+- `host.mu_bulk_lab` — mode of host LAB (the "bulk hBN colour" reference used by `s_contrast`)
+- `substrate.mu_lab` — substrate sample from the joint histogram
 
 ---
 
@@ -166,29 +165,24 @@ conda run -n instrMCPdev python graphene.py \
 
 ## Bottom hBN Detection
 
-**Method**: Detects the bottom hBN directly from the `bottom_part` image (where it is the only hBN visible on the substrate), then warps the detection into full_stack coordinates using the SIFT warp matrix from the align step.
+**Method**: shares the first step of `graphite.py`. The bottom hBN region IS the host produced by substrate rejection — on every bench stack the largest non-substrate connected component in `bottom_part` is the bottom hBN.
 
-Each `bottom_part` image generates several candidate masks:
+1. Substrate sample `mu_sub` = LAB peak of `H_corners × H_image × L` (joint histogram mode of corner + image pixels, weighted by brightness).
+2. Host mask = pixels with LAB distance to `mu_sub` above plateau-midpoint `T*` (multi-scale local-baseline peak detection on `dA(T)/dT`, midpoint of the valley between substrate peak and first-flake peak).
+3. Morph clean → keep largest CC → 4-corner flood-fill-holes.
+4. Warp from bottom_part to full_stack coords via the SIFT-derived affine matrix from align step.
+5. Final 1.5 µm dilation to match the GT-dilation convention.
 
-1. `union_tight` — HSV gate `(s>80) & (80<h<130)` + `morph_clean(close_k=7, open_k=7)` + `keep_largest_n`.
-2. `union_filled` — same as above plus flood-fill (re-incorporates dark interior holes such as the graphite tongue).
-3. `kmeans_K{4,6,8}_c<i>` — K-means clusters in LAB at K∈{4,6,8} masked by the loose color gate, broken into connected components.
-4. `kmeans_union_K{4,6,8}_top1` — union of the top-1 saturated cluster only (the legacy `top2` / `top3` unions were removed because they over-merged neighboring blue debris on AH stacks).
+`compute_host` is imported directly from `graphite.py` — single source of truth for substrate detection. No priors, no fitted thresholds, no `bottom_hbn_shape_priors.json` dependency.
 
-Every candidate is scored by `_score_cc` against `bottom_hbn_shape_priors.json` (Gaussian likelihood over area / aspect / solidity / LAB / HSV). The highest-scoring candidate wins. Final post-process: `morph_clean(close_k=11, open_k=5)`, `keep_largest_n`, `flood_fill_holes`, then a 1.5 µm dilation to match the GT-dilation convention.
-
-### Never-empty fallback
-
-If *every* candidate is rejected by the score gate (typical when GT bottom_hBN is unusually small / unusually colored — e.g. HM05 GT=742 µm² is below `0.4 × area_um2_min = 2644 µm²`), the script no longer returns an empty mask. It falls back to the largest connected component of the loose color gate (filled), and sets `low_confidence: true` in `bottom_hbn_result.json`. This replaces the silent EMPTY behaviour that was breaking HM05 in the bench.
-
-### When it still fails — known limitations
+### Edge cases
 
 | Symptom | Likely cause | Action |
-|---------|-------------|--------|
-| Contour traces the whole visible cyan region, but GT polygon is much smaller | Visible flake includes graphite + bottom_hBN merged in 2D, and the score function picks the larger blob | Inspect the candidate list in the priors-fit log; consider re-fitting priors with the actual stack |
-| Contour is offset from visible flake | SIFT warp inaccurate | Check inliers reported by `sift_align.py`; rerun with adjusted parameters |
-| Contour misses the bottom_hBN entirely (LOW ratio) | K-means split bottom_hBN across clusters AND the union path was rejected by the area gate | Confirm the loose color gate sees blue at the expected location; expand priors area band |
-| Contour is much larger than expected (HIGH ratio) | `union_tight` or a K-means cluster bridges the bottom_hBN with neighboring blue debris | The `close_k=7` reduction limits this — if it persists, the visible flake genuinely is the merged region |
+|---|---|---|
+| Contour traces the whole visible cyan region but GT polygon is smaller | The visible flake is bottom_hBN ∪ graphite/gold merged in 2D — `combine.py` doesn't mind because graphite is detected independently | None; the union is the right answer for downstream alignment |
+| Contour offset from visible flake | SIFT warp inaccurate | Check inliers reported by `sift_align.py`; rerun with adjusted parameters |
+| Empty / very small mask (`low_confidence: true`) | `T*` landed at the top of its sweep (no flake peak detected) — bottom_part has no clearly-separable foreground material | Inspect `bottom_hbn_result.json` for `t_star` and `substrate.mu_lab`; if `t_star ≈ 80` the algorithm couldn't find a flake peak. May need vision-review |
+| Host extends across bare substrate (gold-backgate stacks like HM05) | Gold backgate is correctly classified as non-substrate and gets included | Expected — `combine.py` aligns the union (hBN + gold), and `graphite.py` independently localises the gold |
 
 ```bash
 conda run -n instrMCPdev python bottom_hbn.py \
@@ -198,9 +192,7 @@ conda run -n instrMCPdev python bottom_hbn.py \
     --pixel-size <um/px> --output-dir <path>
 ```
 
-The legacy `--n-clusters` flag is ignored — the multi-K sweep covers K=4/6/8.
-
-**Outputs**: `bottom_hbn_mask.png`, `bottom_hbn_contour.npy`, `bottom_hbn_result.json` (with `low_confidence` + `fallback_source` fields), `03_bottom_hbn_on_full.png`
+**Outputs**: `bottom_hbn_mask.png` (full_stack coords), `bottom_hbn_mask_bp.png` (bottom_part coords; kept for backward compat), `bottom_hbn_contour.npy`, `bottom_hbn_result.json` (area + `substrate.{corner, mu_lab, t_star}` + `low_confidence`), `03_bottom_hbn_on_full.png`
 
 ---
 
