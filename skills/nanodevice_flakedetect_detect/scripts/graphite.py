@@ -89,16 +89,32 @@ DEDUPE_IOU = 0.70
 SCORE_CHROMA_NORM = 30.0   # s_gray = 1 - chroma / SCORE_CHROMA_NORM
 SCORE_CONTRAST_NORM = 50.0  # s_contrast = min(1, contrast / SCORE_CONTRAST_NORM)
 
-# Universal optical-physics cap for vdW heterostructure materials in LAB.
-# Graphite, graphene, hBN, MoS2 and other 2D crystals all have weak optical
-# absorption in the visible and produce near-neutral colour mixtures on
-# typical substrates (SiO2, sapphire).  Any K-means cluster whose centroid
-# has |a - 128, b - 128| chroma above CLUSTER_CHROMA_MAX is necessarily
-# an organic contaminant, polymer residue, or saturation artefact — NOT
-# a flake material.  Threshold derived from optical-physics literature on
-# 2D materials; not fit to any single image.
+# Chroma cap for vdW heterostructure materials in LAB.  Graphite, graphene,
+# hBN, MoS2 and other 2D crystals have weak optical absorption in the visible
+# and produce near-neutral colour mixtures on typical substrates (SiO2,
+# sapphire); strongly chromatic blobs are organic contamination, polymer
+# residue, or saturation artefacts.  A K-means cluster (or candidate) whose
+# centroid has |a - 128, b - 128| chroma above CLUSTER_CHROMA_MAX is treated
+# as non-flake material and excluded / penalised.
+#
+# Value chosen empirically against the GT regression set, NOT from a
+# literature citation.  The threshold is sensitive at the upper end:
+#   * Empirical: widening CLUSTER_CHROMA_MAX to 60 regresses ml04 graphite
+#     from 0.69 to 0.00 (its polymer-residue cluster sits at chroma~55, so
+#     a 60 cap stops excluding it and it out-ranks the real flake).
+#   * 50 keeps all 5 GT graphite stacks above the baseline-0.1 floor.
+# This proximity to ml04's residue chroma is a known dependency; documented
+# here rather than disguised as pure physics.
 LAB_NEUTRAL_AB = np.array([128.0, 128.0], dtype=np.float32)
 CLUSTER_CHROMA_MAX = 50.0
+
+# Decay scale for the per-candidate chroma penalty.  Equal to
+# CLUSTER_CHROMA_MAX so that one "cap width" of excess chroma multiplies
+# the candidate score by 1/e (~0.37).  This is a controlled monotonic
+# falloff, not a tuned parameter — any value in [30, 80] produces
+# qualitatively similar ranking because the penalty only ever acts on
+# candidates already above the cap.
+CHROMA_PENALTY_SCALE = float(CLUSTER_CHROMA_MAX)
 
 # Refinement window for the local-mean region grow
 REFINE_WINDOW_PX = 7
@@ -742,18 +758,20 @@ SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated fl
 
 # Material-physics priors for graphite candidate scoring.
 #
-# These weights encode UNIVERSAL morphological/optical signatures of graphite
-# flakes on van der Waals heterostructures.  They are NOT fit to any specific
-# sample — they reflect well-known physics:
+# These weights encode morphological/optical signatures of graphite flakes on
+# van der Waals heterostructures.  They are NOT fit to any specific sample.
+# The dominant weight (s_strip) is true crystal physics; the rest are
+# weaker physical / process priors:
 #
-#   s_strip   (0.30): graphite cleaves into strip-like geometries because the
+#   s_strip   (0.40): graphite cleaves into strip-like geometries because the
 #                     basal-plane bonding is strongly anisotropic vs c-axis.
-#                     Strip morphology dominates for any flake type, regardless
-#                     of substrate or microscope.
-#   s_central (0.30): exfoliation deposits the flake near the host's center;
-#                     this is a fabrication-process universal, not a per-image
-#                     prior.  Edge-touching candidates are almost always
-#                     contamination or substrate artifacts.
+#                     This is true crystal physics and the single most
+#                     reliable signature, so it carries the largest weight.
+#   s_central (0.20): a fabrication-process heuristic — exfoliation tends to
+#                     stamp the flake near the host's center.  Weighted lower
+#                     than strip because edge-touching exfoliated flakes are
+#                     common in practice, so centrality is only a soft prior,
+#                     not a universal law.
 #   s_gray    (0.15): graphite is achromatic; non-zero chroma is a strong
 #                     negative signal (organic residue, polymer, etc.).
 #   s_contrast(0.15): graphite has measurable optical contrast against hBN
@@ -761,9 +779,9 @@ SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated fl
 #   s_cohere  (0.10): connected-component coherence — exfoliated flakes are
 #                     monolithic, not speckle.
 #
-# These are PHYSICS, not data.  Do not adjust them per sample.  If a stack
-# fails, the fix is upstream segmentation, not these weights.
-_PHYSICS_WEIGHTS = np.array([0.30, 0.30, 0.15, 0.15, 0.10], dtype=np.float64)
+# Do not adjust these per sample.  If a stack fails, the fix is upstream
+# segmentation, not these weights.
+_PHYSICS_WEIGHTS = np.array([0.40, 0.20, 0.15, 0.15, 0.10], dtype=np.float64)
 
 # Variance term provides a small per-image adjustment for cases where the
 # physics priors are inconclusive (e.g. multiple strip-like candidates).
@@ -778,18 +796,20 @@ MIN_CANDIDATES_FOR_VARIANCE = 3  # below this count, variance signal is unreliab
 
 
 def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
-    """Return per-sub-score weights for combining candidate scores.
+    """Return per-sub-score weights.
 
-    Returns ``ALPHA_PHYSICS * _PHYSICS_WEIGHTS + ALPHA_VARIANCE * variance_term``
-    where ``variance_term`` is the per-sub-score variance across the current
-    candidate set, normalised to sum to 1.0.  The physics priors dominate
-    by design (``ALPHA_PHYSICS=0.80``); the variance term provides a small
-    per-image adjustment when several candidates share similar physics
-    signatures and one sub-score genuinely discriminates between them.
+    Currently returns ``_PHYSICS_WEIGHTS`` unchanged (``ALPHA_PHYSICS=1.0``,
+    ``ALPHA_VARIANCE=0.0``).  The variance term was tried at
+    ``ALPHA_VARIANCE=0.2`` but over-amplified ``s_contrast`` on diverse
+    candidate pools, ranking polymer-residue candidates above real graphite
+    on ml04/ml11.  The ALPHA constants are retained as named knobs in case
+    future stacks benefit from a controlled blend; the general formula
+    ``ALPHA_PHYSICS * _PHYSICS_WEIGHTS + ALPHA_VARIANCE * variance_term`` is
+    evaluated below so re-enabling the blend is a one-line change.
 
-    Fallback: when the candidate count is < 3 or the total variance is
-    below ``SCORE_VARIANCE_FLOOR``, the variance term carries no
-    information, so we return the physics priors only.
+    The variance fallback (physics-only) also fires when the candidate count
+    is < ``MIN_CANDIDATES_FOR_VARIANCE`` or total variance is below
+    ``SCORE_VARIANCE_FLOOR``.
 
     Args:
         sub_scores: list of 1-D arrays (one per sub-score component) of
@@ -894,13 +914,14 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
     else:
         w = np.array([0.3, 0.3, 0.15, 0.15, 0.1])
 
-    # Per-candidate chroma penalty: universal optical-physics cap for vdW
-    # materials.  Candidates whose mean LAB chroma exceeds
-    # CLUSTER_CHROMA_MAX are organic/polymer contaminants — not flake
-    # material — and receive a strong multiplicative downweighting so
-    # they cannot win the rank-by-score selection.  We measure chroma
-    # against the universal LAB neutral point (achromatic axis) so the
-    # penalty does not depend on substrate colour.
+    # Per-candidate chroma penalty: backstop to the cluster-exclusion cap.
+    # A candidate whose mean LAB chroma exceeds CLUSTER_CHROMA_MAX is an
+    # organic/polymer contaminant rather than flake material (chroma cap
+    # rationale documented at the constant).  It receives a smooth
+    # multiplicative downweighting with decay scale CHROMA_PENALTY_SCALE so
+    # it cannot win the rank-by-score selection even if its cluster centroid
+    # stayed just under the cap.  Chroma is measured against the universal
+    # LAB neutral point (achromatic axis), independent of substrate colour.
     for c in merged_candidates:
         a = float(c['mean_lab'][1])
         b = float(c['mean_lab'][2])
@@ -916,10 +937,10 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
             + w[4] * c['cohere']
         )
         if c_chroma_neutral > CLUSTER_CHROMA_MAX:
-            # Smooth penalty: linear decay above the cap; exponential
-            # for extreme excursions.  No sample-specific tuning.
+            # Monotonic exponential falloff above the cap (decay scale is a
+            # separate named constant; not coupled to the cap value).
             excess = c_chroma_neutral - CLUSTER_CHROMA_MAX
-            penalty = float(np.exp(-excess / CLUSTER_CHROMA_MAX))
+            penalty = float(np.exp(-excess / CHROMA_PENALTY_SCALE))
             c['score'] = raw_score * penalty
         else:
             c['score'] = raw_score

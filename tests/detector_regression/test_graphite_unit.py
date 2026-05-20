@@ -104,31 +104,51 @@ def test_default_cluster_id_uses_score_not_rank():
 
 # --- Property 5b: score weights are physics-grounded, not GT-fitted ---
 def test_score_weights_are_physics_grounded():
-    """Weights may be present, but must be named as physics (not
-    _SCORE_PRIORS / GT-fitted) and must have a docstring/comment
-    explaining the physical derivation per weight."""
+    """Weights must be named as physics (not GT-fit) AND satisfy numerical
+    invariants that a sample-tuned model would violate."""
     src = (DETECT / "graphite.py").read_text()
-    # Forbidden names that imply GT-fitting
+
+    # Existing forbidden-name check
     forbidden = ["_SCORE_PRIORS", "GT_FITTED", "FITTED_WEIGHTS",
                  "TRAINED_WEIGHTS", "OPTIMIZED_WEIGHTS"]
     found = [t for t in forbidden if t in src]
-    assert not found, (
-        f"weights present under GT-fitted-looking name(s): {found}. "
-        f"Rename to _PHYSICS_WEIGHTS and document derivation."
-    )
-    # If physics weights are used, the file must explain each weight's
-    # physical rationale (look for the keywords)
+    assert not found, f"GT-fitted-looking name(s): {found}"
+
+    # If physics weights are present, verify numerical invariants
+    if "_PHYSICS_WEIGHTS" in src or "_GRAPHITE_PHYSICS_WEIGHTS" in src:
+        # Import to read the actual values
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "graphite", DETECT / "graphite.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["graphite_for_test"] = mod
+        spec.loader.exec_module(mod)
+        w = getattr(mod, "_PHYSICS_WEIGHTS", None)
+        if w is None:
+            w = getattr(mod, "_GRAPHITE_PHYSICS_WEIGHTS", None)
+        assert w is not None
+        # Sum-to-1 (any reasonable scoring model has this property)
+        assert abs(np.sum(w) - 1.0) < 1e-6, f"weights sum to {np.sum(w)}, not 1"
+        # No single weight dominates absolutely (GT-fitted models often have
+        # a winner-takes-all weight)
+        assert np.max(w) <= 0.5, f"max weight {np.max(w)} > 0.5 — looks tuned"
+        # Each weight is non-negative
+        assert np.all(w >= 0)
+        # The first weight (s_strip) should be largest or tied for largest —
+        # encodes the dominant physical fact (crystal anisotropy)
+        assert w[0] >= np.max(w[1:]) - 1e-6, (
+            "s_strip is not the dominant weight; that contradicts the "
+            "universal crystal-physics rationale"
+        )
+
+    # Existing documentation checks
     if "_PHYSICS_WEIGHTS" in src or "_GRAPHITE_PHYSICS_WEIGHTS" in src:
         for keyword in ["s_strip", "s_central", "s_gray", "s_contrast",
                         "s_cohere"]:
             assert keyword in src, (
                 f"_PHYSICS_WEIGHTS used but {keyword!r} not documented"
             )
-        # The comment near the weights must contain "PHYSICS" or "physics"
-        # (case-insensitive). Substring search is OK.
-        assert "PHYSICS" in src.upper(), (
-            "_PHYSICS_WEIGHTS used but no PHYSICS rationale documented"
-        )
+        assert "PHYSICS" in src.upper(), "no PHYSICS rationale documented"
 
 
 # --- Property 6: morphology kernels scale with pixel_size -------------
