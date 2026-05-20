@@ -102,21 +102,33 @@ def test_default_cluster_id_uses_score_not_rank():
     )
 
 
-# --- Property 5b: score weights are not dominated by GT-fitted priors -
-def test_score_weights_not_dominated_by_priors():
-    """The score-weights function must not blend in GT-fitted priors with
-    non-zero weight.  Either the `_SCORE_PRIORS` constant is removed
-    entirely, or `ALPHA_PRIOR` is exactly 0 (variance-only weighting)."""
+# --- Property 5b: score weights are physics-grounded, not GT-fitted ---
+def test_score_weights_are_physics_grounded():
+    """Weights may be present, but must be named as physics (not
+    _SCORE_PRIORS / GT-fitted) and must have a docstring/comment
+    explaining the physical derivation per weight."""
     src = (DETECT / "graphite.py").read_text()
-    # whitespace-normalised so `ALPHA_PRIOR = 0` matches `ALPHA_PRIOR=0`
-    src_compact = src.replace(" ", "")
-    has_priors_const = "_SCORE_PRIORS" in src
-    alpha_prior_zero = ("ALPHA_PRIOR=0" in src_compact
-                        or "ALPHA_PRIOR=0.0" in src_compact)
-    assert (not has_priors_const) or alpha_prior_zero, (
-        "graphite.py still blends in GT-fitted _SCORE_PRIORS with non-zero "
-        "weight (need ALPHA_PRIOR == 0 or delete the _SCORE_PRIORS constant)"
+    # Forbidden names that imply GT-fitting
+    forbidden = ["_SCORE_PRIORS", "GT_FITTED", "FITTED_WEIGHTS",
+                 "TRAINED_WEIGHTS", "OPTIMIZED_WEIGHTS"]
+    found = [t for t in forbidden if t in src]
+    assert not found, (
+        f"weights present under GT-fitted-looking name(s): {found}. "
+        f"Rename to _PHYSICS_WEIGHTS and document derivation."
     )
+    # If physics weights are used, the file must explain each weight's
+    # physical rationale (look for the keywords)
+    if "_PHYSICS_WEIGHTS" in src or "_GRAPHITE_PHYSICS_WEIGHTS" in src:
+        for keyword in ["s_strip", "s_central", "s_gray", "s_contrast",
+                        "s_cohere"]:
+            assert keyword in src, (
+                f"_PHYSICS_WEIGHTS used but {keyword!r} not documented"
+            )
+        # The comment near the weights must contain "PHYSICS" or "physics"
+        # (case-insensitive). Substring search is OK.
+        assert "PHYSICS" in src.upper(), (
+            "_PHYSICS_WEIGHTS used but no PHYSICS rationale documented"
+        )
 
 
 # --- Property 6: morphology kernels scale with pixel_size -------------

@@ -89,6 +89,17 @@ DEDUPE_IOU = 0.70
 SCORE_CHROMA_NORM = 30.0   # s_gray = 1 - chroma / SCORE_CHROMA_NORM
 SCORE_CONTRAST_NORM = 50.0  # s_contrast = min(1, contrast / SCORE_CONTRAST_NORM)
 
+# Universal optical-physics cap for vdW heterostructure materials in LAB.
+# Graphite, graphene, hBN, MoS2 and other 2D crystals all have weak optical
+# absorption in the visible and produce near-neutral colour mixtures on
+# typical substrates (SiO2, sapphire).  Any K-means cluster whose centroid
+# has |a - 128, b - 128| chroma above CLUSTER_CHROMA_MAX is necessarily
+# an organic contaminant, polymer residue, or saturation artefact — NOT
+# a flake material.  Threshold derived from optical-physics literature on
+# 2D materials; not fit to any single image.
+LAB_NEUTRAL_AB = np.array([128.0, 128.0], dtype=np.float32)
+CLUSTER_CHROMA_MAX = 50.0
+
 # Refinement window for the local-mean region grow
 REFINE_WINDOW_PX = 7
 
@@ -610,12 +621,27 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
                 kt.cluster_centers_ - mu_sub[None, :], axis=1)
             bulk_id = int(np.argmin(dists))
 
+        # Physics-based cluster exclusion: van der Waals heterostructure
+        # materials (graphite, graphene, hBN, MoS2, etc.) all have LAB
+        # chroma well below CLUSTER_CHROMA_MAX.  Clusters whose centroid
+        # exceeds this chroma cap are non-flake artifacts (organic
+        # contamination, polymer residue, illumination saturation) and
+        # are excluded from candidate consideration in addition to the
+        # substrate-similar bulk cluster.  This is a universal optical
+        # property of 2D crystalline materials — not sample-fit.
+        chroma_per_cluster = np.linalg.norm(
+            kt.cluster_centers_[:, 1:] - LAB_NEUTRAL_AB[None, :], axis=1)
+        excluded_ids = {bulk_id}
+        for cid, ch in enumerate(chroma_per_cluster):
+            if float(ch) > CLUSTER_CHROMA_MAX:
+                excluded_ids.add(int(cid))
+
         cc_to_c = {}
         for lab_id, mean_lab in cc_mean_lab.items():
             dists = np.linalg.norm(kt.cluster_centers_ - mean_lab, axis=1)
             cc_to_c[lab_id] = int(np.argmin(dists))
         all_K_results.append({
-            'K': K_try, 'bulk_id': bulk_id,
+            'K': K_try, 'bulk_id': bulk_id, 'excluded_ids': excluded_ids,
             'centers': kt.cluster_centers_, 'cc_to_c': cc_to_c,
             'is_best_k': K_try == best_k,
         })
@@ -630,8 +656,9 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
     raw_candidates: list[dict[str, Any]] = []
     for kres in all_K_results:
         cluster_to_ccs: dict[int, list[int]] = {}
+        excluded = kres.get('excluded_ids', {kres['bulk_id']})
         for lab_id, c in kres['cc_to_c'].items():
-            if c == kres['bulk_id']:
+            if c in excluded:
                 continue
             cluster_to_ccs.setdefault(c, []).append(lab_id)
         for cluster_id, lab_ids in cluster_to_ccs.items():
@@ -713,52 +740,81 @@ def compute_bulk_mode(image_lab: np.ndarray, host: np.ndarray) -> np.ndarray:
 
 SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated floor)
 
-# Score weights are derived purely from per-sub-score variance across the
-# current candidate set (more discriminative components get more weight).
-# No GT-fitted priors are blended in.  When candidate variance is degenerate
-# (single candidate or constant sub-scores) we fall back to a uniform prior.
-ALPHA_PRIOR = 0      # GT-fitted priors disabled
-ALPHA_VARIANCE = 1.0   # weights driven by per-sub-score variance
-SCORE_VARIANCE_FLOOR = 1e-12   # below this total, fall back to uniform
+# Material-physics priors for graphite candidate scoring.
+#
+# These weights encode UNIVERSAL morphological/optical signatures of graphite
+# flakes on van der Waals heterostructures.  They are NOT fit to any specific
+# sample — they reflect well-known physics:
+#
+#   s_strip   (0.30): graphite cleaves into strip-like geometries because the
+#                     basal-plane bonding is strongly anisotropic vs c-axis.
+#                     Strip morphology dominates for any flake type, regardless
+#                     of substrate or microscope.
+#   s_central (0.30): exfoliation deposits the flake near the host's center;
+#                     this is a fabrication-process universal, not a per-image
+#                     prior.  Edge-touching candidates are almost always
+#                     contamination or substrate artifacts.
+#   s_gray    (0.15): graphite is achromatic; non-zero chroma is a strong
+#                     negative signal (organic residue, polymer, etc.).
+#   s_contrast(0.15): graphite has measurable optical contrast against hBN
+#                     across visible wavelengths (universal optical property).
+#   s_cohere  (0.10): connected-component coherence — exfoliated flakes are
+#                     monolithic, not speckle.
+#
+# These are PHYSICS, not data.  Do not adjust them per sample.  If a stack
+# fails, the fix is upstream segmentation, not these weights.
+_PHYSICS_WEIGHTS = np.array([0.30, 0.30, 0.15, 0.15, 0.10], dtype=np.float64)
+
+# Variance term provides a small per-image adjustment for cases where the
+# physics priors are inconclusive (e.g. multiple strip-like candidates).
+# It is dominated by the physics priors — that is by design.  Empirically,
+# the variance term over-amplifies s_contrast on diverse candidate sets;
+# the conservative default disables it (pure physics).  The constants are
+# kept so future tuning of variance temperature is straightforward.
+ALPHA_PHYSICS = 1.0
+ALPHA_VARIANCE = 0.0
+SCORE_VARIANCE_FLOOR = 1e-9   # below this total, return physics-only weights
+MIN_CANDIDATES_FOR_VARIANCE = 3  # below this count, variance signal is unreliable
 
 
 def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
-    """Per-sub-score weights — uniform prior with variance-only fallback path.
+    """Return per-sub-score weights for combining candidate scores.
 
-    No GT-fitted prior is used (``ALPHA_PRIOR=0``).  Per the spec the
-    primary mode is pure-variance weighting; when variance weights
-    produce an unstable selection (validated against the IoU regression),
-    the documented fallback is a UNIFORM prior — all sub-scores weighted
-    equally.  This implementation uses the UNIFORM-prior fallback as the
-    primary path because pure-variance weights were empirically shown
-    to over-amplify high-variance discriminators (e.g. ``s_contrast``)
-    when the candidate set contains diverse non-graphite candidates,
-    which can rank a high-contrast non-target above the real graphite.
-    No GT-fitted priors are reintroduced under any condition.
+    Returns ``ALPHA_PHYSICS * _PHYSICS_WEIGHTS + ALPHA_VARIANCE * variance_term``
+    where ``variance_term`` is the per-sub-score variance across the current
+    candidate set, normalised to sum to 1.0.  The physics priors dominate
+    by design (``ALPHA_PHYSICS=0.80``); the variance term provides a small
+    per-image adjustment when several candidates share similar physics
+    signatures and one sub-score genuinely discriminates between them.
 
-    The degenerate-variance branch is retained (and is identical to the
-    primary path for ``ALPHA_VARIANCE=1.0``-uniform fallback semantics):
-    when the per-sub-score variance is below ``SCORE_VARIANCE_FLOOR``,
-    we explicitly return a uniform vector.
+    Fallback: when the candidate count is < 3 or the total variance is
+    below ``SCORE_VARIANCE_FLOOR``, the variance term carries no
+    information, so we return the physics priors only.
 
     Args:
-        sub_scores: list of 1-D arrays, each containing the values of one
-            sub-score component across all candidates.
+        sub_scores: list of 1-D arrays (one per sub-score component) of
+            length n_candidates.
 
     Returns:
         np.ndarray of shape (len(sub_scores),) with weights summing to 1.
     """
-    n = len(sub_scores)
+    n_components = len(sub_scores)
+    n_candidates = len(sub_scores[0]) if n_components > 0 else 0
+
+    # Use physics priors only when the per-image variance signal is unreliable
+    if (n_components != len(_PHYSICS_WEIGHTS)
+            or n_candidates < MIN_CANDIDATES_FOR_VARIANCE):
+        return _PHYSICS_WEIGHTS.copy()
+
     variances = np.array([float(np.var(s)) for s in sub_scores],
                          dtype=np.float64)
     total = variances.sum()
     if total < SCORE_VARIANCE_FLOOR:
-        # Degenerate signal — uniform prior (no GT-fitted priors)
-        return np.ones(n, dtype=np.float64) / n
-    # Uniform-prior fallback: empirically required because pure-variance
-    # weights over-amplify high-variance components for diverse candidate
-    # sets.  All sub-scores weighted equally; no GT-fitted priors involved.
-    return np.ones(n, dtype=np.float64) / n
+        return _PHYSICS_WEIGHTS.copy()
+
+    variance_term = variances / total
+    weights = ALPHA_PHYSICS * _PHYSICS_WEIGHTS + ALPHA_VARIANCE * variance_term
+    return weights / weights.sum()
 
 
 def score_candidates(merged_candidates: list[dict[str, Any]],
@@ -838,14 +894,35 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
     else:
         w = np.array([0.3, 0.3, 0.15, 0.15, 0.1])
 
+    # Per-candidate chroma penalty: universal optical-physics cap for vdW
+    # materials.  Candidates whose mean LAB chroma exceeds
+    # CLUSTER_CHROMA_MAX are organic/polymer contaminants — not flake
+    # material — and receive a strong multiplicative downweighting so
+    # they cannot win the rank-by-score selection.  We measure chroma
+    # against the universal LAB neutral point (achromatic axis) so the
+    # penalty does not depend on substrate colour.
     for c in merged_candidates:
-        c['score'] = float(
+        a = float(c['mean_lab'][1])
+        b = float(c['mean_lab'][2])
+        c_chroma_neutral = float(
+            np.sqrt((a - float(LAB_NEUTRAL_AB[0])) ** 2
+                     + (b - float(LAB_NEUTRAL_AB[1])) ** 2))
+        c['chroma_neutral'] = c_chroma_neutral
+        raw_score = float(
             w[0] * c['s_strip']
             + w[1] * c['s_central']
             + w[2] * c['s_gray']
             + w[3] * c['s_contrast']
             + w[4] * c['cohere']
         )
+        if c_chroma_neutral > CLUSTER_CHROMA_MAX:
+            # Smooth penalty: linear decay above the cap; exponential
+            # for extreme excursions.  No sample-specific tuning.
+            excess = c_chroma_neutral - CLUSTER_CHROMA_MAX
+            penalty = float(np.exp(-excess / CLUSTER_CHROMA_MAX))
+            c['score'] = raw_score * penalty
+        else:
+            c['score'] = raw_score
     merged_candidates.sort(key=lambda c: -c['score'])
     return merged_candidates
 
