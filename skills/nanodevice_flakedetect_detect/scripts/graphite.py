@@ -65,7 +65,7 @@ from sklearn.cluster import KMeans
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                 'nanodevice_flakedetect', 'scripts'))
-from core import keep_largest_n  # noqa: E402
+from core import keep_largest_n, _kernel_from_um  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -146,21 +146,7 @@ SUBSTRATE_GMM_RANDOM_STATE = 0      # deterministic GMM init
 # ---------------------------------------------------------------------------
 
 
-def _kernel_from_um(radius_um: float, pixel_size_um: float,
-                    ellipse: bool = True) -> np.ndarray:
-    """Return a structuring element whose radius is `radius_um` physical
-    micrometres.  Derives the pixel size from `pixel_size_um` so morphology
-    scales correctly across different objectives.
-
-    When ``ellipse`` is True (default) returns a ``cv2.MORPH_ELLIPSE`` SE.
-    When False, returns a flat rectangular ``np.ones((k, k), uint8)`` SE
-    (used where original code used `np.ones((K, K), uint8)`).
-    """
-    radius_px = max(1, int(round(radius_um / pixel_size_um)))
-    k = radius_px * 2 + 1
-    if ellipse:
-        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return np.ones((k, k), dtype=np.uint8)
+# _kernel_from_um is imported from core.py (shared physical-unit morphology helper)
 
 
 # Refine-stage morphology in physical units

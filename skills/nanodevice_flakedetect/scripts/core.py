@@ -16,6 +16,28 @@ import numpy as np
 # Morphological helpers
 # ---------------------------------------------------------------------------
 
+
+def _kernel_from_um(radius_um: float, pixel_size_um: float,
+                    ellipse: bool = True) -> np.ndarray:
+    """Return a structuring element whose radius is `radius_um` physical
+    micrometres.  Derives the pixel size from `pixel_size_um` so morphology
+    scales correctly across different objectives.
+
+    Physics: the radius is a physical measurement (e.g. 0.5 µm for typical
+    graphite strip closure), not a pixel heuristic, so the same value works
+    at any magnification / objective.
+
+    When ``ellipse`` is True (default) returns a ``cv2.MORPH_ELLIPSE`` SE.
+    When False, returns a flat rectangular ``np.ones((k, k), uint8)`` SE
+    (used where original code used `np.ones((K, K), uint8)`).
+    """
+    radius_px = max(1, int(round(radius_um / pixel_size_um)))
+    k = radius_px * 2 + 1
+    if ellipse:
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return np.ones((k, k), dtype=np.uint8)
+
+
 def morph_clean(mask, close_k=9, open_k=9):
     """Morphological close then open.
 
