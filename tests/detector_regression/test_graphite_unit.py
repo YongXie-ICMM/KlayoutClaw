@@ -102,26 +102,79 @@ def test_default_cluster_id_uses_score_not_rank():
     )
 
 
-# --- Property 6: morphology kernels scale with pixel_size -------------
-def test_morphology_kernels_derive_from_pixel_size():
+# --- Property 5b: score weights are not dominated by GT-fitted priors -
+def test_score_weights_not_dominated_by_priors():
+    """The score-weights function must not blend in GT-fitted priors with
+    non-zero weight.  Either the `_SCORE_PRIORS` constant is removed
+    entirely, or `ALPHA_PRIOR` is exactly 0 (variance-only weighting)."""
     src = (DETECT / "graphite.py").read_text()
-    # any helper like scale_kernel(um, pixel_size) is fine; forbid
-    # `cv2.morphologyEx(..., kernel=np.ones((K, K)))` with K as a naked
-    # int that doesn't derive from pixel_size.
+    # whitespace-normalised so `ALPHA_PRIOR = 0` matches `ALPHA_PRIOR=0`
+    src_compact = src.replace(" ", "")
+    has_priors_const = "_SCORE_PRIORS" in src
+    alpha_prior_zero = ("ALPHA_PRIOR=0" in src_compact
+                        or "ALPHA_PRIOR=0.0" in src_compact)
+    assert (not has_priors_const) or alpha_prior_zero, (
+        "graphite.py still blends in GT-fitted _SCORE_PRIORS with non-zero "
+        "weight (need ALPHA_PRIOR == 0 or delete the _SCORE_PRIORS constant)"
+    )
+
+
+# --- Property 6: morphology kernels scale with pixel_size -------------
+_KERNEL_BUILDER_NAMES = {
+    "morphologyEx",          # cv2.morphologyEx
+    "dilate",                 # cv2.dilate
+    "erode",                  # cv2.erode
+    "getStructuringElement",  # cv2.getStructuringElement
+    "ones",                   # np.ones((K, K), ...)
+}
+
+
+def _is_all_literal_int_tuple(node: ast.AST) -> bool:
+    """True if `node` is a Tuple AST literal whose elements are all int
+    Constants — e.g. ``(3, 3)``.  Mixed expressions like
+    ``(2*k+1, 2*k+1)`` return False because the elements are BinOps,
+    not Constants."""
+    return (isinstance(node, ast.Tuple)
+            and len(node.elts) > 0
+            and all(isinstance(e, ast.Constant)
+                    and isinstance(e.value, int) for e in node.elts))
+
+
+def test_morphology_kernels_derive_from_pixel_size():
+    """Reject any morphology / kernel-builder call that constructs its
+    kernel from a literal-int tuple inline.  Kernels must derive from
+    ``pixel_size`` through a helper (e.g. ``_kernel_from_um``)."""
+    src = (DETECT / "graphite.py").read_text()
     tree = ast.parse(src)
+
+    # Allow-list: declarations inside the kernel helper itself (the
+    # helper does `cv2.getStructuringElement(..., (k, k))` where k is a
+    # local var derived from pixel_size). We detect this by checking
+    # whether the call's tuple uses NAMES (not constants).
+    offenders: list[tuple[int, str, str]] = []
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call):
             continue
         fname = getattr(call.func, "attr", getattr(call.func, "id", ""))
-        if fname != "morphologyEx":
+        if fname not in _KERNEL_BUILDER_NAMES:
             continue
-        # walk into kwargs/args looking for a literal-int kernel
+        # Inspect positional args + the `kernel=` keyword
+        candidate_nodes = list(call.args)
         for kw in call.keywords:
-            if kw.arg == "kernel" and isinstance(kw.value, ast.Call):
-                for a in kw.value.args:
-                    if (isinstance(a, ast.Tuple)
-                        and all(isinstance(e, ast.Constant) for e in a.elts)):
-                        pytest.fail(
-                            f"L{call.lineno}: morphologyEx kernel built from "
-                            f"naked tuple {ast.unparse(a)}"
-                        )
+            if kw.arg in ("kernel", "ksize", "structuringElement"):
+                candidate_nodes.append(kw.value)
+                # nested call: kernel=cv2.getStructuringElement(...)
+                if isinstance(kw.value, ast.Call):
+                    candidate_nodes.extend(kw.value.args)
+        for arg in candidate_nodes:
+            if _is_all_literal_int_tuple(arg):
+                offenders.append(
+                    (call.lineno, fname, ast.unparse(arg)))
+                break
+    if offenders:
+        msg = "\n".join(
+            f"  L{ln}: {fn}(... {tup} ...) — use _kernel_from_um(..., pixel_size)"
+            for ln, fn, tup in offenders)
+        pytest.fail(
+            f"morphology kernels constructed from naked literal tuples:\n{msg}"
+        )

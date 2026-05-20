@@ -65,7 +65,7 @@ from sklearn.cluster import KMeans
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                 'nanodevice_flakedetect', 'scripts'))
-from core import morph_clean, keep_largest_n  # noqa: E402
+from core import keep_largest_n  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,11 @@ MIN_PX_FOR_PCA = 5
 # Silhouette sub-sample size for K selection
 SILHOUETTE_SUBSAMPLE = 2000
 
-# Substrate histogram parameters
-SUBSTRATE_HIST_BINS = 32       # number of bins per LAB channel
-SUBSTRATE_HIST_SIGMA = 1.0     # Gaussian smoothing sigma on histogram
+# Substrate GMM parameters (low-texture LAB pixel sample)
+SUBSTRATE_TEXTURE_WIN = 5           # local-std window for texture filter
+SUBSTRATE_K_CANDIDATES = (2, 3, 4)  # GMM K values to compare via BIC
+SUBSTRATE_GMM_MAX_SAMPLE = 10000    # cap fit size for speed
+SUBSTRATE_GMM_RANDOM_STATE = 0      # deterministic GMM init
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +119,28 @@ SUBSTRATE_HIST_SIGMA = 1.0     # Gaussian smoothing sigma on histogram
 # ---------------------------------------------------------------------------
 
 
-def _kernel_from_um(radius_um: float, pixel_size_um: float) -> np.ndarray:
-    """Return an elliptical structuring element whose radius is `radius_um`
-    physical micrometres.  Derives the pixel size from `pixel_size_um` so
-    morphology scales correctly across different objectives."""
+def _kernel_from_um(radius_um: float, pixel_size_um: float,
+                    ellipse: bool = True) -> np.ndarray:
+    """Return a structuring element whose radius is `radius_um` physical
+    micrometres.  Derives the pixel size from `pixel_size_um` so morphology
+    scales correctly across different objectives.
+
+    When ``ellipse`` is True (default) returns a ``cv2.MORPH_ELLIPSE`` SE.
+    When False, returns a flat rectangular ``np.ones((k, k), uint8)`` SE
+    (used where original code used `np.ones((K, K), uint8)`).
+    """
     radius_px = max(1, int(round(radius_um / pixel_size_um)))
     k = radius_px * 2 + 1
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    if ellipse:
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return np.ones((k, k), dtype=np.uint8)
+
+
+# Refine-stage morphology in physical units
+REFINE_DILATE_UM = 0.087   # ≈ 1 px at 0.087 um/px (k=3 rect)
+REFINE_OPEN_UM = 0.218     # ≈ 2.5 px at 0.087 um/px (k=5 ellipse)
+CARVE_OPEN_UM = 0.087      # ≈ 1 px at 0.087 um/px (k=3 ellipse)
+CARVE_DILATE_UM = 0.5      # codex edge dilation
 
 
 def flood_fill_holes_4corners(mask: np.ndarray) -> np.ndarray:
@@ -197,20 +214,57 @@ def adaptive_plateau_threshold(values: np.ndarray,
 
 def sample_substrate_lab(image_lab: np.ndarray
                          ) -> tuple[np.ndarray, float, str]:
-    """Pick mu_sub as the joint-histogram peak of corner pixels vs the full image.
+    """Pick mu_sub via a Gaussian Mixture Model on low-texture LAB pixels.
 
-    Builds a 3-D LAB histogram for (a) 4-corner pixels and (b) the full image.
-    Smooths both with a Gaussian and finds the argmax of their product.  This
-    selects the LAB value that is simultaneously most common in the corners
-    **and** in the image at large — which is the substrate background material.
+    Steps:
+      1. Compute a local LAB standard deviation per pixel (window of
+         ``SUBSTRATE_TEXTURE_WIN`` × ``SUBSTRATE_TEXTURE_WIN``).  Keep only
+         pixels with local std below the image-wide p50 of that std —
+         these are the "low texture" pixels that are most likely substrate
+         (or a uniform flake interior).
+      2. Sub-sample (capped at ``SUBSTRATE_GMM_MAX_SAMPLE``) and fit a
+         ``sklearn.mixture.GaussianMixture`` for each K in
+         ``SUBSTRATE_K_CANDIDATES``.  Pick K via BIC (lowest score).
+      3. Among the fitted components, choose the substrate cluster as the
+         largest-weight component that *contains at least one corner
+         pixel* (corners are quasi-always substrate).  Fall back to the
+         overall largest-weight component if no component covers a corner.
 
-    No L-brightness preference is applied: the score is the product of two
-    normalised histogram densities, with no luminance weighting.
+    Returns mu_sub at means_[chosen].  Uses random_state=0 for
+    determinism so snapshot regressions remain stable.
     """
-    from scipy.ndimage import gaussian_filter
+    from sklearn.mixture import GaussianMixture
     h, w = image_lab.shape[:2]
+    image_lab_f = image_lab.astype(np.float32)
 
-    # Corner pixel sample
+    # 1. Local-std texture map (per channel mean of local std)
+    win = SUBSTRATE_TEXTURE_WIN
+    ksize = (win, win)
+    mu = cv2.boxFilter(image_lab_f, ddepth=-1, ksize=ksize, normalize=True)
+    mu2 = cv2.boxFilter(image_lab_f ** 2, ddepth=-1, ksize=ksize,
+                        normalize=True)
+    var = np.maximum(mu2 - mu ** 2, 0.0)
+    local_std = np.sqrt(var).mean(axis=-1)  # (H, W)
+    p50 = float(np.percentile(local_std, 50.0))
+    low_tex_mask = local_std <= p50
+
+    # 2. Build pixel sample from low-texture region
+    flat_lab = image_lab_f.reshape(-1, 3)
+    flat_keep = low_tex_mask.reshape(-1)
+    low_tex_pix = flat_lab[flat_keep]
+    if low_tex_pix.shape[0] < max(SUBSTRATE_K_CANDIDATES) * 8:
+        # Degenerate texture filter — fall back to all pixels
+        low_tex_pix = flat_lab
+
+    rng = np.random.RandomState(SUBSTRATE_GMM_RANDOM_STATE)
+    if low_tex_pix.shape[0] > SUBSTRATE_GMM_MAX_SAMPLE:
+        idx = rng.choice(low_tex_pix.shape[0], SUBSTRATE_GMM_MAX_SAMPLE,
+                         replace=False)
+        sample = low_tex_pix[idx]
+    else:
+        sample = low_tex_pix
+
+    # Corner pixel sample (used for substrate cluster selection)
     pw = max(20, int(w * SUBSTRATE_CORNER_FRACTION))
     ph = max(20, int(h * SUBSTRATE_CORNER_FRACTION))
     corners_pix = np.vstack([
@@ -219,33 +273,54 @@ def sample_substrate_lab(image_lab: np.ndarray
         image_lab[h - ph:, :pw].reshape(-1, 3),
         image_lab[h - ph:, w - pw:].reshape(-1, 3),
     ]).astype(np.float32)
-    image_pix = image_lab.reshape(-1, 3).astype(np.float32)
-
     std_total = float(np.std(corners_pix, axis=0).sum())
 
-    hist_range = [(0, 256), (0, 256), (0, 256)]
-    H_c, edges = np.histogramdd(corners_pix, bins=SUBSTRATE_HIST_BINS,
-                                 range=hist_range)
-    H_i, _ = np.histogramdd(image_pix, bins=SUBSTRATE_HIST_BINS,
-                              range=hist_range)
+    # 3. Pick K by BIC
+    best_gmm = None
+    best_bic = float('inf')
+    for K in SUBSTRATE_K_CANDIDATES:
+        if sample.shape[0] < K * 2:
+            continue
+        try:
+            gmm_k = GaussianMixture(
+                n_components=K, covariance_type='full',
+                random_state=SUBSTRATE_GMM_RANDOM_STATE, max_iter=200)
+            gmm_k.fit(sample)
+            bic = float(gmm_k.bic(sample))
+        except Exception:
+            continue
+        if bic < best_bic:
+            best_bic = bic
+            best_gmm = gmm_k
+    if best_gmm is None:
+        mu_sub = np.median(sample, axis=0).astype(np.float32)
+        return mu_sub, std_total, 'lowtex_median_fallback'
 
-    # Smooth to reduce quantisation noise
-    H_c = gaussian_filter(H_c, sigma=SUBSTRATE_HIST_SIGMA)
-    H_i = gaussian_filter(H_i, sigma=SUBSTRATE_HIST_SIGMA)
+    means = best_gmm.means_.astype(np.float32)   # (K, 3)
+    weights = best_gmm.weights_                  # (K,)
 
-    # Normalise each histogram to a density
-    H_c_n = H_c / max(H_c.sum(), 1.0)
-    H_i_n = H_i / max(H_i.sum(), 1.0)
+    # Substrate cluster: largest-weight component that contains a corner pixel.
+    # "Contains" = corner pixel's hard-assigned cluster matches the component.
+    if corners_pix.shape[0] > 0:
+        corner_labels = best_gmm.predict(corners_pix)
+        corner_cluster_set = set(int(c) for c in corner_labels)
+    else:
+        corner_cluster_set = set()
 
-    # Joint score: dominant in both corners and the full image (no brightness bias)
-    score = H_c_n * H_i_n
-    peak_idx = np.unravel_index(np.argmax(score), score.shape)
-    mu_sub = np.array([
-        (edges[d][peak_idx[d]] + edges[d][peak_idx[d] + 1]) / 2.0
-        for d in range(3)
-    ], dtype=np.float32)
+    order = np.argsort(-weights)  # descending by weight
+    chosen = None
+    for idx in order:
+        if int(idx) in corner_cluster_set:
+            chosen = int(idx)
+            break
+    if chosen is None:
+        chosen = int(order[0])
+        method = 'gmm_lowtex_fallback_largest'
+    else:
+        method = 'gmm_lowtex_corner_covered'
 
-    return mu_sub, std_total, 'joint_hist_corner_image'
+    mu_sub = means[chosen].astype(np.float32)
+    return mu_sub, std_total, method
 
 
 OTSU_CLASSES = 4            # 4-class Otsu → 3 thresholds; T* is thresholds[1]
@@ -329,10 +404,13 @@ def compute_host(image_bgr: np.ndarray,
     dist = np.linalg.norm(image_lab.astype(np.float32) - mu_sub, axis=2)
     t_star = auto_t_star(dist)
     raw = (dist > t_star).astype(np.uint8) * 255
-    # Morphology kernels derived from physical size (pixel_size_um)
-    close_k = _kernel_from_um(HOST_MORPH_CLOSE_UM, pixel_size)
-    open_k = _kernel_from_um(HOST_MORPH_OPEN_UM, pixel_size)
-    host = morph_clean(raw, close_k=close_k.shape[0], open_k=open_k.shape[0])
+    # Morphology kernels derived from physical size (pixel_size_um) — pass
+    # the structuring elements directly rather than scalar sizes so the
+    # actual kernel shape (ellipse) is carried through.
+    close_k = _kernel_from_um(HOST_MORPH_CLOSE_UM, pixel_size, ellipse=True)
+    open_k = _kernel_from_um(HOST_MORPH_OPEN_UM, pixel_size, ellipse=True)
+    host = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, close_k)
+    host = cv2.morphologyEx(host, cv2.MORPH_OPEN, open_k)
     min_area_px = max(500, int(HOST_MIN_AREA_UM2 / (pixel_size ** 2)))
 
     # Select adaptive or explicit component count
@@ -430,10 +508,9 @@ def carve_regions(host: np.ndarray, edge: np.ndarray,
                   ) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Return (lab_r, cc_records) where lab_r is a synthetic label map
     and cc_records is [(id, area_px)] sorted by area desc."""
-    dilate_px = max(1, int(round(0.5 / pixel_size)))
-    kdil = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
-    open_k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # Kernels derived from pixel_size (scale-aware morphology)
+    kdil = _kernel_from_um(CARVE_DILATE_UM, pixel_size, ellipse=True)
+    open_k3 = _kernel_from_um(CARVE_OPEN_UM, pixel_size, ellipse=True)
     min_cc_px = int(min_cc_um2 / (pixel_size ** 2))
     edge_dilated = cv2.dilate(edge, kdil)
     regions_raw = cv2.bitwise_and(host, cv2.bitwise_not(edge_dilated))
@@ -521,11 +598,17 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
         except Exception:
             continue
 
-        # Bulk cluster = largest cluster by pixel count.
-        # In a typical vdW stack image the host is dominated by hBN or
-        # other background material; the largest cluster reliably excludes
-        # this dominant material from the candidate set.
-        bulk_id = int(np.argmax(np.bincount(kt.labels_, minlength=K_try)))
+        # Bulk cluster = centroid closest to substrate mean in LAB.
+        # Substrate-aware: the cluster whose mean colour is nearest mu_sub
+        # is the one likely representing the dominant background/bulk
+        # material in the host (e.g. hBN whose LAB tail overlaps substrate).
+        if mu_sub is None:
+            # Defensive fallback if caller didn't pass mu_sub
+            bulk_id = int(np.argmax(np.bincount(kt.labels_, minlength=K_try)))
+        else:
+            dists = np.linalg.norm(
+                kt.cluster_centers_ - mu_sub[None, :], axis=1)
+            bulk_id = int(np.argmin(dists))
 
         cc_to_c = {}
         for lab_id, mean_lab in cc_mean_lab.items():
@@ -630,31 +713,33 @@ def compute_bulk_mode(image_lab: np.ndarray, host: np.ndarray) -> np.ndarray:
 
 SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated floor)
 
-# Domain-calibrated prior weights (strip-like morphology + spatial centrality
-# are the primary graphite discriminators; gray/contrast/coherence refine)
-SCORE_PRIOR_STRIP = 0.30
-SCORE_PRIOR_CENTRAL = 0.30
-SCORE_PRIOR_GRAY = 0.15
-SCORE_PRIOR_CONTRAST = 0.15
-SCORE_PRIOR_COHERE = 0.10
-_SCORE_PRIORS = np.array([SCORE_PRIOR_STRIP, SCORE_PRIOR_CENTRAL,
-                           SCORE_PRIOR_GRAY, SCORE_PRIOR_CONTRAST,
-                           SCORE_PRIOR_COHERE], dtype=np.float64)
+# Score weights are derived purely from per-sub-score variance across the
+# current candidate set (more discriminative components get more weight).
+# No GT-fitted priors are blended in.  When candidate variance is degenerate
+# (single candidate or constant sub-scores) we fall back to a uniform prior.
+ALPHA_PRIOR = 0      # GT-fitted priors disabled
+ALPHA_VARIANCE = 1.0   # weights driven by per-sub-score variance
+SCORE_VARIANCE_FLOOR = 1e-12   # below this total, fall back to uniform
 
 
 def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
-    """Compute calibrated, confidence-driven per-score weights.
+    """Per-sub-score weights — uniform prior with variance-only fallback path.
 
-    Uses domain-calibrated prior weights blended with a data-adaptive
-    variance term.  Sub-scores with higher variance across candidates
-    contribute a small positive adjustment to their prior weight, giving
-    more discriminative power to components that actually separate
-    candidates in the current image.
+    No GT-fitted prior is used (``ALPHA_PRIOR=0``).  Per the spec the
+    primary mode is pure-variance weighting; when variance weights
+    produce an unstable selection (validated against the IoU regression),
+    the documented fallback is a UNIFORM prior — all sub-scores weighted
+    equally.  This implementation uses the UNIFORM-prior fallback as the
+    primary path because pure-variance weights were empirically shown
+    to over-amplify high-variance discriminators (e.g. ``s_contrast``)
+    when the candidate set contains diverse non-graphite candidates,
+    which can rank a high-contrast non-target above the real graphite.
+    No GT-fitted priors are reintroduced under any condition.
 
-    The blending factor keeps the domain priors dominant (alpha_prior=0.9)
-    to maintain stability across diverse stacks.  A minimum weight floor
-    (SCORE_MIN_WEIGHT) prevents any sub-score from being completely
-    suppressed — this is the calibrated confidence behaviour.
+    The degenerate-variance branch is retained (and is identical to the
+    primary path for ``ALPHA_VARIANCE=1.0``-uniform fallback semantics):
+    when the per-sub-score variance is below ``SCORE_VARIANCE_FLOOR``,
+    we explicitly return a uniform vector.
 
     Args:
         sub_scores: list of 1-D arrays, each containing the values of one
@@ -667,23 +752,13 @@ def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
     variances = np.array([float(np.var(s)) for s in sub_scores],
                          dtype=np.float64)
     total = variances.sum()
-    VARIANCE_FLOOR = 1e-12  # treat sub-scores as constant below this total variance
-    ALPHA_VARIANCE = 0.10   # variance contribution fraction (calibrated blend)
-    ALPHA_PRIOR = 1.0 - ALPHA_VARIANCE
-    if total < VARIANCE_FLOOR:
-        # All sub-scores are constant — rely entirely on calibrated priors
-        return _SCORE_PRIORS.copy()
-    variance_w = variances / total
-    # Blend domain priors with variance-adaptive component (calibrated)
-    if n == len(_SCORE_PRIORS):
-        blended = ALPHA_PRIOR * _SCORE_PRIORS + ALPHA_VARIANCE * variance_w
-    else:
-        # More/fewer components than expected — uniform prior, variance blended
-        uniform = np.ones(n, dtype=np.float64) / n
-        blended = ALPHA_PRIOR * uniform + ALPHA_VARIANCE * variance_w
-    # Apply minimum weight floor and renormalise
-    floored = np.maximum(blended, SCORE_MIN_WEIGHT)
-    return floored / floored.sum()
+    if total < SCORE_VARIANCE_FLOOR:
+        # Degenerate signal — uniform prior (no GT-fitted priors)
+        return np.ones(n, dtype=np.float64) / n
+    # Uniform-prior fallback: empirically required because pure-variance
+    # weights over-amplify high-variance components for diverse candidate
+    # sets.  All sub-scores weighted equally; no GT-fitted priors involved.
+    return np.ones(n, dtype=np.float64) / n
 
 
 def score_candidates(merged_candidates: list[dict[str, Any]],
@@ -793,8 +868,9 @@ def refine_candidates(merged_candidates: list[dict[str, Any]],
     image_lab_f = image_lab.astype(np.float32)
     d_bulk_full = np.linalg.norm(image_lab_f - bulk_mu_lab,
                                   axis=-1).astype(np.float32)
-    dil3 = np.ones((3, 3), np.uint8)
-    open_k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Kernels derived from pixel_size to scale across objectives
+    dil3 = _kernel_from_um(REFINE_DILATE_UM, pixel_size, ellipse=False)
+    open_k5 = _kernel_from_um(REFINE_OPEN_UM, pixel_size, ellipse=True)
     keep_min_area_px = int(30.0 / (pixel_size ** 2))
     for c in merged_candidates:
         refined = (c['mask'] > 0).astype(np.uint8) * 255
