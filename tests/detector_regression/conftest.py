@@ -1,4 +1,11 @@
-"""Shared fixtures for detector regression tests."""
+"""Shared fixtures for detector regression tests.
+
+NOTE (Phase 0.5): Snapshot-based regression (_deprecated_snapshot_regression.py)
+has been superseded by GT-evaluator regression (test_gt_regression.py). The
+frozen snapshot PNGs in tests_resources/detector_snapshots/ are kept on disk as
+informational drift indicators only — they are NOT used as a test gate.
+The canonical gate is detect_evaluator.py against Aligned_Stack.gds.
+"""
 from __future__ import annotations
 
 import json
