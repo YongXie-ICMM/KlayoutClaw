@@ -1,0 +1,7 @@
+{
+  "stack": "ml08",
+  "material": "graphene",
+  "pixel_size_um_per_px": 0.087,
+  "source_image": "/Volumes/RandomData/harbour-workspace/qlaybot/detect/ml08/input",
+  "detector_git_sha": "fe2c636ce2e1c6d308d483e45bd41b6ad0a5788a"
+}
