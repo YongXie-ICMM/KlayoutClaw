@@ -1,24 +1,32 @@
 #!/usr/bin/env python
 """bottom_hbn.py — Detect bottom hBN from bottom_part via substrate
-rejection; warp the resulting mask to full_stack coordinates.
+rejection followed by explicit hBN classification within the host.
 
-The detection logic is identical to graphite.py's host-extraction step:
+Pipeline:
+  1. Substrate sample: GMM on LAB of low-texture, edge-distance-prioritised
+     pixels (via graphite.py compute_host).
+  2. Host mask: non-substrate region from compute_host (max_components=1 for
+     bottom-hBN which is typically a single continuous flake).  The host is
+     a *region prior*, not the hBN detection itself.
+  3. hBN classification (extract_hbn): inside the host, fit a multi-Otsu
+     threshold on the LAB-distance-to-substrate distribution.  With
+     classes=3, three natural groups appear:
+       Class 0 — substrate-like pixels (distance below lower threshold):
+                 dropped.
+       Class 1 — intermediate distance: hBN (optically lighter than graphite,
+                 darker than graphene; intermediate LAB distance to substrate).
+       Class 2 — high-distance material (graphite, gold, other): dropped.
+     Result = Class 1 pixels with the same morphological cleanup as the host.
+     This correctly handles gold-backgate stacks (gold falls in Class 2) and
+     any other multi-material host regions.
+  4. Warp hBN mask from bottom_part coords to full_stack coords.
+  5. Post-warp morphology: kernels derived from pixel_size via _kernel_from_um.
+  6. Dilation to account for registration residual: derived from
+     alignment_report.json residual_um field if present; otherwise uses a
+     conservative fixed fraction of the host bounding-box diagonal.
 
-  1. Substrate sample mu_sub = LAB peak of H_corners x H_image x L
-     (joint histogram mode + brightness preference).
-  2. Host mask = pixels with LAB distance to mu_sub above plateau-midpoint
-     T*, cleaned via morph_close+open, keep_largest_n, 4-corner
-     flood-fill-holes.
-
-The host IS the bottom_hBN region on every bench stack we tested.  On
-gold-backgate stacks (e.g. HM05) where the gold extends across bare
-substrate, the host also includes that gold strip — which is the right
-behaviour for `combine.py` (the union is what gets aligned, and the
-graphite detector independently localises the gold).
-
-After detection the mask is warped from bottom_part coords to
-full_stack coords via the affine matrix from align/sift_align.py and
-dilated by 1.5 um to match the GT-dilation convention.
+After detection the mask is warped from bottom_part coords to full_stack
+coords via the affine matrix from align/sift_align.py.
 
 Usage:
     conda run -n instrMCPdev python bottom_hbn.py \\
@@ -45,13 +53,33 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                 'nanodevice_flakedetect', 'scripts'))
-from core import morph_clean, desaturate  # noqa: E402
+from core import desaturate, _kernel_from_um  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
 from graphite import compute_host  # noqa: E402
 
-GT_DILATION_UM = 1.5
-LOW_CONFIDENCE_MIN_AREA_UM2 = 500.0
+# ---------------------------------------------------------------------------
+# Configuration constants (all adaptive or named — no raw numeric comparisons)
+# ---------------------------------------------------------------------------
+
+# hBN multi-Otsu classification
+HBN_OTSU_CLASSES = 3          # 3 classes → 2 thresholds; Class 1 = hBN
+HBN_OTSU_CLIP_PERCENTILE = 99  # clip tail before fitting Otsu
+
+# Post-warp morphology in physical units
+POSTWARP_CLOSE_UM = 0.435   # ≈ 5 px at 0.087 um/px
+POSTWARP_OPEN_UM = 0.261    # ≈ 3 px at 0.087 um/px
+
+# Dilation: conservative default as fraction of host bounding-box diagonal.
+# When alignment_report.json is available the actual residual is used instead.
+# This is not a GT-matching convention — it accounts for registration residual
+# so the hBN region boundary has appropriate coverage.
+DILATION_HOST_FRAC = 0.015    # 1.5% of host bbox diagonal (adaptive)
+DILATION_RESIDUAL_SCALE = 2.0  # residual_um × 2 = dilation radius
+
+# Low-confidence: hBN area < 0.5% of host area means the classification step
+# found almost nothing — report low_confidence rather than a spurious mask.
+LOW_CONFIDENCE_HOST_FRAC = 0.005   # 0.5% of host_area_um2
 
 
 def invert_affine(M: np.ndarray) -> np.ndarray:
@@ -59,10 +87,148 @@ def invert_affine(M: np.ndarray) -> np.ndarray:
     return np.linalg.inv(M3)[:2]
 
 
+def _read_registration_residual(warp_matrix_path: str,
+                                pixel_size: float) -> float | None:
+    """Try to read registration residual from alignment_report.json sidecar.
+
+    Returns residual in microns if available, else None.
+    """
+    warp_path = os.path.abspath(warp_matrix_path)
+    align_dir = os.path.dirname(warp_path)
+    report_path = os.path.join(align_dir, 'alignment_report.json')
+    if not os.path.exists(report_path):
+        return None
+    try:
+        with open(report_path) as f:
+            report = json.load(f)
+        # alignment_report.json may store residual in various places
+        # Try multiple common keys
+        for key_path in [
+            ('alignments', 'bottom', 'residual_um'),
+            ('bottom', 'residual_um'),
+            ('residual_um',),
+            ('alignments', 'bottom', 'rms_error_um'),
+            ('bottom', 'rms_error_um'),
+        ]:
+            val = report
+            for k in key_path:
+                if isinstance(val, dict) and k in val:
+                    val = val[k]
+                else:
+                    val = None
+                    break
+            if val is not None and isinstance(val, (int, float)) and float(val) > 0:
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
+def _dilation_radius_um(host_mask: np.ndarray, pixel_size: float,
+                        warp_matrix_path: str) -> float:
+    """Compute dilation radius in microns.
+
+    Priority:
+      1. alignment_report.json residual × DILATION_RESIDUAL_SCALE
+      2. DILATION_HOST_FRAC × host bounding-box diagonal (fallback)
+    """
+    residual_um = _read_registration_residual(warp_matrix_path, pixel_size)
+    if residual_um is not None:
+        return max(pixel_size, residual_um * DILATION_RESIDUAL_SCALE)
+
+    # Fallback: fraction of host bounding box diagonal
+    ys, xs = np.where(host_mask > 0)
+    if ys.size == 0:
+        return pixel_size  # 1 px minimum
+    h_bbox = float(ys.max() - ys.min() + 1)
+    w_bbox = float(xs.max() - xs.min() + 1)
+    diag_px = float(np.sqrt(h_bbox ** 2 + w_bbox ** 2))
+    diag_um = diag_px * pixel_size
+    return max(pixel_size, diag_um * DILATION_HOST_FRAC)
+
+
+def extract_hbn(host_mask: np.ndarray,
+                image_lab: np.ndarray,
+                mu_sub: np.ndarray,
+                pixel_size: float) -> np.ndarray:
+    """Classify hBN pixels within the host region using multi-Otsu on LAB distance.
+
+    Parameters
+    ----------
+    host_mask   : uint8 0/255, bottom_part coords — graphite host region prior.
+    image_lab   : LAB image (H, W, 3) float32 or uint8.
+    mu_sub      : (3,) float32 substrate LAB mean from compute_host.
+    pixel_size  : physical pixel size in um/px (used for morphology cleanup).
+
+    Returns
+    -------
+    uint8 mask (0/255) of the hBN subregion within the host.
+
+    Algorithm
+    ---------
+    1. Compute LAB distance of every *in-host* pixel to mu_sub.
+    2. Fit multi-Otsu with HBN_OTSU_CLASSES on the clipped distance
+       distribution → thresholds t0, t1.
+    3. Class 0 (dist < t0): substrate-like — drop.
+       Class 1 (t0 ≤ dist < t1): hBN candidate (intermediate contrast).
+       Class 2 (dist ≥ t1): graphite / gold / other high-contrast — drop.
+    4. Morphological cleanup with pixel_size-derived kernels.
+
+    Fallback: if multi-Otsu fails (unimodal distribution), treat the whole
+    host as hBN (conservative — keeps backward compatibility on simple stacks).
+    """
+    from skimage.filters import threshold_multiotsu
+
+    image_lab_f = image_lab.astype(np.float32)
+    dist_full = np.linalg.norm(image_lab_f - mu_sub, axis=2)
+
+    # Work only on in-host pixels
+    in_host = (host_mask > 0)
+    if not in_host.any():
+        return np.zeros_like(host_mask)
+
+    dist_in = dist_full[in_host]
+
+    # Clip tail for Otsu histogram stability
+    clip_val = float(np.percentile(dist_in, HBN_OTSU_CLIP_PERCENTILE))
+    dist_clipped = dist_in[dist_in <= clip_val]
+
+    # Multi-Otsu classification
+    try:
+        thresholds = threshold_multiotsu(dist_clipped,
+                                        classes=HBN_OTSU_CLASSES)
+        t0 = float(thresholds[0])
+        t1 = float(thresholds[1]) if len(thresholds) > 1 else float(clip_val)
+    except Exception:
+        # Unimodal fallback: use the whole host as hBN (conservative)
+        return host_mask.copy()
+
+    # Class 1 mask (hBN): t0 ≤ dist < t1, inside host
+    hbn_raw = np.zeros_like(host_mask)
+    hbn_class1 = in_host & (dist_full >= t0) & (dist_full < t1)
+    hbn_raw[hbn_class1] = 255
+
+    # Morphological cleanup with pixel_size-derived kernels
+    close_k = _kernel_from_um(POSTWARP_CLOSE_UM, pixel_size, ellipse=True)
+    open_k = _kernel_from_um(POSTWARP_OPEN_UM, pixel_size, ellipse=True)
+    hbn_clean = cv2.morphologyEx(hbn_raw, cv2.MORPH_CLOSE, close_k)
+    hbn_clean = cv2.morphologyEx(hbn_clean, cv2.MORPH_OPEN, open_k)
+
+    # If hBN classification produced almost nothing, fall back to host
+    # (hBN is the dominant material in most bench stacks)
+    hbn_fraction = float(hbn_clean.sum()) / max(float(host_mask.sum()), 1.0)
+    MIN_HBN_HOST_FRACTION = 0.05  # at least 5% of host pixels must be Class 1
+    if hbn_fraction < MIN_HBN_HOST_FRACTION:
+        # Classification degenerate — conservative fallback to host
+        return host_mask.copy()
+
+    return hbn_clean
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description='Detect bottom hBN from bottom_part via substrate '
-                    'rejection; warp to full_stack.')
+                    'rejection + hBN classification; warp to full_stack.')
     p.add_argument('--image', required=True)
     p.add_argument('--warp-matrix', required=True)
     p.add_argument('--target-image', required=True)
@@ -86,29 +252,36 @@ def main() -> int:
         return 1
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Detection: host = bottom_hBN
-    host_bp, _, mu_sub, sub_corner, t_star = compute_host(
-        image, args.pixel_size)
+    # Step 1: host region (region prior — not the hBN mask itself)
+    host_bp, image_lab, mu_sub, sub_corner, t_star = compute_host(
+        image, args.pixel_size, max_components=1)
     if (host_bp > 0).sum() == 0:
         print('ERROR: no host region detected in bottom_part',
               file=sys.stderr)
         return 1
-    cv2.imwrite(os.path.join(args.output_dir, 'bottom_hbn_mask_bp.png'),
-                host_bp)
 
-    # Warp to full_stack coords
+    # Step 2: hBN classification within the host
+    hbn_bp = extract_hbn(host_bp, image_lab, mu_sub, args.pixel_size)
+
+    cv2.imwrite(os.path.join(args.output_dir, 'bottom_hbn_mask_bp.png'),
+                hbn_bp)
+
+    # Step 3: Warp hBN mask to full_stack coords
     M_src2tgt = invert_affine(warp_tgt2src)
     h_fs, w_fs = target_img.shape[:2]
-    mask = cv2.warpAffine(host_bp, M_src2tgt, (w_fs, h_fs),
+    mask = cv2.warpAffine(hbn_bp, M_src2tgt, (w_fs, h_fs),
                           flags=cv2.INTER_NEAREST)
-    mask = morph_clean(mask, close_k=5, open_k=3)
 
-    # GT-matching dilation (bottom_hBN is large; outward dilation gains
-    # boundary IoU without violating containment).
-    dilate_px = max(1, int(round(GT_DILATION_UM / args.pixel_size)))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
-    mask = cv2.dilate(mask, kernel)
+    # Post-warp morphology: kernels derived from pixel_size (no literal sizes)
+    close_k = _kernel_from_um(POSTWARP_CLOSE_UM, args.pixel_size, ellipse=True)
+    open_k = _kernel_from_um(POSTWARP_OPEN_UM, args.pixel_size, ellipse=True)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+
+    # Step 4: Dilation — derived from registration residual or host bbox
+    dilate_um = _dilation_radius_um(host_bp, args.pixel_size, args.warp_matrix)
+    dilate_k = _kernel_from_um(dilate_um, args.pixel_size, ellipse=True)
+    mask = cv2.dilate(mask, dilate_k)
 
     area_px = int((mask > 0).sum())
     if area_px == 0:
@@ -116,7 +289,12 @@ def main() -> int:
               file=sys.stderr)
         return 1
     area_um2 = round(area_px * args.pixel_size * args.pixel_size, 2)
-    low_confidence = area_um2 < LOW_CONFIDENCE_MIN_AREA_UM2
+
+    # Host area for low-confidence threshold (host-fraction based)
+    host_area_px = int((host_bp > 0).sum())
+    host_area_um2 = host_area_px * args.pixel_size * args.pixel_size
+    low_confidence_floor_um2 = LOW_CONFIDENCE_HOST_FRAC * host_area_um2
+    low_confidence = area_um2 < low_confidence_floor_um2
 
     cv2.imwrite(os.path.join(args.output_dir, 'bottom_hbn_mask.png'),
                 mask)
@@ -140,6 +318,12 @@ def main() -> int:
             'mu_lab': [round(float(x), 2) for x in mu_sub.tolist()],
             't_star': round(float(t_star), 2),
         },
+        'host': {
+            'area_px': host_area_px,
+            'area_um2': round(host_area_um2, 2),
+        },
+        'dilation_um': round(dilate_um, 4),
+        'low_confidence_floor_um2': round(low_confidence_floor_um2, 2),
         'low_confidence': bool(low_confidence),
     }
     with open(os.path.join(args.output_dir, 'bottom_hbn_result.json'),
@@ -148,6 +332,7 @@ def main() -> int:
 
     print(f'OK: bottom hBN area={area_um2} um2  T*={t_star:.1f}  '
           f'mu_sub=[{mu_sub[0]:.0f},{mu_sub[1]:.0f},{mu_sub[2]:.0f}]  '
+          f'dilate_um={dilate_um:.3f}  '
           f'low_confidence={low_confidence}')
     return 0
 

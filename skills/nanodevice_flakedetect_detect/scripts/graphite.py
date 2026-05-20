@@ -784,14 +784,11 @@ MIN_CANDIDATES_FOR_VARIANCE = 3  # below this count, variance signal is unreliab
 def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
     """Return per-sub-score weights.
 
-    Currently returns ``_PHYSICS_WEIGHTS`` unchanged (``ALPHA_PHYSICS=1.0``,
-    ``ALPHA_VARIANCE=0.0``).  The variance term was tried at
-    ``ALPHA_VARIANCE=0.2`` but over-amplified ``s_contrast`` on diverse
-    candidate pools, ranking polymer-residue candidates above real graphite
-    on ml04/ml11.  The ALPHA constants are retained as named knobs in case
-    future stacks benefit from a controlled blend; the general formula
-    ``ALPHA_PHYSICS * _PHYSICS_WEIGHTS + ALPHA_VARIANCE * variance_term`` is
-    evaluated below so re-enabling the blend is a one-line change.
+    When ``ALPHA_VARIANCE <= 0`` (current default: 0.0), returns
+    ``_PHYSICS_WEIGHTS`` directly without computing variance — the variance
+    computation is dead code and skipping it is cleaner.  The ALPHA constants
+    are retained as named knobs; the general formula is evaluated only when
+    the variance blend is actually enabled.
 
     The variance fallback (physics-only) also fires when the candidate count
     is < ``MIN_CANDIDATES_FOR_VARIANCE`` or total variance is below
@@ -804,6 +801,9 @@ def score_weights(sub_scores: list[np.ndarray]) -> np.ndarray:
     Returns:
         np.ndarray of shape (len(sub_scores),) with weights summing to 1.
     """
+    if ALPHA_VARIANCE <= 0:
+        return _PHYSICS_WEIGHTS.copy()
+
     n_components = len(sub_scores)
     n_candidates = len(sub_scores[0]) if n_components > 0 else 0
 
