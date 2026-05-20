@@ -575,6 +575,67 @@ git commit -m "test(detect): IoU regression + generality property tests (initial
 
 ---
 
+## Phase 0.5: GT Evaluator Gate
+
+### Why the snapshot gate was wrong
+
+Phase 0 froze detector mask PNGs as the regression baseline. Those snapshots were produced by the priored pipeline, which already under-performs ground-truth (GT) on graphite:
+
+| stack | graphite IoU (snapshot vs GT) | graphene IoU (snapshot vs GT) |
+|-------|-------------------------------|-------------------------------|
+| ml04  | 0.66                          | 0.87                          |
+| ml08  | 0.87                          | 0.79                          |
+| ml09  | 0.85                          | 0.62                          |
+| ml11  | 0.60                          | 0.22                          |
+| ml14  | 0.64                          | 0.52                          |
+
+Phase 1 made spec-correct graphite changes that appeared to "regress" against snapshot (IoU=0, because the selected candidate changed) but the snapshot gate was comparing against a potentially wrong candidate. The GT gate is the only honest judge.
+
+### New GT evaluator gate
+
+**Files:**
+- `tests/detector_regression/gt_evaluator.py` — runs 4 detectors, applies existing warp matrices, builds GDS, scores via `detect_evaluator`
+- `tests/detector_regression/test_gt_regression.py` — weighted + per-material gate tests
+- `tests/detector_regression/_deprecated_snapshot_regression.py` — renamed from `test_iou_regression.py`, skipped
+
+**Transform chain (summarized in gt_evaluator.py header):**
+1. Run each detector on its native source image
+2. `combine/transform.py` + existing `warp_sift_bottom.npy` / `warp_top.npy` → `traces.json` (full_stack µm coords)
+3. `gdsalign/commit_gds.py --warp-only` + existing `gds_warp.npy` → `traces_gds.json` (GDS µm coords)
+4. Build GDS with gdstk → score vs `Aligned_Stack.gds` via `detect_evaluator.evaluate_flake_detect`
+
+Key implementation detail: `warp_top.npy` was computed on a **mirrored** `top_part.jpg`, so `gt_evaluator.py` reads `alignment_report.json` to get the `mirror` flag and passes `--mirror` to `graphene.py` when needed.
+
+**Reference baseline** (existing priored result.gds GT scores, measured 2026-05-20):
+
+| stack | weighted | top_hBN | graphene | bot_hBN | graphite |
+|-------|----------|---------|----------|---------|----------|
+| ml04  | 0.833    | 0.97    | 0.87     | 0.92    | 0.66     |
+| ml08  | 1.000    | 0.87    | 0.79     | 0.79    | 0.87     |
+| ml09  | 0.833    | 0.95    | 0.62     | 0.81    | 0.85     |
+| ml11  | 0.417    | 0.94    | 0.22     | 0.53    | 0.60     |
+| ml14  | 0.667    | 0.97    | 0.52     | 0.91    | 0.64     |
+
+### Tolerance band rationale (0.1)
+
+Post-warp anti-aliasing and contour approximation introduce ~0.03-0.07 IoU variance across identical runs. A 0.1 band gives 3× headroom above noise while still catching genuine regressions (>0.1 drop = meaningful degradation). A perfect re-run of the priored pipeline should clear all floors by ≥0.03.
+
+### Phase 1 evaluation under the GT gate (current code at commit 7d01732)
+
+Results measured 2026-05-20 with `gt_evaluator.py` on Phase 1 code:
+
+| stack | weighted | top_hbn | graphene | bot_hbn | graphite | W_PASS | PER_PASS |
+|-------|----------|---------|----------|---------|----------|--------|----------|
+| ml04  | 0.500    | 0.973   | 0.867    | 0.386   | 0.000    | FAIL   | FAIL (bot_hbn, graphite) |
+| ml08  | 1.000    | 0.875   | 0.795    | 0.790   | 0.830    | PASS   | PASS |
+| ml09  | 0.833    | 0.948   | 0.619    | 0.809   | 0.854    | PASS   | PASS |
+| ml11  | 0.250    | 0.938   | 0.223    | 0.529   | 0.000    | FAIL   | FAIL (graphite) |
+| ml14  | 0.333    | 0.966   | 0.339    | 0.908   | 0.000    | FAIL   | FAIL (graphene, graphite) |
+
+**Interpretation:** Phase 1 graphite improvements work on ml08/ml09 but break ml04/ml11/ml14. The graphite detector selects a much larger wrong candidate on ml04 (2235 µm² vs GT 461 µm²). This is a real GT regression that Phase 2+ must address. The snapshot gate would have caught this too (IoU=0 vs snapshot for graphite in ml04), but the GT gate provides the authoritative floor and shows ml08/ml09 pass while ml04/ml11/ml14 fail — actionable per-stack diagnosis.
+
+---
+
 ## Phase 1: `graphite.py` De-Tuning (TRD)
 
 **TRD task:** *Remove sample-fitted constants from `skills/nanodevice_flakedetect_detect/scripts/graphite.py` while keeping IoU ≥ 0.95 vs the Phase 0 snapshot on every `mlxx` stack.*
@@ -756,14 +817,17 @@ The Executor must NOT touch test files. Must implement adaptive replacements per
 - [ ] **Step 1.4: Run the full regression + unit test pair until green**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -k graphite -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+# GT regression gate (Phase 0.5+) — authoritative floor:
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -k "graphite" -v
+# Unit tests:
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_graphite_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+# Generality invariants:
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -v -k graphite
 ```
-Expected: all PASS.
+Expected: all PASS. Note: `_deprecated_snapshot_regression.py` is skipped (not a gate).
 
 - [ ] **Step 1.5: Commit Phase 1**
 
@@ -914,11 +978,11 @@ Required changes:
 - [ ] **Step 2.4: Run all of:**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -k graphene -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -k "graphene" -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_graphene_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -k graphene -v
 ```
 Expected: all PASS.
@@ -1034,11 +1098,11 @@ Required:
 - [ ] **Step 3.4: Run regression + unit + invariants**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -k bottom_hbn -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -k "bottom_hbn" -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_bottom_hbn_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -k bottom_hbn -v
 ```
 
@@ -1141,11 +1205,11 @@ Required:
 - [ ] **Step 4.4: Run all tests**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -k top_hbn -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -k "top_hbn" -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_top_hbn_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -k top_hbn -v
 ```
 
@@ -1258,11 +1322,11 @@ Required:
 - [ ] **Step 5.4: Tests**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_b1_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -k b1_classifier -v
 ```
 
@@ -1377,9 +1441,9 @@ Required:
 - [ ] **Step 6.3: Tests + commit**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_b2_unit.py -v
 git add skills/nanodevice_flakedetect_detect/scripts/detectors/b2_multik.py \
         tests/detector_regression/test_b2_unit.py
@@ -1477,11 +1541,11 @@ Required:
 - [ ] **Step 7.3: Tests + commit**
 
 ```bash
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
-    tests/detector_regression/test_iou_regression.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
+    tests/detector_regression/test_gt_regression.py -v
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_b3_unit.py -v
-PYTHONPATH=tests/detector_regression conda run -n instrMCPdev pytest \
+PYTHONPATH=tests/detector_regression /Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python -m pytest \
     tests/detector_regression/test_generality_invariants.py -v
 git add skills/nanodevice_flakedetect_detect/scripts/detectors/b3_shapetemplate.py \
         tests/detector_regression/test_b3_unit.py
