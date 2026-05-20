@@ -1,17 +1,27 @@
-"""GT-evaluator regression gate (Phase 0.5+).
+"""GT-evaluator regression gate (Phase 0.5) — INFORMATIONAL ONLY.
 
-Each new detector commit must score >= the existing priored-pipeline result.gds
-GT score minus a 0.1 tolerance band (variance noise, post-warp anti-aliasing).
+[DEPRECATED AS GATE — Phase 0.75]
 
-The floor is BASELINE_SCORES in gt_evaluator.py — measured from the existing
-result.gds files at /Volumes/RandomData/harbour-workspace/qlaybot/detect/{stack}/output/result.gds.
+These tests are marked @pytest.mark.informational and are SKIPPED by default.
+Run them with --run-informational to see their output.
 
-Why 0.1 tolerance?
-  Post-warp anti-aliasing and contour approximation introduce ~0.03-0.07 IoU
-  variance across identical runs. A 0.1 band gives 3x headroom above noise
-  while still catching genuine regressions (>0.1 drop = meaningful regression).
+Why this gate is informational, not authoritative:
+  BASELINE_SCORES in gt_evaluator.py were measured from existing result.gds
+  files produced by the qlaybot agent using vision-in-the-loop --cluster-id
+  overrides. This means the baseline represents *agent-with-vision* performance,
+  not *default-algorithm* performance. Comparing default detector outputs to
+  an agent-overridden baseline is structurally biased: the default algorithm
+  cannot reach a score that required a human/agent to look at candidate panels
+  and pick the correct --cluster-id. For example, ml09 graphene has a baseline
+  of 0.62 that was achieved by the agent picking cluster-id=1; the default
+  detector selects a different candidate entirely.
 
-See: docs/superpowers/plans/2026-05-20-detector-de-tuning.md § Phase 0.5
+  The authoritative gate (Phase 0.75) is in test_agent_regression.py:
+  "given the new detector code, can a focused agent produce a high-quality
+  result.gds?" — measuring agent-with-new-code performance against GT, with
+  the agent allowed to use --cluster-id, candidate panels, and sidecar JSON.
+
+See: docs/superpowers/plans/2026-05-20-detector-de-tuning.md § Phase 0.5 and § Phase 0.75
 """
 from __future__ import annotations
 
@@ -53,10 +63,15 @@ def stack_session(request) -> str:
     return request.param
 
 
+@pytest.mark.informational
 def test_gt_weighted_score_not_regressed(
     stack_session, fixture_root_session, tmp_path_factory
 ):
-    """Weighted GT score >= existing-result.gds baseline minus 0.1 tolerance."""
+    """Weighted GT score >= existing-result.gds baseline minus 0.1 tolerance.
+
+    INFORMATIONAL ONLY — skipped by default. Use --run-informational to enable.
+    See module docstring for why this gate is no longer authoritative.
+    """
     actual = _get_score(stack_session, fixture_root_session, tmp_path_factory)
     baseline = BASELINE_SCORES[stack_session]["weighted"]
     floor = max(0.0, baseline - TOLERANCE)
@@ -69,11 +84,16 @@ def test_gt_weighted_score_not_regressed(
 MATERIALS_GT = ["top_hbn", "graphene", "bottom_hbn", "graphite"]
 
 
+@pytest.mark.informational
 @pytest.mark.parametrize("material", MATERIALS_GT)
 def test_gt_per_material_not_regressed(
     stack_session, material, fixture_root_session, tmp_path_factory
 ):
-    """Per-material IoU >= existing-result.gds per-material baseline minus 0.1."""
+    """Per-material IoU >= existing-result.gds per-material baseline minus 0.1.
+
+    INFORMATIONAL ONLY — skipped by default. Use --run-informational to enable.
+    See module docstring for why this gate is no longer authoritative.
+    """
     actual = _get_score(stack_session, fixture_root_session, tmp_path_factory)
     per_mat = actual.get("per_material", {})
     if material not in per_mat:
