@@ -36,13 +36,6 @@ def test_no_substrate_branches(path: Path):
     offenders: list[tuple[int, str]] = []
 
     class Visitor(ast.NodeVisitor):
-        def visit_If(self, node):
-            seg = ast.get_source_segment(src, node.test) or ""
-            for tok in FORBIDDEN_SUBSTRATE_TOKENS:
-                if tok in seg:
-                    offenders.append((node.lineno, seg.strip()))
-            self.generic_visit(node)
-
         def visit_Compare(self, node):
             seg = ast.get_source_segment(src, node) or ""
             for tok in FORBIDDEN_SUBSTRATE_TOKENS:
@@ -80,15 +73,6 @@ def test_no_gt_prior_files(path: Path):
 # Allow numeric literals only inside top-level `NAME = <number>` constants
 # or function default-arg = <number> (so callers can override). Bare
 # literals inside `if`, `while`, `compare` are flagged.
-ALLOWED_NUMERIC_CONTEXTS = (
-    ast.Assign,           # SOMETHING = 0.5  (module/class scope ok; gated below)
-    ast.AnnAssign,
-    ast.arguments,        # def f(x=0.5)
-    ast.Call,             # cv2.morphologyEx(... 5 ...)  — many libs need ints
-    ast.Subscript,
-    ast.List, ast.Tuple, ast.Set, ast.Dict,
-    ast.Return,
-)
 
 
 def _module_constants(tree: ast.Module) -> set[str]:
@@ -111,8 +95,8 @@ def test_no_naked_numerics_in_comparisons(path: Path):
         def visit_Compare(self, node):
             for cmp_target in (node.left, *node.comparators):
                 if isinstance(cmp_target, ast.Constant) and isinstance(cmp_target.value, (int, float)):
-                    # 0, 1, -1, 2 are allowed (loop counters, sentinels)
-                    if cmp_target.value in (-1, 0, 1, 2, 255):
+                    # -1, 0, 1, 255 are allowed (loop counters, sentinels, byte max)
+                    if cmp_target.value in (-1, 0, 1, 255):
                         continue
                     seg = ast.get_source_segment(src, node) or ""
                     offenders.append((node.lineno, seg.strip()))

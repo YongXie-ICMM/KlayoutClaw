@@ -24,7 +24,10 @@ def test_regression(stack, material, fixture_root, snapshot_root):
         new_mask_path = run(material, fixture_root / stack / "input", Path(td))
         new = _read_mask(new_mask_path)
     base = _read_mask(snap_mask)
-    score = iou(new, base)
+    try:
+        score = iou(new, base)
+    except ValueError as e:
+        pytest.fail(f"{stack}/{material}: shape mismatch — {e}")
     assert score >= IOU_THRESHOLD, (
         f"{stack}/{material} IoU={score:.3f} < {IOU_THRESHOLD}"
     )

@@ -27,7 +27,12 @@ def _pixel_size(stack_input: Path) -> float:
 
 
 def _run(cmd: list[str], cwd: Path) -> None:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"detector timed out after 300s: {' '.join(cmd)}"
+        ) from e
     if proc.returncode != 0:
         raise RuntimeError(
             f"detector failed: {' '.join(cmd)}\nstderr:\n{proc.stderr[-2000:]}"
@@ -97,5 +102,5 @@ RUNNERS = {
 
 def run(material: str, stack_input: Path, out_dir: Path) -> Path:
     if material not in RUNNERS:
-        raise ValueError(material)
+        raise ValueError(f"unknown material {material!r}; expected one of {list(RUNNERS)}")
     return RUNNERS[material](stack_input, out_dir)
