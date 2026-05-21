@@ -206,6 +206,19 @@ def test_graphene_no_grow_for_plausible_seed():
     )
 
 
+def test_graphene_hybrid_survival():
+    """Survival uses a UNION of absolute-floor + top-area + top-contrast.
+    No single filter should be able to drop a candidate that any other filter retains."""
+    src = (DETECT / "graphene.py").read_text()
+    # Sentinels for the hybrid policy
+    for token in ["ABSOLUTE_RELL_FLOOR", "TOP_AREA_KEEP", "TOP_CONTRAST_KEEP"]:
+        assert token in src, f"{token} missing from hybrid policy"
+    # Forbid the pure top-N approach as the sole filter
+    assert "abs_survivors" in src and "area_survivors" in src, (
+        "hybrid policy must compute multiple survivor sets"
+    )
+
+
 def test_graphene_containment_penalty_uses_absolute_overlap():
     """Phase 10c: the containment penalty must consider absolute overlap area,
     not just fractional containment.

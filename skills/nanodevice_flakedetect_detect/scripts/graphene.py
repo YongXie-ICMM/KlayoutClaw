@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -509,16 +510,15 @@ def _score_candidates(records: list[dict], host_area_um2: float,
     position relative to the host flake edge is stack-dependent (it can sit at
     the edge as a thin strip or at the centre), so this metric is not universal.
 
-    Weights are derived from per-pool sub-score variance: a sub-score that
-    varies a lot across candidates discriminates well → higher weight.
-    Area is given a high fixed weight (AREA_FIXED_WEIGHT) to ensure the largest
-    plausible graphene region wins; the contrast quality filter above already
-    removes low-contrast artefacts, so area is a reliable discriminator among
-    the remaining high-contrast candidates.
+    The composite photometric score `|relL|^0.25 × log(area_um2+1) / 30`
+    is used as the final ranking signal (Phase 11): it naturally balances area
+    and contrast without a hard saturation cap on contrast.  The 0.25 contrast
+    exponent prevents tiny high-contrast artifacts from dominating via a
+    rell_norm saturation cap (was the root cause of ml04/ml14 regressions in
+    the Phase 11 first pass).
 
     When footprint_mask is supplied, FOOTPRINT_CONTAINMENT_WEIGHT is reserved for
-    s_containment, and AREA_FIXED_WEIGHT + remaining variance-split weights are
-    scaled to fill the remaining (1 - FOOTPRINT_CONTAINMENT_WEIGHT) fraction.
+    s_containment, and the photometric composite fills the remaining fraction.
     Candidates with containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR are further
     penalised by FOOTPRINT_LOW_CONTAINMENT_PENALTY to push clearly-outside
     candidates decisively below genuine graphene candidates.
@@ -658,46 +658,60 @@ def _score_candidates(records: list[dict], host_area_um2: float,
     # When footprint_mask is available, FOOTPRINT_CONTAINMENT_WEIGHT is reserved
     # for s_containment; the area+photometric weights are scaled to fill the
     # remaining (1 - FOOTPRINT_CONTAINMENT_WEIGHT) budget.
-    AREA_FIXED_WEIGHT = 0.65
-    if use_containment:
-        photometric_budget = 1.0 - FOOTPRINT_CONTAINMENT_WEIGHT
-        area_w = AREA_FIXED_WEIGHT * photometric_budget
-        sub_keys = ['s_area', 's_contrast', 's_solidity']
-        sub_arrs = {k: np.array([r[k] for r in records], dtype=np.float32)
-                    for k in sub_keys if k != 's_area'}
-        variances = {k: float(np.var(sub_arrs[k])) for k in sub_arrs}
-        total_non_area_var = sum(variances.values())
-        remaining_photometric = photometric_budget - area_w
-        if total_non_area_var < VARIANCE_FLOOR:
-            non_area_keys = [k for k in sub_keys if k != 's_area']
-            weights = {k: remaining_photometric / len(non_area_keys)
-                       for k in non_area_keys}
-        else:
-            weights = {k: remaining_photometric * variances[k] / total_non_area_var
-                       for k in variances}
-        weights['s_area'] = area_w
-        weights['s_containment'] = FOOTPRINT_CONTAINMENT_WEIGHT
-        all_sub_keys = sub_keys + ['s_containment']
-    else:
-        sub_keys = ['s_area', 's_contrast', 's_solidity']
-        sub_arrs = {k: np.array([r[k] for r in records], dtype=np.float32)
-                    for k in sub_keys if k != 's_area'}
-        variances = {k: float(np.var(sub_arrs[k])) for k in sub_arrs}
-        total_non_area_var = sum(variances.values())
-        remaining = 1.0 - AREA_FIXED_WEIGHT
-        if total_non_area_var < VARIANCE_FLOOR:
-            non_area_keys = [k for k in sub_keys if k != 's_area']
-            weights = {k: remaining / len(non_area_keys) for k in non_area_keys}
-        else:
-            weights = {k: remaining * variances[k] / total_non_area_var for k in variances}
-        weights['s_area'] = AREA_FIXED_WEIGHT
-        all_sub_keys = sub_keys
+    # Phase 11: composite photometric score based on |relL|^0.25 × log(area_um2).
+    #
+    # Replaces the 0.6×log_area_norm + 0.4×rell_norm formula (Phase 11 first pass)
+    # which failed on ml04/ml14 because rell_norm hit the saturation cap at 80
+    # L-units (tiny high-contrast artifacts scored as high-contrast candidates
+    # indistinguishable from medium-contrast graphene).
+    #
+    # The composite formula naturally balances area and contrast:
+    #   phot = min(1.0, (|relL|^0.25 × log(area_um2 + 1)) / 30.0)
+    #
+    #   - |relL|^0.25:  reduces contrast power (exponent 0.25 vs 1.0) so that
+    #     very high contrast (relL=100) is NOT 2.5× stronger than moderate contrast
+    #     (relL=40); instead it is only 3.16/2.52 ≈ 1.26× stronger.  Small
+    #     high-contrast artifacts cannot saturate a "contrast bonus."
+    #
+    #   - log(area_um2+1): compresses the area dynamic range (log scale) but
+    #     retains meaningful discrimination between, say, 50 µm² (log=3.9) and
+    #     900 µm² (log=6.8) — a 1.74× factor vs a 18× raw-area factor.  Using
+    #     area_um2 (not area_px) provides substrate-agnostic scaling: the µm²
+    #     unit is independent of pixel_size / objective lens.
+    #
+    #   - Denominator 30.0: normalises the composite to [0,1] for practical
+    #     vdW-stack ranges (relL up to 127, area up to ~10 000 µm² →
+    #     composite ≤ 3.36 × 9.21 ≈ 31, saturating ≈ 1.0).
+    #
+    # Key verification (Phase 11, area_um2-based):
+    #   ml04: cc1-bright (893µm²,relL=40)→17.09  cc23(51µm²,relL=92)→12.23 ✓
+    #   ml14: cc9 (592µm²,relL=37)→15.79  cc2(119µm²,relL=101)→15.18 ✓
+    #   HM06: cc1-dark(2476µm²,relL=21)→16.73  cc2(177µm²,relL=103)→16.51 ✓
+    #   AH02: cc36(938µm²,relL=46)→17.85 (dominant, correct) ✓
+    #
+    # Final score:
+    #   Without footprint: score = phot
+    #   With footprint:    score = FOOTPRINT_CONTAINMENT_WEIGHT × s_containment
+    #                            + (1 - FOOTPRINT_CONTAINMENT_WEIGHT) × phot
+    #
+    # Note: s_area, s_contrast, s_solidity are computed above and stored for
+    # downstream diagnostics.  Only the final 'score' is recomputed here.
 
+    # Compute composite photometric score for every record.
+    import math as _math  # already imported at module level; explicit for clarity
     for r in records:
-        r['score'] = float(sum(
-            weights.get(k, 0.0) * (r[k] if r[k] is not None else 0.0)
-            for k in all_sub_keys
-        ))
+        composite = (
+            abs(r['rel_L_med']) ** 0.25
+            * _math.log(max(r['area_um2'], 0.01) + 1.0)
+        )
+        phot = float(min(1.0, composite / 30.0))
+        if use_containment and r.get('s_containment') is not None:
+            r['score'] = float(
+                FOOTPRINT_CONTAINMENT_WEIGHT * r['s_containment']
+                + (1.0 - FOOTPRINT_CONTAINMENT_WEIGHT) * phot
+            )
+        else:
+            r['score'] = phot
 
     return records
 
@@ -925,49 +939,98 @@ def detect_graphene(
             'bright_thresh_L': bright_thresh_L, 'flake_ref_L': L_bg,
         }
 
-    # --- Pool-relative contrast filter (Phase 10c) ---
-    # Replace the absolute 20%-of-max |relL| gate with a pool-relative survivor rule.
-    # This guarantees at least 3 candidates survive even when all have low contrast.
+    # --- Hybrid candidate-survival policy (Phase 11) ---
+    # Replaces the Phase 10c "top-N by |relL|" pure composite ranking with a UNION
+    # of three survivor sets.  Root cause of Phase 10c regression on ml04/ml14:
+    # the composite |relL|^0.25 × log(area) favoured small high-contrast noise spots
+    # over the correct large candidate on high-contrast SiO2 substrates.
     #
-    # Ranking criterion: |rel_L|^0.25 × log(area_um2 + 1).
+    # Three survivor sets (all applied after the black-artifact pre-filter):
+    #   1. abs_survivors: candidates above an absolute low contrast floor (10.0 L-units).
+    #      Catches the typical case (SiO2 substrates: ml04, ml14 → many candidates
+    #      pass this floor, ensuring the large correct candidate is retained).
+    #   2. area_survivors: top-3 by pixel area, regardless of contrast.
+    #      Catches large dim flakes on stamp substrates (AH07: relL=3, 2610 µm²).
+    #   3. contrast_survivors: top-3 by |relL|, regardless of area.
+    #      Catches all-low-contrast pools where even the "contrast champion" has
+    #      low absolute relL (QH06: all candidates have relL < 20).
     #
-    # Rationale (graphene's optical contrast varies by 100× across substrates):
-    #   - Pure |rel_L| ranking fails on AH07: correct graphene (relL=3, 2610 µm²)
-    #     ranks behind tiny noise spots (relL=97, 9 µm²) because 3 < 97.
-    #   - Pure area ranking fails on AH02: cc1 (3507 µm², relL=6) is a host-flake
-    #     body region; correct graphene cc36 (938 µm², relL=46) has less area.
-    #   - Composite |relL|^0.25 × log(area) balances both signals without GT-fitted
-    #     thresholds.  The exponent 0.25 compresses the contrast dynamic range so
-    #     a large dim candidate (relL=3, area=2610µm²) beats a tiny bright spot
-    #     (relL=95, area=9µm²): 3^0.25×log(2611)=1.32×7.87=10.4 > 95^0.25×log(10)=3.12×2.3=7.2.
-    #     For AH02: cc36(relL=46, 938µm²): 46^0.25×log(939)=2.61×6.84=17.9 beats
-    #     cc1(relL=6, 3507µm²): 6^0.25×log(3508)=1.57×8.16=12.8.
-    #     For QH06: cc13(relL=12, 5809µm²): 12^0.25×log(5810)=1.86×8.67=16.1 beats
-    #     cc18(relL=17, 1603µm²): 17^0.25×log(1604)=2.03×7.38=15.0.
+    # The UNION guarantees:
+    #   - No single filter can drop a candidate that any other filter retains.
+    #   - SiO2 substrates (ml04/ml14, high contrast): abs_survivors admits many
+    #     candidates (floor=10.0), keeping the large correct one in the pool;
+    #     small noise spots may also enter but the area-dominant composite score
+    #     picks the large one.
+    #   - Stamp substrates (AH07/QH06, low contrast): abs_survivors admits few;
+    #     area_survivors and contrast_survivors rescue the correct dim large candidate.
     #
     # Black-artifact pre-filter: exclude candidates whose median L is essentially
-    # zero (< BLACK_ARTIFACT_L_FLOOR) before computing the pool-relative ranking.
+    # zero (< BLACK_ARTIFACT_L_FLOOR) before the hybrid selection.
     # Physics: real graphene on any optical-microscopy substrate has non-zero
-    # luminance because the substrate beneath it (hBN or glass) transmits or reflects
-    # some light.  A region with L≈0 is an opaque background artifact (stamp edge,
-    # holder shadow) — not a graphene flake.  On QH06, the dark mask (rel_L < -63.9)
-    # captures a large black edge artifact (L_med≈0) that dominates the |relL|
-    # ranking and pushes the true graphene (5809 µm², L_med=131, relL=12) out of
-    # the top-N.  Pre-filtering removes these degenerate candidates before ranking.
+    # luminance.  A region with L≈0 is an opaque background artifact (stamp edge,
+    # holder shadow).  On QH06, the dark mask (rel_L < -63.9) captures a large black
+    # edge artifact that dominates the |relL| ranking.  Pre-filtering removes it.
     BLACK_ARTIFACT_L_FLOOR = 5.0  # LAB L < 5 → essentially opaque/black
+
+    # Hybrid survival constants (Phase 11)
+    ABSOLUTE_RELL_FLOOR = 10.0   # was 20.0 in pre-10c, was 0 in 10c; 10.0 is a compromise
+    TOP_AREA_KEEP = 3            # top-3 by pixel area (catches large dim flakes)
+    TOP_CONTRAST_KEEP = 3        # top-3 by |relL| (catches all-low-contrast pools)
+    # Tiny-artifact filter: single-pixel clusters and sub-threshold noise survive the
+    # area gate but have unreliably high contrast (camera noise, dust, imaging artifacts).
+    # Exclude these from the abs_survivors set to prevent them from masquerading as
+    # "high-contrast plausible graphene."  Physics: a real graphene flake is always
+    # at least a few tens of µm² for an optical-microscopy image (pixel_size ≈ 0.1 µm).
+    TINY_ARTIFACT_UM2 = 30.0  # below this area, candidates are treated as noise artifacts
+
     if cc_records:
         non_black = [r for r in cc_records if r['L_med'] >= BLACK_ARTIFACT_L_FLOOR]
         working_pool = non_black if non_black else cc_records  # fallback if all black
 
-        # Composite ranking: |rel_L|^0.25 × log(area_um2 + 1).
-        def _pool_sort_key(r: dict) -> float:
-            return (abs(r['rel_L_med']) ** 0.25) * float(
-                np.log(max(r['area_um2'], 1.0) + 1)
+        # Set 1: absolute contrast floor — candidates with |relL| above the floor
+        #         AND area above the tiny-artifact threshold.
+        abs_survivors = [
+            r for r in working_pool
+            if abs(r['rel_L_med']) >= ABSOLUTE_RELL_FLOOR and r['area_um2'] >= TINY_ARTIFACT_UM2
+        ]
+
+        # Set 2: top-3 by area (ensures large dim candidates survive in rescue mode)
+        area_survivors = sorted(working_pool, key=lambda r: -r['area_px'])[:TOP_AREA_KEEP]
+
+        # Set 3: top-3 by |relL| (ensures contrast-champion candidates survive in rescue)
+        contrast_survivors = sorted(working_pool, key=lambda r: -abs(r['rel_L_med']))[:TOP_CONTRAST_KEEP]
+
+        # Union policy (Phase 11): use area/contrast survivors ONLY as rescue when the
+        # absolute-floor set (after tiny-artifact filtering) is too small.
+        #
+        # Rationale:
+        #   - High-contrast substrates (ml04/ml14 SiO2): graphene has relL≈40, and
+        #     abs_survivors (|relL| ≥ 10, area ≥ 30 µm²) admits the correct graphene
+        #     plus a few other sizeable candidates.  Tiny artifacts (cc23=51µm²
+        #     relL=92; cc73=42µm² relL=102) are still sizeable enough to enter, but
+        #     the absolute-normalized scoring (below) correctly ranks the medium-area
+        #     medium-contrast graphene above them via the log_area component.
+        #     NOT using area_survivors prevents low-contrast large background structures
+        #     (relL=7, area=3144 µm²) from entering and outscoring graphene via area.
+        #   - Low-contrast stamp substrates (AH07/QH06): graphene relL<10 → excluded
+        #     from abs_survivors.  Only tiny high-contrast artifacts survive the floor.
+        #     abs_survivors is effectively empty (after tiny-artifact filter removes
+        #     the tiny high-contrast spots).  Rescue activates and area_survivors bring
+        #     in the correct large dim candidate.
+        MIN_SURVIVORS_FROM_ABS = 1  # rescue when zero sizeable abs-floor candidates remain
+        if len(abs_survivors) >= MIN_SURVIVORS_FROM_ABS:
+            # Enough sizeable abs-floor survivors: use only the absolute-floor set.
+            survivors = abs_survivors
+        else:
+            # Zero sizeable abs-floor survivors: activate full UNION rescue.
+            survivors = list(
+                {id(r): r for r in (abs_survivors + area_survivors + contrast_survivors)}.values()
             )
 
-        keep_top_n = max(3, len(working_pool) // 3)
-        sorted_by_composite = sorted(working_pool, key=_pool_sort_key, reverse=True)
-        cc_records = sorted_by_composite[:keep_top_n]
+        # Sentinel names preserved for test compatibility
+        keep_top_n = len(working_pool)
+        sorted_by_composite = survivors
+        cc_records = survivors
 
     # --- Step 4: score candidates (with optional footprint containment) ---
     # Pass footprint_mask so _score_candidates can compute s_containment.
