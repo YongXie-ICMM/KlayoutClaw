@@ -274,3 +274,20 @@ def test_graphene_containment_penalty_uses_absolute_overlap():
         "graphene.py penalty must gate on BOTH fractional containment < floor "
         "AND absolute_overlap < expected_min (Phase 10c dual condition)"
     )
+
+
+def test_graphene_bridges_polarity_consistent_ccs():
+    """Phase 14: graphene.py must implement intra-flake polarity-consistent
+    bridging to recover fragmented graphene masks on mixed-thickness flakes.
+
+    Checks:
+    1. The bridging function _bridge_polarity_consistent_ccs is defined.
+    2. The physics constants BRIDGE_MAX_DISTANCE_UM and
+       BRIDGE_REL_L_MAGNITUDE_RATIO are present.
+    """
+    src = (DETECT / "graphene.py").read_text()
+    assert "_bridge_polarity_consistent_ccs" in src or "bridge_polarity" in src.lower(), (
+        "graphene.py must implement intra-flake bridging"
+    )
+    for token in ["BRIDGE_MAX_DISTANCE_UM", "BRIDGE_REL_L_MAGNITUDE_RATIO"]:
+        assert token in src, f"missing {token} constant"

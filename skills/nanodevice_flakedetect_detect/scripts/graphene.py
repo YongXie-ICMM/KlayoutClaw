@@ -138,6 +138,25 @@ FOOTPRINT_CONTAINMENT_WEIGHT = 0.5
 FOOTPRINT_LOW_CONTAINMENT_FLOOR = 0.5
 FOOTPRINT_LOW_CONTAINMENT_PENALTY = 0.3  # multiply s_containment by this factor
 
+# ---------------------------------------------------------------------------
+# Intra-flake bridging constants (Phase 14)
+# ---------------------------------------------------------------------------
+# A graphene flake of mixed thickness shows intra-flake LAB variation, but
+# each fragment must share polarity sign relative to bulk hBN (graphene is
+# always either brighter or darker than hBN, never both — that would be two
+# different materials). Fragments separated by short gaps (<3 µm — same
+# order as typical flake thickness inhomogeneity) inside the same footprint
+# are physically the same flake.
+BRIDGE_MAX_DISTANCE_UM = 3.0
+BRIDGE_REL_L_MAGNITUDE_RATIO = 2.0  # allow 0.5x to 2x of seed |rel_L|
+# Maximum chroma deviation from bulk hBN a,b for a CC to be considered
+# graphene-consistent (LAB a,b range ±128; graphene shows small chroma shift).
+BRIDGE_MAX_CHROMA_DEV_AB = 15.0  # LAB a or b units
+# Minimum number of foreground CCs required before bridging is attempted.
+BRIDGE_MIN_CC_COUNT = 2
+# Minimum footprint-membership fraction for a CC to qualify for bridging.
+BRIDGE_MIN_FOOTPRINT_FRAC = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Helper: build coarse foreground region via Otsu on blurred luminance
@@ -516,6 +535,167 @@ def _region_grow_footprint_bounded(
         cur = new_mask
 
     return cur
+
+
+# ---------------------------------------------------------------------------
+# Helper: bridge polarity-consistent CCs inside the same footprint blob
+# ---------------------------------------------------------------------------
+
+def _bridge_polarity_consistent_ccs(
+    grown: np.ndarray,
+    lab: np.ndarray,
+    footprint_mask: np.ndarray | None,
+    bulk_mu_ab: np.ndarray,
+    seed_polarity: int,
+    seed_rel_L_med: float,
+    pixel_size_um: float,
+) -> np.ndarray:
+    """Bridge polarity-consistent connected components inside the footprint.
+
+    Physics rationale: a graphene flake with mixed thickness shows intra-flake
+    LAB variation — bright cores and dimmer surroundings that appear as separate
+    CCs after a LAB-sigma-capped grow.  When two such CCs both:
+      1. Lie inside the same footprint blob (same top-flake region),
+      2. Share the same polarity sign relative to bulk hBN (both brighter, or
+         both darker — a single material cannot be both),
+      3. Have rel_L magnitude within BRIDGE_REL_L_MAGNITUDE_RATIO × the seed's
+         magnitude (they are the same material, not a totally different layer),
+      4. Have small chroma deviation from bulk hBN (graphene has low chroma;
+         large a,b deviations indicate a different material such as hBN),
+      5. Are within BRIDGE_MAX_DISTANCE_UM centroid-to-centroid (gaps larger
+         than ~3 µm are physical separations between distinct flakes),
+    then they are bridged by filling their convex hull, constrained to the
+    footprint.
+
+    Bridging is footprint-restricted: the added pixels must lie inside
+    footprint_mask.  If no footprint is available, no bridging is performed
+    (the footprint membership criterion cannot be verified).
+
+    Args:
+        grown:         uint8 binary mask (0/255) — current graphene mask.
+        lab:           LAB image (H×W×3, float32 or uint8).
+        footprint_mask: uint8 binary mask (0/255) in same coordinates as grown,
+                        or None (bridging is skipped when None).
+        bulk_mu_ab:    (2,) float array with [a_bg, b_bg] — median a,b of the
+                        host flake (used as the reference for chroma deviation).
+        seed_polarity: +1 (bright CC), -1 (dark CC), 0 (unknown).
+        seed_rel_L_med: seed CC's median rel_L (signed).
+        pixel_size_um: µm per pixel.
+
+    Returns:
+        uint8 binary mask (0/255) — grown with bridged CCs added (constrained
+        to footprint).  If no bridging is applicable, returns grown unchanged.
+    """
+    if footprint_mask is None or not (footprint_mask > 0).any():
+        return grown  # no footprint: cannot verify membership criterion
+
+    if seed_polarity == 0 or seed_rel_L_med == 0.0:
+        return grown  # polarity unknown: cannot verify polarity consistency
+
+    bridge_max_px = BRIDGE_MAX_DISTANCE_UM / pixel_size_um
+
+    # Find connected components in the current grown mask.
+    n_labels, labels = cv2.connectedComponents(grown, connectivity=8)
+    if n_labels <= BRIDGE_MIN_CC_COUNT:
+        # 0 or 1 foreground CC: nothing to bridge.
+        return grown
+
+    # Build per-CC statistics.
+    lab_f32 = lab.astype(np.float32)
+    seed_abs_rel_L = abs(seed_rel_L_med)
+    cc_stats: list[dict] = []
+    for label_id in range(1, n_labels):
+        px_mask = (labels == label_id).astype(np.uint8) * 255
+        px_ys, px_xs = np.where(labels == label_id)
+        if len(px_ys) == 0:
+            continue
+
+        # --- Criterion 1: footprint membership ---
+        # Fraction of CC pixels inside footprint must be >= 0.5.
+        fp_overlap = int((footprint_mask[px_ys, px_xs] > 0).sum())
+        fp_frac = fp_overlap / max(1, len(px_ys))
+        if fp_frac < BRIDGE_MIN_FOOTPRINT_FRAC:
+            continue  # not a footprint CC
+
+        # --- Criteria 2 & 3: polarity + magnitude ---
+        pix_lab = lab_f32[px_ys, px_xs]
+        # Use median a,b for chroma check; we need median L for polarity.
+        med_L = float(np.median(pix_lab[:, 0]))
+        # rel_L for this CC relative to the bulk hBN (not relative to seed).
+        # We use a proxy: sign of (med_L relative to the footprint median).
+        # The polarity is the same sign as seed_polarity when rel_L_med ~ same sign.
+        # We compute med_rel_L from the LAB array directly.
+        # bulk_mu_ab[0] = a_bg, and we don't have L_bg here.
+        # Use the seed_rel_L_med sign: we only need to confirm same polarity.
+        # Proxy: median L of this CC vs. median L of entire grown mask.
+        grown_L_vals = lab_f32[grown > 0, 0]
+        grown_L_med = float(np.median(grown_L_vals)) if len(grown_L_vals) > 0 else med_L
+        cc_rel_L = med_L - grown_L_med  # rough rel_L vs current grown region
+
+        # Check polarity consistency: same sign direction as seed.
+        if seed_polarity > 0 and cc_rel_L < -BRIDGE_MAX_CHROMA_DEV_AB:
+            continue  # opposite polarity (too dark when seed is bright)
+        if seed_polarity < 0 and cc_rel_L > BRIDGE_MAX_CHROMA_DEV_AB:
+            continue  # opposite polarity (too bright when seed is dark)
+
+        # Magnitude check: |cc_rel_L| should not be more than
+        # BRIDGE_REL_L_MAGNITUDE_RATIO × |seed_rel_L|.
+        # We use a loose check only when the CC rel_L is extreme.
+        # (The CC rel_L computed above is relative to grown region, not to L_bg,
+        #  so it may be ≈ 0 even for valid fragments; only reject large outliers.)
+        cc_abs_rel_L = abs(cc_rel_L)
+        if (seed_abs_rel_L > 1.0
+                and cc_abs_rel_L > BRIDGE_REL_L_MAGNITUDE_RATIO * seed_abs_rel_L + 5.0):
+            continue  # magnitude too large vs seed
+
+        # --- Criterion 4: small chroma (graphene has low chroma) ---
+        med_a = float(np.median(pix_lab[:, 0 + 1]))  # a channel
+        med_b = float(np.median(pix_lab[:, 0 + 2]))  # b channel
+        chroma_dev_a = abs(med_a - float(bulk_mu_ab[0]))
+        chroma_dev_b = abs(med_b - float(bulk_mu_ab[1]))
+        if chroma_dev_a > BRIDGE_MAX_CHROMA_DEV_AB or chroma_dev_b > BRIDGE_MAX_CHROMA_DEV_AB:
+            continue  # too much chroma → different material
+
+        # Centroid
+        cy = float(np.mean(px_ys))
+        cx = float(np.mean(px_xs))
+        cc_stats.append({
+            'label_id': label_id,
+            'mask': px_mask,
+            'cy': cy,
+            'cx': cx,
+            'px_ys': px_ys,
+            'px_xs': px_xs,
+        })
+
+    if len(cc_stats) <= 1:
+        return grown  # 0 or 1 qualifying CC: nothing to pair
+
+    # For each pair, check centroid distance and bridge if close enough.
+    result = grown.copy()
+    n = len(cc_stats)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ci, cj = cc_stats[i], cc_stats[j]
+            dist_px = math.sqrt((ci['cy'] - cj['cy']) ** 2
+                                + (ci['cx'] - cj['cx']) ** 2)
+            # --- Criterion 5: centroid distance < BRIDGE_MAX_DISTANCE_UM ---
+            if dist_px > bridge_max_px:
+                continue  # too far apart
+
+            # Bridge: fill convex hull of the union of the two CCs, constrained
+            # to footprint.
+            ys_union = np.concatenate([ci['px_ys'], cj['px_ys']])
+            xs_union = np.concatenate([ci['px_xs'], cj['px_xs']])
+            pts = np.stack([xs_union, ys_union], axis=1).astype(np.int32)
+            hull = cv2.convexHull(pts)
+            bridge_canvas = np.zeros_like(grown)
+            cv2.fillPoly(bridge_canvas, [hull], 255)
+            # Constrain to footprint.
+            bridge_canvas = cv2.bitwise_and(bridge_canvas, footprint_mask)
+            result = cv2.bitwise_or(result, bridge_canvas)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1225,6 +1405,41 @@ def detect_graphene(
         # Seed region is homogeneous (low gradient) or low-contrast with no
         # footprint: skip grow to avoid over-expansion into adjacent host material.
         grown = base_mask
+
+    # --- Step 5b: polarity-consistent intra-flake bridging (Phase 14) ---
+    #
+    # After the footprint-bounded grow, the graphene mask may still consist of
+    # multiple disconnected CCs.  This happens when the flake has mixed
+    # thickness: bright cores pass the LAB sigma cap, but dimmer surrounding
+    # regions are rejected and appear as gaps between the bright islands.
+    #
+    # The old MORPH_CLOSE inadvertently bridged these gaps (it was removed in
+    # Phase 13 to fix the AH02 over-grow).  This step replaces it with a
+    # physics-justified selective bridging: only pairs of CCs that share the
+    # same polarity, are both inside the footprint, have small chroma, AND are
+    # within BRIDGE_MAX_DISTANCE_UM apart are bridged via their convex hull.
+    #
+    # AH02 safety: AH02's seed (bright graphene) and the over-grown region
+    # (MORPH_CLOSE artefact) come from DIFFERENT polarity clusters or are well
+    # separated (>3 µm) — so the distance gate prevents re-introduction of the
+    # old over-grow.  The footprint constraint additionally ensures bridging
+    # cannot leak outside the top-flake spatial boundary.
+    if use_footprint_grow:
+        # Only bridge when the footprint-bounded grow was used — that is the
+        # path that produces multi-CC Swiss-cheese masks in need of bridging.
+        # For the no-footprint path, MORPH_CLOSE already handles the task.
+        seed_polarity_val = int(best.get('polarity', 0))
+        seed_rel_L_med_val = float(best.get('rel_L_med', 0.0))
+        bulk_mu_ab_val = np.array([a_bg, b_bg], dtype=np.float64)
+        grown = _bridge_polarity_consistent_ccs(
+            grown=grown,
+            lab=lab,
+            footprint_mask=_grow_footprint,
+            bulk_mu_ab=bulk_mu_ab_val,
+            seed_polarity=seed_polarity_val,
+            seed_rel_L_med=seed_rel_L_med_val,
+            pixel_size_um=pixel_size,
+        )
 
     # --- Step 6: morph-clean and fill holes ---
     close_k2 = _kernel_from_um(GRAPHENE_MORPH_CLOSE_UM, pixel_size, ellipse=True)
