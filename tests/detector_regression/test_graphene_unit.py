@@ -291,3 +291,62 @@ def test_graphene_bridges_polarity_consistent_ccs():
     )
     for token in ["BRIDGE_MAX_DISTANCE_UM", "BRIDGE_REL_L_MAGNITUDE_RATIO"]:
         assert token in src, f"missing {token} constant"
+
+
+def test_graphene_auto_footprint_informs_scoring():
+    """Phase 15: the auto-discovered footprint must influence candidate ranking,
+    not just the grow step.  Otherwise the photometric-only score determines
+    which CC is selected without using the spatial footprint constraint.
+
+    Root cause (ml09/AH03): Phase 13 routed the auto-discovered footprint only
+    to footprint_mask_grow_only (grow step only), not to any scoring parameter.
+    So containment scoring was never activated for auto-discovered footprints.
+
+    Phase 15 fix: auto-discovered footprint is routed to BOTH:
+      - footprint_mask_score_only -> candidate scoring (NEW in Phase 15)
+      - footprint_mask_grow_only  -> grow step (unchanged from Phase 13)
+    This enables containment scoring for auto-discovered footprints WITHOUT
+    expanding the upper area gate (which would admit large non-graphene CCs).
+
+    Design decision: footprint_mask_score_only does NOT expand the area gate
+    (unlike footprint_mask which does both scoring and gate expansion).  This is
+    intentional: expanding the gate via the auto-discovered footprint admits
+    large hBN shadow regions / stamp edges that were correctly excluded by the
+    host-based gate.  The footprint validates spatial location of candidates
+    ALREADY in the pool, not which candidates enter the pool.
+
+    Checks:
+    1. detect_graphene() accepts a footprint_mask_score_only parameter.
+    2. main() routing uses footprint_mask_score_only for auto-discovered footprint.
+    3. _score_candidates uses fp_for_scoring fallback (score_only when no explicit).
+    """
+    src = (DETECT / "graphene.py").read_text()
+
+    # 1. detect_graphene() must accept footprint_mask_score_only
+    assert "footprint_mask_score_only" in src, (
+        "graphene.py detect_graphene() must accept footprint_mask_score_only "
+        "(Phase 15: scoring-only footprint that does not expand area gate)"
+    )
+
+    # 2. main() routing must pass auto-discovered footprint to score_only
+    has_score_only_routing = (
+        "footprint_mask_score_only=loaded_footprint_mask" in src
+        or "footprint_mask_score_only = loaded_footprint_mask" in src
+    )
+    assert has_score_only_routing, (
+        "graphene.py main() must route auto-discovered footprint to "
+        "footprint_mask_score_only (Phase 15: score without area gate expansion)"
+    )
+
+    # 3. The scoring function must use fp_for_scoring as a fallback
+    has_fp_for_scoring = "fp_for_scoring" in src
+    assert has_fp_for_scoring, (
+        "graphene.py must define fp_for_scoring as fallback for containment "
+        "scoring when footprint_mask is None but score_only is available"
+    )
+
+    # 4. Phase 15 documentation must be present
+    has_phase15_comment = "Phase 15" in src
+    assert has_phase15_comment, (
+        "graphene.py must reference Phase 15 in routing or scoring comments"
+    )

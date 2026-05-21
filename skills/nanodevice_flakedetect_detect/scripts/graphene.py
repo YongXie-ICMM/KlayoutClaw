@@ -39,8 +39,12 @@ CLI:
     [--footprint-mask PATH]  optional: footprint mask in full_stack coords.
                              Auto-locates warp_top.npy in the same directory
                              to warp the mask into mirrored-top_part coords.
-                             When omitted, footprint scoring is skipped
-                             (backward compatible).
+                             When omitted, auto-discovery is attempted from
+                             {stack}/output/align/footprint_mask.png.
+                             Phase 15: auto-discovered footprint now informs
+                             candidate scoring (footprint_mask_score_only) as
+                             well as grow (footprint_mask_grow_only), without
+                             expanding the area gate (host-based gate preserved).
 
 Outputs in --output-dir:
     graphene_mask.png
@@ -900,8 +904,28 @@ def _score_candidates(records: list[dict], host_area_um2: float,
     #
     # Final score:
     #   Without footprint: score = phot
-    #   With footprint:    score = FOOTPRINT_CONTAINMENT_WEIGHT × s_containment
+    #   With footprint:    score = FOOTPRINT_CONTAINMENT_WEIGHT × containment_raw
     #                            + (1 - FOOTPRINT_CONTAINMENT_WEIGHT) × phot
+    #
+    # Phase 15 note: we use containment_raw (the fractional containment in [0,1])
+    # rather than s_containment (the adjusted score with absolute-overlap saturation)
+    # in the final score formula.  The adjusted s_containment saturates to 1.0 for
+    # any candidate with sufficient absolute overlap, which flattens the difference
+    # between a candidate with 90% containment (only 10% outside the footprint) and
+    # one with 100% containment.  The raw fraction preserves this signal:
+    #
+    # Physics example (AH03): The correct graphene CC has raw_cont=1.00 (entirely
+    # inside footprint) while the wrong bright CC has raw_cont=0.90 (10% outside).
+    # With containment_raw in the score:
+    #   correct CC: 0.5×1.00 + 0.5×0.445 = 0.723 (wins)
+    #   wrong CC:   0.5×0.90 + 0.5×0.492 = 0.696
+    # With s_containment (both saturate to 1.0 via absolute overlap): scores
+    # collapse to 0.722 vs 0.746 — wrong CC wins because phot dominates.
+    #
+    # The s_containment value is retained in the record for diagnostics but is
+    # no longer used in the final score computation.  Low-containment candidates
+    # (raw_cont < 0.5) are naturally penalised by the raw fraction — no additional
+    # penalty multiplier is needed.
     #
     # Note: s_area, s_contrast, s_solidity are computed above and stored for
     # downstream diagnostics.  Only the final 'score' is recomputed here.
@@ -915,8 +939,10 @@ def _score_candidates(records: list[dict], host_area_um2: float,
         )
         phot = float(min(1.0, composite / 30.0))
         if use_containment and r.get('s_containment') is not None:
+            # Phase 15: use raw fractional containment to preserve signal between
+            # 90% and 100% contained candidates.  See comment above for rationale.
             r['score'] = float(
-                FOOTPRINT_CONTAINMENT_WEIGHT * r['s_containment']
+                FOOTPRINT_CONTAINMENT_WEIGHT * r['containment_raw']
                 + (1.0 - FOOTPRINT_CONTAINMENT_WEIGHT) * phot
             )
         else:
@@ -936,6 +962,7 @@ def detect_graphene(
     cluster_id: int | None = None,
     footprint_mask: np.ndarray | None = None,
     footprint_mask_grow_only: np.ndarray | None = None,
+    footprint_mask_score_only: np.ndarray | None = None,
 ) -> dict:
     """Detect graphene in the top_part image.
 
@@ -948,18 +975,27 @@ def detect_graphene(
         footprint_mask: Optional uint8 binary mask (0/255) in mirrored-top_part
             coordinates.  When supplied, candidate scoring includes a spatial
             containment term (Phase 10a) that heavily favours candidates inside
-            the footprint.  When None, scoring falls back to the photometric-only
+            the footprint, AND expands the upper area gate to AREA_MAX_FOOTPRINT_FRAC
+            of the footprint.  When None, scoring falls back to the photometric-only
             approach (backward compatible).
         footprint_mask_grow_only: Optional uint8 binary mask (0/255) used ONLY
-            for the region-grow step (Phase 13).  Unlike footprint_mask, this
-            does NOT influence candidate scoring — it preserves the existing
-            photometric-only candidate ranking while enabling footprint-bounded
-            grow for better extent recovery.  Use this when the footprint was
-            auto-discovered (not explicitly provided by the agent) to avoid
-            altering the candidate selection that was calibrated without
-            footprint scoring.  When both footprint_mask and
+            for the region-grow step (Phase 13).  Does NOT influence candidate
+            scoring or the upper area gate.  When both footprint_mask and
             footprint_mask_grow_only are provided, footprint_mask takes priority
             for both scoring and grow.
+        footprint_mask_score_only: Optional uint8 binary mask (0/255) used ONLY
+            for candidate scoring (Phase 15).  Unlike footprint_mask, this does
+            NOT expand the upper area gate — the area gate remains host-based
+            (preserving the Phase 13 candidate pool size for auto-discovered
+            footprints).  This is the correct parameter for auto-discovered
+            footprints: scoring benefit without admitting new large candidates
+            that are not the graphene layer.
+            Physics: the footprint validates spatial location of candidates
+            already in the pool.  Expanding the area gate would let in new
+            large CCs (potentially dark hBN shadow regions) that were
+            correctly excluded by the host-based gate.
+            When footprint_mask is provided, footprint_mask_score_only is ignored
+            (footprint_mask takes priority for scoring).
 
     Returns a dict with keys:
         graphene_mask, graphene_contour, top_flake_mask, processed_image,
@@ -1257,8 +1293,15 @@ def detect_graphene(
     # footprint_mask must be in mirrored-top_part coordinates (i.e. same
     # coordinate system as the cc_masks produced above).  The caller is
     # responsible for loading and warping it before calling detect_graphene.
+    #
+    # Phase 15: footprint_mask_score_only provides scoring without area gate
+    # expansion.  Use it as a fallback when footprint_mask is not provided.
+    # This enables containment scoring for auto-discovered footprints while
+    # preserving the candidate pool size (no new large CCs admitted).
+    # fp_for_scoring: auto-discovered footprint for ranking (Phase 15)
+    fp_for_scoring = footprint_mask if footprint_mask is not None else footprint_mask_score_only
     cc_records = _score_candidates(cc_records, host_area_um2=host_area_um2,
-                                   footprint_mask=footprint_mask)
+                                   footprint_mask=fp_for_scoring)
     cc_records.sort(key=lambda r: r['score'], reverse=True)
 
     # Allow explicit override via cluster_id (0-based rank).
@@ -1591,21 +1634,37 @@ def main():
             print(f'Footprint mask loaded and warped to top_part coords '
                   f'(area={fp_area}px).')
 
-    # Route the footprint to the right parameter (Phase 13):
-    # - When --footprint-mask is explicit (args.footprint_mask): pass as
-    #   footprint_mask so it influences BOTH candidate scoring AND grow.
-    #   Physics: the agent deliberately provided the footprint to guide selection.
-    # - When auto-discovered (footprint_source != args.footprint_mask): pass as
-    #   footprint_mask_grow_only so it influences ONLY the grow step.
-    #   Physics: auto-discovery should expand the photometrically-selected seed
-    #   to the footprint extent, without altering which candidate ranks first
-    #   (that ranking was calibrated without footprint scoring).
+    # Route the footprint to the right parameter (Phase 15):
+    # Universal principle: the footprint represents the same physical constraint
+    # regardless of how the script learned about it.  The top-alignment footprint
+    # marks the spatial extent of the deposited top-flake material — this is a
+    # universal property of vdW stack imaging, not a sample-specific prior.
+    # The candidate's spatial location within the deposited flake is informative
+    # for ranking, period.  The difference between explicit and auto-discovered
+    # footprints is only in the SIDE EFFECTS:
+    #
+    # - Explicit (--footprint-mask): footprint_mask → scoring + grow + area gate
+    #   expansion.  The agent deliberately provides the footprint to guide the
+    #   full detection pipeline.
+    #
+    # - Auto-discovered: footprint_mask_score_only → scoring only (Phase 15 NEW)
+    #                    footprint_mask_grow_only   → grow only (Phase 13)
+    #   The auto-discovered footprint informs ranking (same physics) but must NOT
+    #   expand the upper area gate.  Expanding the gate would admit new large CCs
+    #   (hBN shadow regions, stamp edges) that were correctly excluded by the
+    #   host-based gate.  The grow step uses the footprint directly as its spatial
+    #   bound — this was already Phase 13 behavior.
+    #
+    # fp_for_scoring = explicit_footprint or auto_discovered_footprint (Phase 15)
+    # fp_for_grow    = explicit_footprint or auto_discovered_footprint (Phase 13)
+    # area_gate_expansion = explicit_footprint only (unchanged from Phase 10b)
     explicit_footprint_requested = bool(args.footprint_mask)
     result = detect_graphene(
         img, args.pixel_size, mirror=args.mirror,
         cluster_id=args.cluster_id,
         footprint_mask=loaded_footprint_mask if explicit_footprint_requested else None,
         footprint_mask_grow_only=loaded_footprint_mask if not explicit_footprint_requested else None,
+        footprint_mask_score_only=loaded_footprint_mask if not explicit_footprint_requested else None,
     )
 
     print(f'L_bg(flake)={result.get("L_bg", "?"):.1f}, '
