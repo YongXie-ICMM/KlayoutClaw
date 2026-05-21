@@ -24,7 +24,7 @@ Pipeline (adaptive throughout; no hand-tuned per-stack thresholds):
         s_strip   = 1 - sqrt(lambda_min / lambda_max)  (PCA aspect)
         s_central = mean(dt over candidate) / max(dt over host)
         s_gray    = 1 - chroma / SCORE_CHROMA_NORM
-                    (chroma measured vs bulk a,b mean — substrate-aware)
+                    (chroma measured vs bulk-mode a,b — host-relative)
         s_contrast= min(1, dist_to_bulk_mode / SCORE_CONTRAST_NORM)
         s_cohere  = largest-CC fraction
         score = score_weights(sub_scores) · [s_strip, s_central,
@@ -125,8 +125,15 @@ LOW_CONFIDENCE_FLOOR = 0.40
 # Default + clamp ranges for agent-controllable hyperparameters
 DEFAULT_TOP_N = 8
 MAX_TOP_N = 12
-DEFAULT_REFINE_ITERS = 5
+DEFAULT_REFINE_ITERS = 10
 MAX_REFINE_ITERS = 10
+
+# Per-iteration area-growth cap for early termination of region-grow.
+# Exfoliated graphite flakes grow smoothly (~3-8 % per step) under the
+# local-mean criterion.  A sudden jump ≥ 25 % in one step means the
+# frontier bridged into an adjacent host region; rolling back that step
+# and stopping prevents absorbing non-graphite material.
+REFINE_MAX_SINGLE_ITER_GROW = 0.25  # fraction of current area per step
 
 # Minimum CC count needed for PCA aspect (sentinels are fine as comparison)
 MIN_PX_FOR_PCA = 5
@@ -830,21 +837,30 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
                      ) -> list[dict[str, Any]]:
     """Compute 5 score components per candidate and sort by score desc.
 
-    Chroma is measured relative to the substrate mean a,b channels
-    (mu_sub[1], mu_sub[2]) — substrate-aware, not the fixed LAB neutral
-    point.  Weights are derived from the variance of each sub-score across
-    candidates (calibrated confidence-driven weights via score_weights()).
+    Chroma (s_gray) is measured relative to the bulk-mode a,b channels of
+    the host (``bulk_mu_lab[1], bulk_mu_lab[2]``).  Using the bulk mode as
+    the chromatic neutral reference is more physically correct than using
+    the substrate: graphite and hBN both absorb weakly and their LAB a,b
+    values track the same per-image illumination shift that the bulk mode
+    captures.  The substrate lies outside the host mask and may have
+    substantially different a,b channels.  Weights are derived from the
+    variance of each sub-score across candidates (calibrated confidence-
+    driven weights via score_weights()).
     """
     host_dt = cv2.distanceTransform(host, cv2.DIST_L2, 5)
     max_dt = float(host_dt.max()) if host_dt.max() > 0 else 1.0
-    # Substrate a,b as chromatic neutral — graphite and substrate share
-    # similar hue; using substrate mean avoids dependency on fixed LAB point.
-    if mu_sub is not None:
-        neutral_a = float(mu_sub[1])
-        neutral_b = float(mu_sub[2])
-    else:
-        neutral_a = float(bulk_mu_lab[1])
-        neutral_b = float(bulk_mu_lab[2])
+    # Bulk-mode a,b as chromatic neutral for s_gray.
+    # Graphite should look achromatic RELATIVE TO the dominant host material
+    # (bulk mode = bottom hBN typically), not relative to the substrate which
+    # is outside the host mask.  The substrate a,b channels often differ
+    # substantially from the host image baseline (e.g. substrate b=132 while
+    # the entire host image has b≈84); using substrate as reference makes
+    # graphite appear highly chromatic even when it is optically neutral
+    # relative to its surrounding material.  Physics: graphite and hBN both
+    # absorb weakly in the visible; their LAB a,b values track the same
+    # illumination-dependent shift — the bulk mode captures that shift.
+    neutral_a = float(bulk_mu_lab[1])
+    neutral_b = float(bulk_mu_lab[2])
     for c in merged_candidates:
         # area + mean_lab + cohere
         merged_mask = c['mask']
@@ -958,6 +974,7 @@ def refine_candidates(merged_candidates: list[dict[str, Any]],
     keep_min_area_px = int(30.0 / (pixel_size ** 2))
     for c in merged_candidates:
         refined = (c['mask'] > 0).astype(np.uint8) * 255
+        prev_area_px = int((refined > 0).sum())
         for _ in range(iters):
             dilated = cv2.dilate(refined, dil3)
             frontier = ((dilated > 0) & (refined == 0) & (host > 0))
@@ -978,7 +995,16 @@ def refine_candidates(merged_candidates: list[dict[str, Any]],
             add = frontier & safe & (d_local < lam * d_bulk_full)
             if not add.any():
                 break
-            refined = refined | (add.astype(np.uint8) * 255)
+            candidate = refined | (add.astype(np.uint8) * 255)
+            # Early-stop: a >25 % area jump in one step signals the frontier
+            # bridged into an adjacent host region; reject that step and stop.
+            new_area_px = int((candidate > 0).sum())
+            if (prev_area_px > 0
+                    and (new_area_px - prev_area_px)
+                    > REFINE_MAX_SINGLE_ITER_GROW * prev_area_px):
+                break
+            refined = candidate
+            prev_area_px = new_area_px
         refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, open_k5)
         refined = keep_largest_n(refined, n=1, min_area=keep_min_area_px)
         c['refined_mask'] = refined
