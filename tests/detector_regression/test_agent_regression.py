@@ -1,6 +1,6 @@
-"""Agent-driven detector regression test (Phase 0.75).
+"""Agent-driven detector regression test (Phase 9 / 0.8 gate).
 
-Gate: per-stack weighted GT score >= 0.5.
+Gate: per-stack weighted GT score >= 0.8.
 
 Each test dispatches a focused Claude Code agent to:
   1. Run all 4 detectors on the stack's microscope images.
@@ -12,16 +12,19 @@ Each test dispatches a focused Claude Code agent to:
 The harness scores that result.gds against Aligned_Stack.gds via
 detect_evaluator.evaluate_flake_detect (canonical, read-only evaluator).
 
+Scope expansion (Phase 9): 5 mlxx stacks → all 18 bench stacks
+  (5 mlxx + 5 AH + 5 HM + 3 QH). Gate raised from 0.5 → 0.8.
+
 Why not the static baseline gate (test_gt_regression.py)?
   BASELINE_SCORES in gt_evaluator.py were measured from existing result.gds
   files produced by the qlaybot agent using vision-in-the-loop --cluster-id
   overrides. Comparing default-algorithm outputs to agent-with-vision baselines
-  is structurally biased: the default algorithm cannot reach a score the agent
+  is structurally biased: the default algorithm cannot reach a baseline the agent
   achieved by looking at the microscope images. The agent-driven gate is the
   honest measurement: can the new detector code, used by an agent with the same
-  affordances, produce a good result?
+  affordances, produce a high-quality result?
 
-See: docs/superpowers/plans/2026-05-20-detector-de-tuning.md § Phase 0.75
+See: docs/superpowers/plans/2026-05-20-detector-de-tuning.md § Phase 9
 """
 from __future__ import annotations
 
@@ -39,12 +42,21 @@ from agent_evaluator import score_stack_with_agent
 # Gate configuration
 # ---------------------------------------------------------------------------
 
-WEIGHTED_FLOOR = 0.5
-STACKS = ["ml04", "ml08", "ml09",
-          pytest.param("ml11", marks=pytest.mark.xfail(
-              reason="ml11 graphene IoU structurally < 0.4 tier — needs upstream "
-                     "detector improvement beyond this plan's scope")),
-          "ml14"]
+WEIGHTED_FLOOR = 0.8
+STACKS = [
+    # mlxx series (original 5 from Phase 0.75)
+    "ml04", "ml08", "ml09",
+    pytest.param("ml11", marks=pytest.mark.xfail(
+        reason="ml11 graphene IoU structurally < 0.4 tier — needs upstream "
+               "detector improvement beyond this plan's scope")),
+    "ml14",
+    # AH series (5 stacks, Phase 9 expansion)
+    "AH02", "AH03", "AH05", "AH06", "AH07",
+    # HM series (5 stacks, Phase 9 expansion)
+    "HM05", "HM06", "HM07", "HM08", "HM11",
+    # QH series (3 stacks, Phase 9 expansion)
+    "QH06", "QH07", "QH12",
+]
 
 # Per-test timeout in seconds. Each stack involves ~4 detector runs
 # plus combine + gdsalign: budget 10 minutes.

@@ -43,7 +43,54 @@ COMBINE_SCRIPTS = REPO_ROOT / "skills" / "nanodevice_flakedetect_combine" / "scr
 GDSALIGN_SCRIPTS = REPO_ROOT / "skills" / "nanodevice_gdsalign" / "scripts"
 
 FIXTURE_ROOT = Path("/Volumes/RandomData/harbour-workspace/qlaybot/detect")
-GT_ROOT = Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench-qlaybot")
+
+# Primary GT root: klayout-bench-bare-codex contains flake_detect_<stack>/tests/
+# for all 18 bench stacks. The legacy klayout-bench-qlaybot has device_design_
+# prefixes only and is kept as a fallback.
+GT_SEARCH_ROOTS = [
+    Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench-bare-codex"),
+    Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench-bare-claude_code"),
+    Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench-qlaybot"),
+    Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench-coevolve"),
+    Path("/Users/andrewwayne/KLayout_Harbour/datasets/klayout-bench"),
+]
+# Dir-name prefixes to try (in order): flake_detect_ first (canonical for this
+# task), then device_design_ and e2e_device_design_ as fallbacks.
+GT_DIR_PREFIXES = ["flake_detect_", "device_design_", "e2e_device_design_"]
+
+
+def _resolve_gt_gds(stack: str) -> Path:
+    """Locate Aligned_Stack.gds for *stack* across multiple benchmark roots.
+
+    Searches GT_SEARCH_ROOTS × GT_DIR_PREFIXES in order.  Returns the first
+    match, or raises FileNotFoundError with a descriptive message if none found.
+    """
+    tried = []
+    for bench in GT_SEARCH_ROOTS:
+        for prefix in GT_DIR_PREFIXES:
+            candidate = bench / f"{prefix}{stack}" / "tests" / "Aligned_Stack.gds"
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate
+    raise FileNotFoundError(
+        f"Aligned_Stack.gds not found for stack '{stack}'. Tried:\n"
+        + "\n".join(f"  {p}" for p in tried)
+    )
+
+
+def _resolve_evaluator_py(stack: str) -> Path:
+    """Locate detect_evaluator.py for *stack* (same search as GT GDS)."""
+    tried = []
+    for bench in GT_SEARCH_ROOTS:
+        for prefix in GT_DIR_PREFIXES:
+            candidate = bench / f"{prefix}{stack}" / "tests" / "detect_evaluator.py"
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate
+    raise FileNotFoundError(
+        f"detect_evaluator.py not found for stack '{stack}'. Tried:\n"
+        + "\n".join(f"  {p}" for p in tried)
+    )
 
 CONDA_PYTHON = "/Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python"
 
@@ -57,7 +104,7 @@ DEFAULT_PIXEL_SIZE_UM = 0.106
 
 def _load_evaluator(stack: str):
     """Import detect_evaluator.py from the GT fixture (canonical, read-only)."""
-    evaluator_path = GT_ROOT / f"flake_detect_{stack}" / "tests" / "detect_evaluator.py"
+    evaluator_path = _resolve_evaluator_py(stack)
     spec = importlib.util.spec_from_file_location("detect_evaluator", evaluator_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -424,16 +471,26 @@ def score_stack_with_agent(
     stack_input = stack_dir / "input"
     align_dir = stack_dir / "output" / "align"
     gdsalign_dir = stack_dir / "output" / "gdsalign"
-    gt_gds = GT_ROOT / f"flake_detect_{stack}" / "tests" / "Aligned_Stack.gds"
 
+    # Environmental pre-checks: missing fixture dirs → pytest.skip (not fail)
+    # so that a missing external drive shows up as N skipped, not N failed.
+    import pytest as _pytest  # noqa: PLC0415  (local import to keep top-level clean)
     for p, label in [
         (stack_input, "stack input dir"),
-        (align_dir, "align output dir"),
-        (gdsalign_dir, "gdsalign output dir"),
-        (gt_gds, "Aligned_Stack.gds"),
+        (align_dir, "align output dir (warp_sift_bottom.npy, warp_top.npy, etc.)"),
+        (gdsalign_dir, "gdsalign output dir (gds_warp.npy)"),
     ]:
         if not p.exists():
-            raise FileNotFoundError(f"{label} not found: {p}")
+            _pytest.skip(
+                f"[env] {label} not found for stack '{stack}': {p}. "
+                "Mount the fixture volume or run the align/gdsalign stages first."
+            )
+
+    # Locate GT GDS — skip if no benchmark root contains it.
+    try:
+        gt_gds = _resolve_gt_gds(stack)
+    except FileNotFoundError as exc:
+        _pytest.skip(f"[env] No GT GDS for stack '{stack}': {exc}")
 
     # ---- Prepare working directory ----
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -492,6 +549,14 @@ def score_stack_with_agent(
 
     # ---- Save transcript ----
     transcript_path.write_text(transcript, encoding="utf-8", errors="replace")
+
+    # ---- Persist stderr to a dedicated per-stack file for post-run triage ----
+    if stderr_output:
+        stderr_log_dir = Path("/tmp/phase9_run")
+        stderr_log_dir.mkdir(parents=True, exist_ok=True)
+        (stderr_log_dir / f"{stack}.stderr").write_text(
+            stderr_output, encoding="utf-8", errors="replace"
+        )
 
     if timed_out:
         raise TimeoutError(
