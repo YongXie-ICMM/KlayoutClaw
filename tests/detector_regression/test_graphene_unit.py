@@ -199,6 +199,13 @@ def test_graphene_contrast_filter_is_pool_relative():
     )
 
 
+def test_graphene_no_grow_for_plausible_seed():
+    src = (DETECT / "graphene.py").read_text()
+    assert "SEED_NOGROW_FOOTPRINT_FRAC" in src, (
+        "graphene.py needs a no-grow short-circuit for plausible seeds"
+    )
+
+
 def test_graphene_containment_penalty_uses_absolute_overlap():
     """Phase 10c: the containment penalty must consider absolute overlap area,
     not just fractional containment.

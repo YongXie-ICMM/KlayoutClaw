@@ -1010,67 +1010,118 @@ def detect_graphene(
     seed_area_px = int((base_mask > 0).sum())
     seed_abs_rel_L = float(abs(best.get('rel_L_med', 0.0)))
     GRADIENT_EVIDENCE_FLOOR = 5.0
-    # Footprint-bounded grow criteria (Phase 10b):
-    #
-    # The footprint-bounded grow is applied only when ALL conditions are met:
-    #  1. Footprint mask is available and non-empty.
-    #  2. Seed contrast |rel_L| >= FOOTPRINT_GROW_MIN_SEED_CONTRAST (10.0 L-units).
-    #     Low-contrast seeds have broad LAB std that would admit most footprint
-    #     pixels, causing the grow to fill the entire footprint.
-    #  3. Seed area < FOOTPRINT_GROW_MAX_SEED_FRACTION × footprint area (0.10).
-    #     When the seed already occupies a substantial fraction of the footprint
-    #     (>10%), it is likely already a good representation of the graphene region.
-    #     Further growth tends to over-expand into adjacent non-graphene footprint
-    #     areas (AH02, AH05 observed regressions).  A strict 10% cap ensures the
-    #     footprint-bounded grow is only used when the seed is clearly a fragment
-    #     (e.g., a bright core segment of a larger graphene flake — ml09 cc8 at 23%
-    #     of footprint pre-Phase-10b). With the new area gate expansion allowing
-    #     larger CCs, such small-fragment seeds are less common; the strict cap
-    #     prevents regressions on stacks with correctly-sized seeds.
-    #
-    # Fall-through to gradient-leakage grow (conservative 1.50× area cap) for
-    # all other cases.  The 1.50× cap is an increase from the Phase 2 1.10× cap,
-    # allowing more growth on stacks where the polarity threshold captures only
-    # the bright core and the gradient boundary is clear (ml09, AH03).
-    FOOTPRINT_GROW_MIN_SEED_CONTRAST = 10.0
-    FOOTPRINT_GROW_MAX_SEED_FRACTION = 0.10  # only grow if seed < 10% of footprint
-    fp_area_for_grow = (
+
+    # Compute seed fraction relative to footprint (used in grow-cap logic below).
+    # When footprint_mask is available, use footprint area as denominator —
+    # it is the physically correct upper bound for how large a graphene region
+    # can be.  Fall back to host area when no footprint is available.
+    _fp_area_for_frac = (
         int((footprint_mask > 0).sum())
-        if footprint_mask is not None else 0
+        if footprint_mask is not None and (footprint_mask > 0).any()
+        else host_area_px
     )
-    seed_fp_fraction = (
-        seed_area_px / max(fp_area_for_grow, 1)
-        if fp_area_for_grow > 0 else 1.0
+    seed_frac = seed_area_px / max(1, _fp_area_for_frac)
+
+    # --- No-grow short-circuit for plausible seeds (Phase 10d) ---
+    # If the seed candidate is LARGE relative to the footprint (>= 5% of footprint
+    # area), the polarity-threshold already captured a substantial fraction of the
+    # graphene.  Further grow via the leakage-check path (1.50× cap) tends to
+    # over-expand into ambiguous boundary pixels that share the seed's LAB
+    # distribution but are NOT graphene (AH02: seed=938 µm², grow→1105 µm²,
+    # GT=944 µm²).  For these large seeds, skip grow and use the seed as-is.
+    #
+    # Rationale for the 5% threshold:
+    #   - Seeds below 5% of footprint are fragments that genuinely benefit from
+    #     grow (ml09, AH03, AH05 — seeds << 1% of footprint, correct graphene is
+    #     much larger).  The leakage-check grow recovers these partial seeds.
+    #   - Seeds above 5% of footprint are already substantially sized relative to
+    #     the deposited flake region.  Growing further from a large seed adds noise.
+    #   - AH02 empirically: seed≈938 µm², footprint≈ a few thousand µm².  seed_frac
+    #     is well above 5%.  The guard fires and prevents the 1105 µm² over-expand.
+    #   - ml04 empirically: seed is a smaller fraction of footprint → guard does
+    #     not fire → grow proceeds normally (ml04 graphene 0.829 unaffected).
+    #
+    # The footprint-bounded grow (use_footprint_grow) is already gated by
+    # FOOTPRINT_GROW_MAX_SEED_FRACTION = 0.10, so only the leakage-check grow
+    # path is reached for large seeds; the no-grow guard below prevents it.
+    SEED_NOGROW_FOOTPRINT_FRAC_LO = 0.005  # 0.5 % — minimum plausible graphene size
+    SEED_NOGROW_FOOTPRINT_FRAC_HI = 0.30   # 30 % — above this, seed fills footprint
+    # Large-seed threshold: seeds above this fraction are already well-sized.
+    # Only applies when footprint is available (makes the threshold physically grounded).
+    SEED_LARGE_FOOTPRINT_FRAC = 0.05  # 5 % of footprint → skip grow
+
+    use_footprint_for_nogrow = (
+        footprint_mask is not None and (footprint_mask > 0).any()
     )
-    use_footprint_grow = (
-        footprint_mask is not None
-        and fp_area_for_grow > 0
-        and seed_abs_rel_L >= FOOTPRINT_GROW_MIN_SEED_CONTRAST
-        and seed_fp_fraction < FOOTPRINT_GROW_MAX_SEED_FRACTION
+    seed_is_large = (
+        use_footprint_for_nogrow
+        and SEED_NOGROW_FOOTPRINT_FRAC_LO <= seed_frac
+        and seed_frac >= SEED_LARGE_FOOTPRINT_FRAC
     )
-    if use_footprint_grow:
-        # Phase 10b: footprint-bounded grow — no area cap, footprint is the bound.
-        # Pass seed polarity and rel_L to apply directional constraint (prevents
-        # a bright seed from growing into dark footprint areas and vice versa).
-        seed_polarity_val = int(best.get('polarity', 0))
-        grown = _region_grow_footprint_bounded(
-            base_mask, lab, footprint_mask, pixel_size,
-            seed_polarity=seed_polarity_val,
-            rel_L_image=rel_L,
-        )
-    elif len(seed_grads) > 0 and float(np.percentile(seed_grads, 90)) > GRADIENT_EVIDENCE_FLOOR:
-        # Gradient-leakage grow with 1.50× area cap (increased from 1.10× in Phase 2).
-        # The larger cap allows more growth on stacks where the polarity threshold
-        # captures only the bright core and the gradient boundary is clear.
-        GROW_AREA_CAP_FACTOR = 1.50  # stop grow when area exceeds 1.50x seed
-        grown = _region_grow_leakage_check(
-            base_mask, lab, grad_mag, flake, pixel_size, n_iter=2,
-            area_cap_px=int(seed_area_px * GROW_AREA_CAP_FACTOR),
-        )
+    if seed_is_large:
+        grown = base_mask  # seed is already substantial — skip grow to avoid over-expansion
     else:
-        # Seed region is homogeneous (low gradient) or low-contrast with no
-        # footprint: skip grow to avoid over-expansion into adjacent host material.
-        grown = base_mask
+        # Footprint-bounded grow criteria (Phase 10b):
+        #
+        # The footprint-bounded grow is applied only when ALL conditions are met:
+        #  1. Footprint mask is available and non-empty.
+        #  2. Seed contrast |rel_L| >= FOOTPRINT_GROW_MIN_SEED_CONTRAST (10.0 L-units).
+        #     Low-contrast seeds have broad LAB std that would admit most footprint
+        #     pixels, causing the grow to fill the entire footprint.
+        #  3. Seed area < FOOTPRINT_GROW_MAX_SEED_FRACTION × footprint area (0.10).
+        #     When the seed already occupies a substantial fraction of the footprint
+        #     (>10%), it is likely already a good representation of the graphene region.
+        #     Further growth tends to over-expand into adjacent non-graphene footprint
+        #     areas (AH02, AH05 observed regressions).  A strict 10% cap ensures the
+        #     footprint-bounded grow is only used when the seed is clearly a fragment
+        #     (e.g., a bright core segment of a larger graphene flake — ml09 cc8 at 23%
+        #     of footprint pre-Phase-10b). With the new area gate expansion allowing
+        #     larger CCs, such small-fragment seeds are less common; the strict cap
+        #     prevents regressions on stacks with correctly-sized seeds.
+        #
+        # Fall-through to gradient-leakage grow (conservative 1.50× area cap) for
+        # all other cases.  The 1.50× cap is an increase from the Phase 2 1.10× cap,
+        # allowing more growth on stacks where the polarity threshold captures only
+        # the bright core and the gradient boundary is clear (ml09, AH03).
+        FOOTPRINT_GROW_MIN_SEED_CONTRAST = 10.0
+        FOOTPRINT_GROW_MAX_SEED_FRACTION = 0.10  # only grow if seed < 10% of footprint
+        fp_area_for_grow = (
+            int((footprint_mask > 0).sum())
+            if footprint_mask is not None else 0
+        )
+        seed_fp_fraction = (
+            seed_area_px / max(fp_area_for_grow, 1)
+            if fp_area_for_grow > 0 else 1.0
+        )
+        use_footprint_grow = (
+            footprint_mask is not None
+            and fp_area_for_grow > 0
+            and seed_abs_rel_L >= FOOTPRINT_GROW_MIN_SEED_CONTRAST
+            and seed_fp_fraction < FOOTPRINT_GROW_MAX_SEED_FRACTION
+        )
+        if use_footprint_grow:
+            # Phase 10b: footprint-bounded grow — no area cap, footprint is the bound.
+            # Pass seed polarity and rel_L to apply directional constraint (prevents
+            # a bright seed from growing into dark footprint areas and vice versa).
+            seed_polarity_val = int(best.get('polarity', 0))
+            grown = _region_grow_footprint_bounded(
+                base_mask, lab, footprint_mask, pixel_size,
+                seed_polarity=seed_polarity_val,
+                rel_L_image=rel_L,
+            )
+        elif len(seed_grads) > 0 and float(np.percentile(seed_grads, 90)) > GRADIENT_EVIDENCE_FLOOR:
+            # Gradient-leakage grow with 1.50× area cap (increased from 1.10× in Phase 2).
+            # The larger cap allows more growth on stacks where the polarity threshold
+            # captures only the bright core and the gradient boundary is clear.
+            GROW_AREA_CAP_FACTOR = 1.50  # stop grow when area exceeds 1.50x seed
+            grown = _region_grow_leakage_check(
+                base_mask, lab, grad_mag, flake, pixel_size, n_iter=2,
+                area_cap_px=int(seed_area_px * GROW_AREA_CAP_FACTOR),
+            )
+        else:
+            # Seed region is homogeneous (low gradient) or low-contrast with no
+            # footprint: skip grow to avoid over-expansion into adjacent host material.
+            grown = base_mask
 
     # --- Step 6: morph-clean and fill holes ---
     close_k2 = _kernel_from_um(GRAPHENE_MORPH_CLOSE_UM, pixel_size, ellipse=True)
