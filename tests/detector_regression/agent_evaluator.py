@@ -174,6 +174,13 @@ def _build_agent_prompt(stack: str, stack_input: Path, align_dir: Path,
     footprint_mask = align_dir / "footprint_mask.png"
     gds_warp = gdsalign_dir / "gds_warp.npy"
 
+    # Build the --footprint-mask flag for graphene.py (Phase 10a).
+    # Only include the flag if footprint_mask.png AND warp_top.npy both exist —
+    # graphene.py needs the warp matrix to bring the mask into top_part coords.
+    footprint_flag_for_graphene = ""
+    if footprint_mask.exists() and (align_dir / "warp_top.npy").exists():
+        footprint_flag_for_graphene = f"--footprint-mask {footprint_mask} \\"
+
     prompt = f"""You are a precision detector agent for van der Waals heterostructure microscopy images.
 Your task: run 4 material detectors on stack **{stack}**, inspect their outputs, pick the best candidate
 for each material, produce traces.json + traces_gds.json, then build result.gds.
@@ -214,8 +221,11 @@ Create {detect_dir} first.
   --image {top_part} \\
   --pixel-size {pixel_size} \\
   {graphene_mirror_flag} \\
+  {footprint_flag_for_graphene}
   --output-dir {detect_dir}
 ```
+(The `--footprint-mask` flag, if present above, enables spatial-containment scoring
+ so rank-0 is the footprint-contained graphene flake. Copy the command exactly.)
 
 **bottom_hBN** (reads bottom_part + warp matrix, outputs to detect dir):
 ```
@@ -248,6 +258,15 @@ After each detector runs:
 3. If rank 0 looks wrong, re-run with `--cluster-id N` (N = 1, 2, ...) to pick
    a better candidate. You may re-run each detector **at most 2 more times** (3 total).
 4. Never re-run a detector more than 3 times total. Move on if no better candidate found.
+
+**Graphene-specific guidance (Phase 10a):**
+The graphene detector now uses footprint-containment scoring (--footprint-mask flag above).
+Rank-0 is the graphene candidate with the highest containment within the footprint + area score.
+**Prefer cluster_id=0 (the default) for graphene** — only override with --cluster-id if:
+- The graphene area is 0 px (low_confidence=True), OR
+- The diagnostic overlay clearly shows the selected region is on the substrate (not the flake).
+Do NOT retry graphene with higher cluster-ids just because the shape looks imperfect —
+the containment scoring ensures rank-0 is the most likely graphene candidate.
 
 ## Constraint
 

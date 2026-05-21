@@ -91,3 +91,26 @@ def test_area_gate_scaled_by_host():
                 pytest.fail(
                     f"area gate appears unscaled by host: {line.strip()!r}"
                 )
+
+
+def test_graphene_uses_footprint_containment_when_available():
+    """Phase 10a: graphene.py must expose --footprint-mask CLI and implement
+    spatial containment scoring so the default cluster (rank 0) is reliably
+    the footprint-contained graphene flake, eliminating agent cluster-id overrides.
+    """
+    src = (DETECT / "graphene.py").read_text()
+    # Must mention both footprint and containment concepts
+    assert ("footprint" in src.lower() and "containment" in src.lower()), (
+        "graphene.py must mention footprint-containment scoring"
+    )
+    # CLI flag must be exposed
+    assert "--footprint-mask" in src, "expose --footprint-mask CLI"
+    # The scoring function must exist
+    assert "spatial_containment_score" in src, (
+        "graphene.py must define spatial_containment_score()"
+    )
+    # The warp helper must exist (needed to translate footprint to top_part coords)
+    assert "_load_footprint_in_toppart_coords" in src, (
+        "graphene.py must define _load_footprint_in_toppart_coords() to warp "
+        "the footprint mask from full_stack coords to mirrored-top_part coords"
+    )

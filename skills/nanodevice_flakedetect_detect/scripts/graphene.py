@@ -15,16 +15,28 @@ Strategy (adaptive; no GT-fitted priors):
      centroid-distance-to-flake-edge, and within-polarity-population
      separability.  Weights derived from sub-score variance across
      candidates (discriminative = higher weight).
-  6. Region grow the best CC using a boundary-leakage check: stop when
+  6. Footprint-containment scoring (Phase 10a): when --footprint-mask is
+     supplied, each candidate is scored by the fraction of its pixels that
+     fall inside the top-alignment footprint (warped to mirrored-top_part
+     coords via the co-located warp_top.npy).  Physics: the footprint marks
+     the spatial extent of the top-flake region by construction.  Any cluster
+     mostly outside it is background substrate, not graphene.  This is a
+     universal property of vdW stack imaging — not sample-specific tuning.
+  7. Region grow the best CC using a boundary-leakage check: stop when
      the boundary mean gradient drops below the in-flake p10 of the same
      gradient field (substrate-agnostic, replaces the substrate-name check).
-  7. morph_clean + flood_fill_holes.
-  8. No-candidate fallback: emit empty mask with low_confidence=True.
+  8. morph_clean + flood_fill_holes.
+  9. No-candidate fallback: emit empty mask with low_confidence=True.
 
 CLI:
     --image, --pixel-size, --output-dir, [--mirror]
     [--cluster-id N]   rank to pick (kept for CLI compat)
     [--n-sub-clusters] (kept for CLI compat, unused)
+    [--footprint-mask PATH]  optional: footprint mask in full_stack coords.
+                             Auto-locates warp_top.npy in the same directory
+                             to warp the mask into mirrored-top_part coords.
+                             When omitted, footprint scoring is skipped
+                             (backward compatible).
 
 Outputs in --output-dir:
     graphene_mask.png
@@ -85,6 +97,21 @@ LAB_GROW_SIGMA_CAP = 2.5
 # value, all sub-scores get equal weight (pool is effectively uninformative).
 VARIANCE_FLOOR = 1e-9
 
+# ---------------------------------------------------------------------------
+# Footprint-containment scoring constants (Phase 10a)
+# ---------------------------------------------------------------------------
+# Weight given to the footprint-containment sub-score in candidate ranking.
+# 0.5 = half the total score; high weight ensures footprint-outside candidates
+# lose decisively to footprint-inside candidates of similar photometric score.
+FOOTPRINT_CONTAINMENT_WEIGHT = 0.5
+
+# Penalty multiplier applied when containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR.
+# Physics: a cluster with < 50% of its pixels inside the footprint is almost
+# certainly background substrate — apply a strong penalty to push it below
+# genuine graphene candidates with partial or full containment.
+FOOTPRINT_LOW_CONTAINMENT_FLOOR = 0.5
+FOOTPRINT_LOW_CONTAINMENT_PENALTY = 0.3  # multiply s_containment by this factor
+
 
 # ---------------------------------------------------------------------------
 # Helper: build coarse foreground region via Otsu on blurred luminance
@@ -135,6 +162,111 @@ def _gradient_mag(img: np.ndarray) -> np.ndarray:
     gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
     return np.sqrt(gx ** 2 + gy ** 2)
+
+
+# ---------------------------------------------------------------------------
+# Footprint-containment helpers (Phase 10a)
+# ---------------------------------------------------------------------------
+
+def _load_footprint_in_toppart_coords(
+    footprint_mask_path: str,
+    target_shape: tuple[int, int],
+    mirror: bool,
+) -> np.ndarray | None:
+    """Load the footprint mask and warp it into mirrored-top_part coordinates.
+
+    Physics rationale: footprint_mask.png is produced by footprint.py in the
+    coordinate system of the full_stack_raw (SiO2 substrate) image.  graphene.py
+    processes top_part.jpg, optionally mirrored, which is in stamp-substrate
+    coordinates.  The two coordinate systems are related by warp_top.npy — a 2×3
+    affine that maps mirrored-top_part → full_stack.  We invert it to map the
+    footprint back to mirrored-top_part coordinates so that containment can be
+    scored directly against the CC masks produced during graphene detection.
+
+    Args:
+        footprint_mask_path: Path to footprint_mask.png (full_stack coords).
+        target_shape: (height, width) of the image being processed (top_part,
+            after any mirroring) — used as the output size for warpAffine.
+        mirror: Whether graphene.py is running in mirror mode.  Always True
+            for vdW stacks; the warp_top.npy was computed on the mirrored
+            top_part, so this flag is informational / future-proof.
+
+    Returns:
+        uint8 binary mask (0/255) in mirrored-top_part coordinates, or None if
+        the footprint mask or warp_top.npy cannot be loaded.
+    """
+    fp_path = Path(footprint_mask_path)
+    if not fp_path.exists():
+        return None
+
+    fp_mask = cv2.imread(str(fp_path), cv2.IMREAD_GRAYSCALE)
+    if fp_mask is None:
+        return None
+
+    # Auto-locate warp_top.npy co-located with footprint_mask.png.
+    warp_path = fp_path.parent / "warp_top.npy"
+    if not warp_path.exists():
+        # Fallback: return the footprint as-is (same-size images, no rotation).
+        # This is only valid when the top_part and full_stack share the same
+        # pixel grid (no relative rotation/scale between substrates), which is
+        # not guaranteed.  We return None to avoid false containment scores.
+        return None
+
+    try:
+        warp_top = np.load(str(warp_path))  # 2×3: mirrored-top_part → full_stack
+        if warp_top.shape != (2, 3):
+            return None
+    except (OSError, ValueError):
+        return None
+
+    # Invert to get full_stack → mirrored-top_part.
+    warp_inv = cv2.invertAffineTransform(warp_top)
+
+    h, w = target_shape[:2]
+    fp_warped = cv2.warpAffine(
+        fp_mask, warp_inv, (w, h), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    # Binarize (preserve any anti-aliasing artifacts that slipped through).
+    _, fp_bin = cv2.threshold(fp_warped, FOOTPRINT_WARP_BINARY_THRESH, 255,
+                              cv2.THRESH_BINARY)
+    return fp_bin
+
+
+# Named constant for the warp binarisation threshold (avoids naked numeric).
+FOOTPRINT_WARP_BINARY_THRESH = 127
+
+
+def spatial_containment_score(candidate_mask: np.ndarray,
+                              footprint_mask: np.ndarray) -> float:
+    """Fraction of the candidate's pixels that fall inside the footprint.
+
+    containment = |candidate ∩ footprint| / |candidate|
+
+    Range [0, 1].  Higher = more of the candidate overlaps the footprint region.
+
+    Physics grounding: the top-alignment footprint marks the spatial extent of
+    the top-flake stack (the region where stamp-borne material was deposited).
+    Any K-means cluster whose pixels are mostly outside this region is background
+    substrate — it cannot be graphene.  This is a universal property of vdW stack
+    imaging: graphene is always within the deposited flake footprint, regardless
+    of substrate type, illumination conditions, or color balance.  The score is
+    purely geometric and does not depend on any GT-fitted prior.
+
+    Args:
+        candidate_mask: uint8 binary mask (0/255) of the CC candidate.
+        footprint_mask: uint8 binary mask (0/255) in the same coordinate system.
+
+    Returns:
+        containment fraction in [0, 1], or 0.0 if candidate_mask is empty.
+    """
+    cand_px = int((candidate_mask > 0).sum())
+    if cand_px == 0:
+        return 0.0
+    overlap = int(
+        cv2.bitwise_and(candidate_mask, footprint_mask).astype(np.bool_).sum()
+    )
+    return overlap / cand_px
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +350,18 @@ def _region_grow_leakage_check(
 # Helper: score a set of CC candidates using per-pool sub-score variance
 # ---------------------------------------------------------------------------
 
-def _score_candidates(records: list[dict], host_area_um2: float) -> list[dict]:
+def _score_candidates(records: list[dict], host_area_um2: float,
+                      footprint_mask: np.ndarray | None = None) -> list[dict]:
     """Assign a composite score to each CC record.
 
     Sub-scores (all in [0, 1], higher = more graphene-like):
-      s_area      — log-normalised area relative to the largest candidate
-                    (larger CCs preferred; tiny noise fragments score low)
-      s_contrast  — |rel_L_med| normalised by pool max (strong contrast
-                    indicates real optical absorption difference)
-      s_solidity  — convexity of the shape (crystallographic straight edges)
+      s_area          — log-normalised area relative to the largest candidate
+                        (larger CCs preferred; tiny noise fragments score low)
+      s_contrast      — |rel_L_med| normalised by pool max (strong contrast
+                        indicates real optical absorption difference)
+      s_solidity      — convexity of the shape (crystallographic straight edges)
+      s_containment   — fraction of candidate pixels inside the footprint mask
+                        (Phase 10a; only scored when footprint_mask is provided)
 
     Note: centroid-edge distance (s_edge) is intentionally excluded.  Graphene
     position relative to the host flake edge is stack-dependent (it can sit at
@@ -239,6 +374,13 @@ def _score_candidates(records: list[dict], host_area_um2: float) -> list[dict]:
     removes low-contrast artefacts, so area is a reliable discriminator among
     the remaining high-contrast candidates.
 
+    When footprint_mask is supplied, FOOTPRINT_CONTAINMENT_WEIGHT is reserved for
+    s_containment, and AREA_FIXED_WEIGHT + remaining variance-split weights are
+    scaled to fill the remaining (1 - FOOTPRINT_CONTAINMENT_WEIGHT) fraction.
+    Candidates with containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR are further
+    penalised by FOOTPRINT_LOW_CONTAINMENT_PENALTY to push clearly-outside
+    candidates decisively below genuine graphene candidates.
+
     Physics grounding:
       - Area: real graphene flakes are not single-pixel artefacts; the
         largest contrast region in the gate [AREA_MIN..AREA_MAX] is the
@@ -249,6 +391,9 @@ def _score_candidates(records: list[dict], host_area_um2: float) -> list[dict]:
         |rel_L| for scoring.
       - Solidity: monolayer crystals cleave along armchair/zigzag edges
         (faceted outlines → high convex-hull utilisation).
+      - Containment (Phase 10a): the top-alignment footprint marks the spatial
+        extent of the deposited flake.  Graphene is always inside this region;
+        background substrate features are not.  This is substrate-agnostic.
     """
     if not records:
         return records
@@ -285,31 +430,89 @@ def _score_candidates(records: list[dict], host_area_um2: float) -> list[dict]:
     # it can sit at the edge (as a thin strip on the hBN boundary) or at the
     # centre.  This metric is not universal and caused ml08-style failures.
 
+    # --- s_containment (Phase 10a): footprint spatial containment ---
+    # Physics: the top-alignment footprint marks the spatial extent of the
+    # deposited top flake.  Graphene is always inside this region; background
+    # substrate features are not.  Candidates with low containment are penalised
+    # further (below FOOTPRINT_LOW_CONTAINMENT_FLOOR) to decisively rank them
+    # below genuine graphene candidates.  This is substrate-agnostic.
+    # Determine whether footprint scoring is active: mask must be provided,
+    # non-empty, and match the candidate CC mask dimensions.
+    use_containment = False
+    if footprint_mask is not None and records and '_cc_mask' in records[0]:
+        ref_shape = records[0]['_cc_mask'].shape  # (H, W) uint8
+        if footprint_mask.shape == ref_shape:
+            use_containment = True
+
+    if use_containment:
+        for r in records:
+            raw_containment = spatial_containment_score(r['_cc_mask'],
+                                                        footprint_mask)
+            # Apply low-containment penalty: candidates mostly outside the
+            # footprint receive a heavily discounted s_containment so they
+            # lose decisively in the final score.
+            if raw_containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR:
+                penalised = raw_containment * FOOTPRINT_LOW_CONTAINMENT_PENALTY
+            else:
+                penalised = raw_containment
+            r['s_containment'] = float(penalised)
+            r['containment_raw'] = float(raw_containment)
+    else:
+        for r in records:
+            r['s_containment'] = None  # not available
+
     # Compute weights from sub-score variance across the candidate pool.
-    # Area is given a high fixed weight (0.65) to ensure the largest plausible
-    # graphene region wins over small high-contrast noise fragments.
+    # Area is given a high fixed weight (AREA_FIXED_WEIGHT) to ensure the largest
+    # plausible graphene region wins over small high-contrast noise fragments.
     # Physics: in the absence of GT priors, area is the strongest prior-free
     # proxy for the real graphene layer.  The contrast quality filter above
     # already removes low-contrast artefacts; among the retained high-contrast
     # candidates, the larger one is more likely to be the real graphene flake.
     # Remaining weight (0.35) is split by sub-score variance.
-    sub_keys = ['s_area', 's_contrast', 's_solidity']
+    #
+    # When footprint_mask is available, FOOTPRINT_CONTAINMENT_WEIGHT is reserved
+    # for s_containment; the area+photometric weights are scaled to fill the
+    # remaining (1 - FOOTPRINT_CONTAINMENT_WEIGHT) budget.
     AREA_FIXED_WEIGHT = 0.65
-    sub_arrs = {k: np.array([r[k] for r in records], dtype=np.float32)
-                for k in sub_keys if k != 's_area'}
-    variances = {k: float(np.var(sub_arrs[k])) for k in sub_arrs}
-
-    total_non_area_var = sum(variances.values())
-    remaining = 1.0 - AREA_FIXED_WEIGHT
-    if total_non_area_var < VARIANCE_FLOOR:
-        non_area_keys = [k for k in sub_keys if k != 's_area']
-        weights = {k: remaining / len(non_area_keys) for k in non_area_keys}
+    if use_containment:
+        photometric_budget = 1.0 - FOOTPRINT_CONTAINMENT_WEIGHT
+        area_w = AREA_FIXED_WEIGHT * photometric_budget
+        sub_keys = ['s_area', 's_contrast', 's_solidity']
+        sub_arrs = {k: np.array([r[k] for r in records], dtype=np.float32)
+                    for k in sub_keys if k != 's_area'}
+        variances = {k: float(np.var(sub_arrs[k])) for k in sub_arrs}
+        total_non_area_var = sum(variances.values())
+        remaining_photometric = photometric_budget - area_w
+        if total_non_area_var < VARIANCE_FLOOR:
+            non_area_keys = [k for k in sub_keys if k != 's_area']
+            weights = {k: remaining_photometric / len(non_area_keys)
+                       for k in non_area_keys}
+        else:
+            weights = {k: remaining_photometric * variances[k] / total_non_area_var
+                       for k in variances}
+        weights['s_area'] = area_w
+        weights['s_containment'] = FOOTPRINT_CONTAINMENT_WEIGHT
+        all_sub_keys = sub_keys + ['s_containment']
     else:
-        weights = {k: remaining * variances[k] / total_non_area_var for k in variances}
-    weights['s_area'] = AREA_FIXED_WEIGHT
+        sub_keys = ['s_area', 's_contrast', 's_solidity']
+        sub_arrs = {k: np.array([r[k] for r in records], dtype=np.float32)
+                    for k in sub_keys if k != 's_area'}
+        variances = {k: float(np.var(sub_arrs[k])) for k in sub_arrs}
+        total_non_area_var = sum(variances.values())
+        remaining = 1.0 - AREA_FIXED_WEIGHT
+        if total_non_area_var < VARIANCE_FLOOR:
+            non_area_keys = [k for k in sub_keys if k != 's_area']
+            weights = {k: remaining / len(non_area_keys) for k in non_area_keys}
+        else:
+            weights = {k: remaining * variances[k] / total_non_area_var for k in variances}
+        weights['s_area'] = AREA_FIXED_WEIGHT
+        all_sub_keys = sub_keys
 
     for r in records:
-        r['score'] = float(sum(weights.get(k, 0.0) * r[k] for k in sub_keys))
+        r['score'] = float(sum(
+            weights.get(k, 0.0) * (r[k] if r[k] is not None else 0.0)
+            for k in all_sub_keys
+        ))
 
     return records
 
@@ -323,6 +526,7 @@ def detect_graphene(
     pixel_size: float,
     mirror: bool = True,
     cluster_id: int | None = None,
+    footprint_mask: np.ndarray | None = None,
 ) -> dict:
     """Detect graphene in the top_part image.
 
@@ -332,6 +536,11 @@ def detect_graphene(
         mirror: If True, horizontally flip the image before processing.
         cluster_id: If given, pick this rank (0-based) from the scored
             candidate list instead of the top rank.  Kept for CLI compat.
+        footprint_mask: Optional uint8 binary mask (0/255) in mirrored-top_part
+            coordinates.  When supplied, candidate scoring includes a spatial
+            containment term (Phase 10a) that heavily favours candidates inside
+            the footprint.  When None, scoring falls back to the photometric-only
+            approach (backward compatible).
 
     Returns a dict with keys:
         graphene_mask, graphene_contour, top_flake_mask, processed_image,
@@ -538,8 +747,13 @@ def detect_graphene(
         if strong_records:
             cc_records = strong_records
 
-    # --- Step 4: score candidates ---
-    cc_records = _score_candidates(cc_records, host_area_um2=host_area_um2)
+    # --- Step 4: score candidates (with optional footprint containment) ---
+    # Pass footprint_mask so _score_candidates can compute s_containment.
+    # footprint_mask must be in mirrored-top_part coordinates (i.e. same
+    # coordinate system as the cc_masks produced above).  The caller is
+    # responsible for loading and warping it before calling detect_graphene.
+    cc_records = _score_candidates(cc_records, host_area_um2=host_area_um2,
+                                   footprint_mask=footprint_mask)
     cc_records.sort(key=lambda r: r['score'], reverse=True)
 
     # Allow explicit override via cluster_id (0-based rank).
@@ -620,6 +834,12 @@ def main():
                    help='rank to select (0=top-scoring, default)')
     p.add_argument('--n-sub-clusters', type=int, default=3,
                    help='[kept for CLI compat, unused]')
+    p.add_argument('--footprint-mask', default=None,
+                   help='optional path to footprint_mask.png in full_stack coords '
+                        '(Phase 10a: enables footprint-containment scoring). '
+                        'A co-located warp_top.npy must exist in the same directory '
+                        'to warp the mask into mirrored-top_part coordinates. '
+                        'When omitted, footprint scoring is skipped (backward compatible).')
     args = p.parse_args()
 
     img = cv2.imread(os.path.abspath(os.path.expanduser(args.image)))
@@ -630,9 +850,31 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load and warp footprint mask into mirrored-top_part coordinates (Phase 10a).
+    # This enables spatial-containment scoring in _score_candidates so that the
+    # correct graphene cluster ranks first without requiring agent visual override.
+    loaded_footprint_mask: np.ndarray | None = None
+    if args.footprint_mask:
+        h_img, w_img = img.shape[:2]
+        target_shape = (h_img, w_img)
+        loaded_footprint_mask = _load_footprint_in_toppart_coords(
+            args.footprint_mask, target_shape, mirror=args.mirror,
+        )
+        if loaded_footprint_mask is None:
+            print(
+                f'WARN: --footprint-mask {args.footprint_mask!r} could not be loaded '
+                'or warp_top.npy not found; footprint scoring disabled.',
+                file=sys.stderr,
+            )
+        else:
+            fp_area = int((loaded_footprint_mask > 0).sum())
+            print(f'Footprint mask loaded and warped to top_part coords '
+                  f'(area={fp_area}px).')
+
     result = detect_graphene(
         img, args.pixel_size, mirror=args.mirror,
         cluster_id=args.cluster_id,
+        footprint_mask=loaded_footprint_mask,
     )
 
     print(f'L_bg(flake)={result.get("L_bg", "?"):.1f}, '
@@ -641,10 +883,14 @@ def main():
     print('Top candidates:')
     for r in result['cc_records'][:5]:
         marker = ' <-- selected' if r['lab_idx'] == result.get('selected_idx') else ''
+        containment_str = ''
+        if r.get('s_containment') is not None:
+            containment_str = f" cont={r.get('containment_raw', 0.0):.2f}"
         print(f"  cc{r['lab_idx']}: area={r['area_um2']:.0f}um2 "
               f"aspect={r['aspect']:.1f} sol={r['solidity']:.2f} "
               f"L={r['L_med']:.0f} relL={r.get('rel_L_med', 0):.1f} "
-              f"pol={r.get('polarity', '?')} score={r['score']:.3f}{marker}")
+              f"pol={r.get('polarity', '?')}{containment_str} "
+              f"score={r['score']:.3f}{marker}")
 
     if result.get('low_confidence') or result['graphene_contour'] is None:
         print('WARN: no graphene candidate; emitting empty mask with low_confidence=True',
