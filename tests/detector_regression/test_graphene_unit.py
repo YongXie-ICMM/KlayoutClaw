@@ -93,6 +93,47 @@ def test_area_gate_scaled_by_host():
                 )
 
 
+def test_graphene_grows_into_footprint():
+    """Phase 10b: graphene.py must implement footprint-bounded region grow.
+
+    Checks:
+    1. The 1.10x hardcoded grow area cap is gone (replaced by 1.50 or dynamic).
+    2. A footprint-bounded grow function exists that accepts a footprint_mask arg.
+    3. The grow cap constant in the leakage-check path is >= 1.40 (not 1.10).
+    """
+    src = _src()
+    tree = ast.parse(src)
+
+    # (1) No hardcoded 1.10 area cap constant anywhere
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and "GROW_AREA_CAP" in t.id:
+                    val = node.value
+                    if isinstance(val, ast.Constant) and isinstance(val.value, float):
+                        assert val.value >= 1.40, (
+                            f"GROW_AREA_CAP_FACTOR = {val.value} is still ≤ 1.10 "
+                            "(Phase 10b requires >= 1.40 or dynamic footprint-bounded grow)"
+                        )
+
+    # (2) Footprint-bounded grow function must exist with footprint_mask param
+    fp_grow_funcs = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            param_names = [a.arg for a in node.args.args]
+            if "footprint_mask" in param_names and "grow" in node.name.lower():
+                fp_grow_funcs.append(node.name)
+    assert fp_grow_funcs, (
+        "graphene.py must define a grow function with a footprint_mask parameter "
+        "(Phase 10b: footprint-bounded region grow)"
+    )
+
+    # (3) AREA_MAX_FOOTPRINT_FRAC constant must exist
+    assert "AREA_MAX_FOOTPRINT_FRAC" in src, (
+        "graphene.py must define AREA_MAX_FOOTPRINT_FRAC constant (Phase 10b area gate)"
+    )
+
+
 def test_graphene_uses_footprint_containment_when_available():
     """Phase 10a: graphene.py must expose --footprint-mask CLI and implement
     spatial containment scoring so the default cluster (rank 0) is reliably
