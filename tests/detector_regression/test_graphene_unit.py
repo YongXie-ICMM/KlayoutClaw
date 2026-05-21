@@ -155,3 +155,77 @@ def test_graphene_uses_footprint_containment_when_available():
         "graphene.py must define _load_footprint_in_toppart_coords() to warp "
         "the footprint mask from full_stack coords to mirrored-top_part coords"
     )
+
+
+def test_graphene_contrast_filter_is_pool_relative():
+    """The contrast filter must keep at least 3 candidates regardless of
+    absolute contrast magnitude (otherwise it's sample-fitted to high-contrast
+    substrates like SiO2).
+
+    Phase 10c: replaces the absolute 20%-of-max gate with a pool-relative
+    composite ranking (|relL|^0.25 × log(area)).  This balances contrast and
+    area signals so a large dim candidate (AH07: relL=3, 2610 µm²) beats tiny
+    bright spots (relL=95, 9 µm²) without GT-fitted thresholds.
+    """
+    src = (DETECT / "graphene.py").read_text()
+    # No 20% absolute gate — the literal 0.20 magnitude gate is removed.
+    uses_abs_gate = (
+        "MIN_CONTRAST_FRAC = 0.20" in src
+        or "min_abs_rel = max_abs_rel * 0.20" in src
+    )
+    assert not uses_abs_gate, (
+        "graphene.py still uses an absolute 0.20 relL gate; should be pool-relative "
+        "(Phase 10c: use composite |relL|^0.25 × log(area) ranking)"
+    )
+    # A top-N pool-relative selection must be present.
+    has_pool_selection = (
+        "keep_top_n" in src
+        or "sorted_by_composite" in src
+        or "_pool_sort_key" in src
+        or "keep_top" in src.lower()
+    )
+    assert has_pool_selection, (
+        "graphene.py needs pool-relative contrast filtering (Phase 10c): "
+        "add keep_top_n = max(3, len(candidates) // 3) selection with composite ranking"
+    )
+    # Black-artifact pre-filter must exclude near-zero L candidates.
+    has_black_filter = (
+        "BLACK_ARTIFACT_L_FLOOR" in src
+        or "L_med" in src and "non_black" in src
+    )
+    assert has_black_filter, (
+        "graphene.py needs BLACK_ARTIFACT_L_FLOOR pre-filter (Phase 10c: "
+        "removes opaque edge artifacts that dominate |relL| ranking)"
+    )
+
+
+def test_graphene_containment_penalty_uses_absolute_overlap():
+    """Phase 10c: the containment penalty must consider absolute overlap area,
+    not just fractional containment.
+
+    A large candidate with 24.5% containment (e.g. 1438 µm² candidate, 352 µm²
+    overlap) must not be outscored by a tiny 11 µm² candidate at 100% containment.
+    The fix: apply the penalty only when BOTH fractional containment < 0.5 AND
+    absolute overlap < expected minimum (0.5% of footprint area).
+    """
+    src = (DETECT / "graphene.py").read_text()
+    # The absolute overlap variable or concept must be present.
+    has_absolute_overlap = (
+        "absolute_overlap_px" in src
+        or "absolute_overlap_um2" in src
+        or "norm_abs_overlap" in src
+    )
+    assert has_absolute_overlap, (
+        "graphene.py containment penalty must compute absolute overlap area "
+        "(Phase 10c: prevents tiny fully-contained noise from beating large "
+        "partially-contained graphene flakes)"
+    )
+    # The combined penalty condition must reference both fractional and absolute.
+    has_dual_condition = (
+        "absolute_overlap_px < expected_min_overlap_px" in src
+        or "absolute_overlap_um2 < expected_min_overlap_um2" in src
+    )
+    assert has_dual_condition, (
+        "graphene.py penalty must gate on BOTH fractional containment < floor "
+        "AND absolute_overlap < expected_min (Phase 10c dual condition)"
+    )

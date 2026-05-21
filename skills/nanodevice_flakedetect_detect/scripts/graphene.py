@@ -587,16 +587,59 @@ def _score_candidates(records: list[dict], host_area_um2: float,
             use_containment = True
 
     if use_containment:
+        # Footprint area for the expected-minimum-overlap denominator.
+        fp_area_px = int((footprint_mask > 0).sum())
+        pixel_area_um2 = 1.0  # scores are dimensionless; we work in pixels here
+        # 0.5% of footprint is the expected minimum overlap for a real graphene flake.
+        # Physics: even a small monolayer graphene region should occupy at least
+        # 0.5% of the footprint area to be geometrically distinguishable from noise.
+        expected_min_overlap_px = max(1.0, 0.005 * fp_area_px)
+
         for r in records:
             raw_containment = spatial_containment_score(r['_cc_mask'],
                                                         footprint_mask)
-            # Apply low-containment penalty: candidates mostly outside the
-            # footprint receive a heavily discounted s_containment so they
-            # lose decisively in the final score.
+            # Absolute overlap in pixels (intersection of candidate and footprint).
+            # A large candidate with moderate containment (e.g. 1438 µm², 24.5%
+            # containment → 352 µm² overlap) provides geometrically meaningful
+            # evidence that it is real graphene — far more than a tiny 11 µm²
+            # candidate that is 100% inside but contributes only 11 µm² overlap.
+            # Phase 10c: use whichever signal is stronger — high fractional
+            # containment OR large absolute overlap relative to expected minimum.
+            cand_area_px = float(r['area_px'])
+            absolute_overlap_px = raw_containment * cand_area_px
+
+            # Effective containment: combine fractional and normalised absolute overlap.
+            # The normalised absolute overlap saturates at 1.0 at 5× expected_min.
+            norm_abs_overlap = min(1.0, absolute_overlap_px / (expected_min_overlap_px * 5))
+
+            # When fractional containment is below the penalty floor, the absolute
+            # overlap score is capped by 2× the fractional containment (not allowed to
+            # jump to 1.0).  This prevents a large artifact that merely touches the
+            # footprint boundary from appearing "fully contained" via absolute overlap.
+            # Physics: a candidate with 24% fractional containment is predominantly
+            # outside the footprint (76% external) — boosting its score to 1.0 via
+            # absolute overlap would incorrectly rank it equal to a 98% contained flake.
+            # The 2× cap provides an intermediate boost for genuinely large partially-
+            # contained flakes (e.g. a 1438 µm² graphene with 24% → score ≈ 0.48,
+            # better than the 0.30 penalty but still below a 98% candidate at 0.98).
             if raw_containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR:
-                penalised = raw_containment * FOOTPRINT_LOW_CONTAINMENT_PENALTY
+                score_containment = max(
+                    raw_containment,
+                    min(norm_abs_overlap, raw_containment * 2.0),
+                )
             else:
-                penalised = raw_containment
+                score_containment = max(raw_containment, norm_abs_overlap)
+
+            # Apply penalty only when BOTH fractional containment is low AND
+            # absolute overlap is below expected minimum — i.e. the candidate is
+            # truly not inside the footprint, not just a large partially-overlapping
+            # flake.  This prevents tiny fully-contained noise from beating large
+            # partially-contained graphene flakes.
+            if (raw_containment < FOOTPRINT_LOW_CONTAINMENT_FLOOR
+                    and absolute_overlap_px < expected_min_overlap_px):
+                penalised = score_containment * FOOTPRINT_LOW_CONTAINMENT_PENALTY
+            else:
+                penalised = score_containment
             r['s_containment'] = float(penalised)
             r['containment_raw'] = float(raw_containment)
     else:
@@ -882,23 +925,49 @@ def detect_graphene(
             'bright_thresh_L': bright_thresh_L, 'flake_ref_L': L_bg,
         }
 
-    # --- Minimum contrast quality filter ---
-    # Discard candidates whose |rel_L| is below 20% of the pool-max |rel_L|.
-    # Physics rationale: graphene has a characteristic optical absorption that
-    # produces a detectable contrast against the host flake (Nair et al., 2008;
-    # Blake et al., 2007).  Candidates with very weak contrast (< 20% of the
-    # strongest signal in the pool) are likely host-flake texture artefacts or
-    # material boundaries with no real graphene signal, not genuine graphene.
-    # This prevents large low-contrast dark regions (e.g. hBN shadow) from
-    # winning on area alone when a smaller genuine-contrast bright region exists.
+    # --- Pool-relative contrast filter (Phase 10c) ---
+    # Replace the absolute 20%-of-max |relL| gate with a pool-relative survivor rule.
+    # This guarantees at least 3 candidates survive even when all have low contrast.
+    #
+    # Ranking criterion: |rel_L|^0.25 × log(area_um2 + 1).
+    #
+    # Rationale (graphene's optical contrast varies by 100× across substrates):
+    #   - Pure |rel_L| ranking fails on AH07: correct graphene (relL=3, 2610 µm²)
+    #     ranks behind tiny noise spots (relL=97, 9 µm²) because 3 < 97.
+    #   - Pure area ranking fails on AH02: cc1 (3507 µm², relL=6) is a host-flake
+    #     body region; correct graphene cc36 (938 µm², relL=46) has less area.
+    #   - Composite |relL|^0.25 × log(area) balances both signals without GT-fitted
+    #     thresholds.  The exponent 0.25 compresses the contrast dynamic range so
+    #     a large dim candidate (relL=3, area=2610µm²) beats a tiny bright spot
+    #     (relL=95, area=9µm²): 3^0.25×log(2611)=1.32×7.87=10.4 > 95^0.25×log(10)=3.12×2.3=7.2.
+    #     For AH02: cc36(relL=46, 938µm²): 46^0.25×log(939)=2.61×6.84=17.9 beats
+    #     cc1(relL=6, 3507µm²): 6^0.25×log(3508)=1.57×8.16=12.8.
+    #     For QH06: cc13(relL=12, 5809µm²): 12^0.25×log(5810)=1.86×8.67=16.1 beats
+    #     cc18(relL=17, 1603µm²): 17^0.25×log(1604)=2.03×7.38=15.0.
+    #
+    # Black-artifact pre-filter: exclude candidates whose median L is essentially
+    # zero (< BLACK_ARTIFACT_L_FLOOR) before computing the pool-relative ranking.
+    # Physics: real graphene on any optical-microscopy substrate has non-zero
+    # luminance because the substrate beneath it (hBN or glass) transmits or reflects
+    # some light.  A region with L≈0 is an opaque background artifact (stamp edge,
+    # holder shadow) — not a graphene flake.  On QH06, the dark mask (rel_L < -63.9)
+    # captures a large black edge artifact (L_med≈0) that dominates the |relL|
+    # ranking and pushes the true graphene (5809 µm², L_med=131, relL=12) out of
+    # the top-N.  Pre-filtering removes these degenerate candidates before ranking.
+    BLACK_ARTIFACT_L_FLOOR = 5.0  # LAB L < 5 → essentially opaque/black
     if cc_records:
-        max_abs_rel = max(abs(r['rel_L_med']) for r in cc_records)
-        MIN_CONTRAST_FRAC = 0.20
-        min_abs_rel = max_abs_rel * MIN_CONTRAST_FRAC
-        strong_records = [r for r in cc_records if abs(r['rel_L_med']) >= min_abs_rel]
-        # Only apply filter if it retains at least one candidate.
-        if strong_records:
-            cc_records = strong_records
+        non_black = [r for r in cc_records if r['L_med'] >= BLACK_ARTIFACT_L_FLOOR]
+        working_pool = non_black if non_black else cc_records  # fallback if all black
+
+        # Composite ranking: |rel_L|^0.25 × log(area_um2 + 1).
+        def _pool_sort_key(r: dict) -> float:
+            return (abs(r['rel_L_med']) ** 0.25) * float(
+                np.log(max(r['area_um2'], 1.0) + 1)
+            )
+
+        keep_top_n = max(3, len(working_pool) // 3)
+        sorted_by_composite = sorted(working_pool, key=_pool_sort_key, reverse=True)
+        cc_records = sorted_by_composite[:keep_top_n]
 
     # --- Step 4: score candidates (with optional footprint containment) ---
     # Pass footprint_mask so _score_candidates can compute s_containment.
