@@ -51,8 +51,11 @@ DETECT_SCRIPTS = REPO_ROOT / "skills" / "nanodevice_flakedetect_detect" / "scrip
 COMBINE_SCRIPTS = REPO_ROOT / "skills" / "nanodevice_flakedetect_combine" / "scripts"
 GDSALIGN_SCRIPTS = REPO_ROOT / "skills" / "nanodevice_gdsalign" / "scripts"
 
-# Default pixel size — all bench stacks use 0.106 µm/px (100x objective)
-DEFAULT_PIXEL_SIZE_UM = 0.106
+# Default pixel size — canonical 100x objective bench value (memory: ML08 flakedetect_v1).
+# Must match run_detector.DEFAULT_PIXEL_SIZE_UM. The previous 0.106 value was incorrect
+# and caused every agent-test detector invocation to use a wrong --pixel-size argument,
+# scaling all µm² gates by ~1.49× and morphology kernels by ~0.82×.
+DEFAULT_PIXEL_SIZE_UM = 0.087
 
 # GDS layer mapping — must match commit_gds.py and detect_evaluator.py
 LAYER_MAP = {
