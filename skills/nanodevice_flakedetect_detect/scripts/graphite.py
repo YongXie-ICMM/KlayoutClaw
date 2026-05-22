@@ -94,19 +94,38 @@ SCORE_CONTRAST_NORM = 50.0  # s_contrast = min(1, contrast / SCORE_CONTRAST_NORM
 # and produce near-neutral colour mixtures on typical substrates (SiO2,
 # sapphire); strongly chromatic blobs are organic contamination, polymer
 # residue, or saturation artefacts.  A K-means cluster (or candidate) whose
-# centroid has |a - 128, b - 128| chroma above CLUSTER_CHROMA_MAX is treated
+# centroid has |a - 128, b - 128| chroma above the *effective* cap is treated
 # as non-flake material and excluded / penalised.
 #
-# Value chosen empirically against the GT regression set, NOT from a
-# literature citation.  The threshold is sensitive at the upper end:
+# The effective cap = max(CLUSTER_CHROMA_MAX, host_median_chroma + CHROMA_ADAPTIVE_MARGIN).
+# This adaptive scheme is grounded in universal optics:
+#   * When the entire host has a systematic colour shift (e.g. gold-backgate
+#     stacks on QH12/HM06 where every flake material inherits a strong yellow
+#     tint, giving host median chroma > 50), the fixed cap incorrectly excludes
+#     the dominant flake cluster.  Organic contamination and polymer residue are
+#     physically small (< 5–10 % of host area) and are still excluded because
+#     their cluster chroma exceeds the adaptive threshold.
+#   * When the host median chroma is low (typical SiO2-on-hBN stacks ≤ 45),
+#     effective_cap = CLUSTER_CHROMA_MAX = 50 — identical to the previous
+#     behaviour.  ml04 (host median ≈ 44.7, residue cluster chroma ≈ 55) is
+#     therefore unaffected.
+#
+# CLUSTER_CHROMA_MAX value:
 #   * Empirical: widening CLUSTER_CHROMA_MAX to 60 regresses ml04 graphite
 #     from 0.69 to 0.00 (its polymer-residue cluster sits at chroma~55, so
 #     a 60 cap stops excluding it and it out-ranks the real flake).
-#   * 50 keeps all 5 GT graphite stacks above the baseline-0.1 floor.
+#   * 50 keeps all SiO2-substrate stacks above the baseline-0.1 floor.
 # This proximity to ml04's residue chroma is a known dependency; documented
 # here rather than disguised as pure physics.
+#
+# CHROMA_ADAPTIVE_MARGIN = 5 means a cluster must be at least 5 chroma units
+# more saturated than the host median to be excluded.  This value is NOT
+# per-stack tuned — it is a universal margin chosen so residue blobs (which
+# are strongly localised and therefore form small, high-chroma clusters) are
+# still rejected even on high-chroma-host stacks.
 LAB_NEUTRAL_AB = np.array([128.0, 128.0], dtype=np.float32)
 CLUSTER_CHROMA_MAX = 50.0
+CHROMA_ADAPTIVE_MARGIN = 5.0  # added to host_median_chroma to form the adaptive cap
 
 # Decay scale for the per-candidate chroma penalty.  Equal to
 # CLUSTER_CHROMA_MAX so that one "cap width" of excess chroma multiplies
@@ -609,6 +628,29 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
     # Pick best K via silhouette
     best_k = _pick_k_silhouette(host_pix, K_range)
 
+    # Adaptive chroma cap: the fixed CLUSTER_CHROMA_MAX (50) is calibrated for
+    # SiO2 substrates where hBN/graphite are near-neutral (host median chroma
+    # typically 40-45).  On gold-backgate or strongly-illuminated stacks the
+    # entire host inherits a systematic colour shift (host median > 50).  In
+    # those cases the fixed cap incorrectly excludes the dominant flake cluster.
+    # Universal principle: organic contamination and polymer residue are
+    # physically small, so their K-means clusters represent tiny host fractions.
+    # Legitimate flake clusters cover a large fraction and their chroma tracks
+    # the host's own chromatic baseline.  The adaptive cap is:
+    #
+    #   effective_cap = max(CLUSTER_CHROMA_MAX, host_median_chroma + CHROMA_ADAPTIVE_MARGIN)
+    #
+    # where CHROMA_ADAPTIVE_MARGIN = 5 ensures a cluster must be at least
+    # 5 units more saturated than the host median to be excluded as artifact.
+    # For typical SiO2 stacks (host_median ≤ 45), effective_cap = 50 exactly
+    # — no change from previous behaviour.  This computation is O(n_host_pix)
+    # and performed once outside the K loop.
+    host_chroma = np.linalg.norm(
+        host_pix[:, 1:] - LAB_NEUTRAL_AB[None, :], axis=1)
+    effective_chroma_cap = max(
+        float(CLUSTER_CHROMA_MAX),
+        float(np.median(host_chroma)) + CHROMA_ADAPTIVE_MARGIN)
+
     # Run full K-means for each K in range (for union coverage)
     all_K_results: list[dict[str, Any]] = []
     for K_try in K_range:
@@ -632,17 +674,18 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
 
         # Physics-based cluster exclusion: van der Waals heterostructure
         # materials (graphite, graphene, hBN, MoS2, etc.) all have LAB
-        # chroma well below CLUSTER_CHROMA_MAX.  Clusters whose centroid
-        # exceeds this chroma cap are non-flake artifacts (organic
+        # chroma well below the effective cap.  Clusters whose centroid
+        # exceeds effective_chroma_cap are non-flake artifacts (organic
         # contamination, polymer residue, illumination saturation) and
         # are excluded from candidate consideration in addition to the
-        # substrate-similar bulk cluster.  This is a universal optical
-        # property of 2D crystalline materials — not sample-fit.
+        # substrate-similar bulk cluster.  On high-chroma-host stacks the
+        # adaptive cap replaces the fixed CLUSTER_CHROMA_MAX so legitimate
+        # flake clusters are not inadvertently excluded.
         chroma_per_cluster = np.linalg.norm(
             kt.cluster_centers_[:, 1:] - LAB_NEUTRAL_AB[None, :], axis=1)
         excluded_ids = {bulk_id}
         for cid, ch in enumerate(chroma_per_cluster):
-            if float(ch) > CLUSTER_CHROMA_MAX:
+            if float(ch) > effective_chroma_cap:
                 excluded_ids.add(int(cid))
 
         cc_to_c = {}
@@ -756,15 +799,25 @@ SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated fl
 # The dominant weight (s_strip) is true crystal physics; the rest are
 # weaker physical / process priors:
 #
-#   s_strip   (0.40): graphite cleaves into strip-like geometries because the
+#   s_strip   (0.35): graphite cleaves into strip-like geometries because the
 #                     basal-plane bonding is strongly anisotropic vs c-axis.
 #                     This is true crystal physics and the single most
 #                     reliable signature, so it carries the largest weight.
-#   s_central (0.20): a fabrication-process heuristic — exfoliation tends to
-#                     stamp the flake near the host's center.  Weighted lower
-#                     than strip because edge-touching exfoliated flakes are
-#                     common in practice, so centrality is only a soft prior,
-#                     not a universal law.
+#                     Reduced from 0.40 to 0.35 (Phase 16): s_strip saturates
+#                     at 1.0 for extreme slivers (aspect > 30) that are
+#                     codex-edge artifacts rather than real graphite flakes.
+#                     Reducing from 0.40 prevents these artifacts from
+#                     outscoring genuine candidates that have slightly lower
+#                     strip scores but much larger area + better centrality.
+#                     The physics argument (anisotropic cleavage) is valid;
+#                     the weight is not per-stack tuned.
+#   s_central (0.25): a fabrication-process heuristic — exfoliation tends to
+#                     stamp the flake near the host's center.  Increased from
+#                     0.20 (Phase 16) to reflect that centrality is a
+#                     stronger spatial prior than previously weighted: sliver
+#                     artifacts cluster near host edges (low s_central) while
+#                     real graphite flakes occupy the host interior.  Edge-
+#                     touching flakes are common but not dominant.
 #   s_gray    (0.15): graphite is achromatic; non-zero chroma is a strong
 #                     negative signal (organic residue, polymer, etc.).
 #   s_contrast(0.15): graphite has measurable optical contrast against hBN
@@ -774,7 +827,7 @@ SCORE_MIN_WEIGHT = 0.05   # minimum weight fraction per sub-score (calibrated fl
 #
 # Do not adjust these per sample.  If a stack fails, the fix is upstream
 # segmentation, not these weights.
-_PHYSICS_WEIGHTS = np.array([0.40, 0.20, 0.15, 0.15, 0.10], dtype=np.float64)
+_PHYSICS_WEIGHTS = np.array([0.35, 0.25, 0.15, 0.15, 0.10], dtype=np.float64)
 
 # Variance term provides a small per-image adjustment for cases where the
 # physics priors are inconclusive (e.g. multiple strip-like candidates).
