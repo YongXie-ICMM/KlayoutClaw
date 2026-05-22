@@ -890,30 +890,40 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
                      ) -> list[dict[str, Any]]:
     """Compute 5 score components per candidate and sort by score desc.
 
-    Chroma (s_gray) is measured relative to the bulk-mode a,b channels of
-    the host (``bulk_mu_lab[1], bulk_mu_lab[2]``).  Using the bulk mode as
-    the chromatic neutral reference is more physically correct than using
-    the substrate: graphite and hBN both absorb weakly and their LAB a,b
-    values track the same per-image illumination shift that the bulk mode
-    captures.  The substrate lies outside the host mask and may have
-    substantially different a,b channels.  Weights are derived from the
-    variance of each sub-score across candidates (calibrated confidence-
-    driven weights via score_weights()).
+    Chroma (s_gray) uses the minimum-chroma-reference strategy: for each
+    candidate, chroma is computed against both the bulk-mode a,b (Phase 12
+    approach — correct when illumination shifts both graphite and hBN together)
+    and the substrate a,b (correct when the bulk is contaminated by residue or
+    another material), and the SMALLER chroma value is used.
+
+    Physics rationale: graphite is the most achromatic material in the host.
+    On illumination-shifted stacks (ml04, ml14), the bulk captures the shift
+    and bulk-relative chroma is near zero.  On contaminated-bulk stacks (AH02),
+    the substrate is near the LAB neutral axis and substrate-relative chroma is
+    near zero.  Taking the minimum is the correct estimator: it rewards whichever
+    reference makes the candidate look most achromatic, and a genuine graphite
+    flake will look achromatic relative to AT LEAST ONE of them.  This is
+    universal — not per-stack tuned.  (Phase 19 fix; replaces the single-
+    reference strategy that regressed AH02 from 0.77 to 0.48.)
+
+    Weights are derived from the variance of each sub-score across candidates
+    (calibrated confidence-driven weights via score_weights()).
     """
     host_dt = cv2.distanceTransform(host, cv2.DIST_L2, 5)
     max_dt = float(host_dt.max()) if host_dt.max() > 0 else 1.0
-    # Bulk-mode a,b as chromatic neutral for s_gray.
-    # Graphite should look achromatic RELATIVE TO the dominant host material
-    # (bulk mode = bottom hBN typically), not relative to the substrate which
-    # is outside the host mask.  The substrate a,b channels often differ
-    # substantially from the host image baseline (e.g. substrate b=132 while
-    # the entire host image has b≈84); using substrate as reference makes
-    # graphite appear highly chromatic even when it is optically neutral
-    # relative to its surrounding material.  Physics: graphite and hBN both
-    # absorb weakly in the visible; their LAB a,b values track the same
-    # illumination-dependent shift — the bulk mode captures that shift.
-    neutral_a = float(bulk_mu_lab[1])
-    neutral_b = float(bulk_mu_lab[2])
+    # Pre-compute the two candidate reference points for s_gray.
+    # ref_ab_bulk : bulk-mode a,b (Phase 12 reference — correct when
+    #               illumination shifts graphite and hBN together)
+    # ref_ab_sub  : substrate a,b (correct when bulk is contaminated)
+    # If mu_sub is not provided, fall back to LAB_NEUTRAL_AB as the substrate
+    # proxy — a safe universal default.
+    ref_ab_bulk = np.array([float(bulk_mu_lab[1]), float(bulk_mu_lab[2])],
+                           dtype=np.float64)
+    if mu_sub is not None:
+        ref_ab_sub = np.array([float(mu_sub[1]), float(mu_sub[2])],
+                              dtype=np.float64)
+    else:
+        ref_ab_sub = LAB_NEUTRAL_AB.astype(np.float64)
     for c in merged_candidates:
         # area + mean_lab + cohere
         merged_mask = c['mask']
@@ -946,11 +956,17 @@ def score_candidates(merged_candidates: list[dict[str, Any]],
         c['s_central'] = (float(host_dt[merged_mask > 0].mean()) / max_dt
                           if area_px > 0 else 0.0)
 
-        # s_gray: chroma relative to substrate a,b (substrate-aware,
-        # not hardcoded to the fixed LAB neutral point)
+        # s_gray: minimum chroma over bulk-mode and substrate references.
+        # Graphite is the most achromatic candidate — it will be close to
+        # AT LEAST ONE reference.  Taking the minimum is universal: it does
+        # not require knowing which reference is contaminated.
         a = float(c['mean_lab'][1])
         b = float(c['mean_lab'][2])
-        c['chroma'] = float(np.sqrt((a - neutral_a) ** 2 + (b - neutral_b) ** 2))
+        chroma_vs_bulk = float(np.sqrt((a - ref_ab_bulk[0]) ** 2
+                                       + (b - ref_ab_bulk[1]) ** 2))
+        chroma_vs_sub  = float(np.sqrt((a - ref_ab_sub[0]) ** 2
+                                       + (b - ref_ab_sub[1]) ** 2))
+        c['chroma'] = min(chroma_vs_bulk, chroma_vs_sub)
         c['s_gray'] = max(0.0, 1.0 - c['chroma'] / SCORE_CHROMA_NORM)
 
         # s_contrast

@@ -81,12 +81,16 @@ def test_compute_host_returns_or_documents_multi_component():
 # --- Property 4: chroma center is not hardcoded to (128, 128) ---------
 def test_chroma_center_not_hardcoded():
     src = (DETECT / "graphite.py").read_text()
-    # naked `(128, 128)` or `a=128, b=128` must be gone from scoring
+    # Bare integer literals `(128, 128)` or `a=128, b=128` must not appear
+    # inline in scoring logic.  The LAB neutral axis must be referenced via the
+    # named module constant LAB_NEUTRAL_AB (defined as [128.0, 128.0]) so the
+    # intent is documented.  Note: the constant definition itself uses
+    # `128.0, 128.0` (floats) — this test checks for the integer form.
     forbidden_patterns = ["128, 128", "a=128", "b=128"]
     hits = [p for p in forbidden_patterns if p in src]
     assert not hits, (
-        f"chroma center still hardcoded: {hits}. Use the substrate or host "
-        f"mean LAB as the neutral reference."
+        f"chroma center still hardcoded as naked literals: {hits}. "
+        f"Reference LAB_NEUTRAL_AB (the named module constant) instead."
     )
 
 
@@ -210,3 +214,45 @@ def test_morphology_kernels_derive_from_pixel_size():
         pytest.fail(
             f"morphology kernels constructed from naked literal tuples:\n{msg}"
         )
+
+
+# --- Property 7: s_gray uses min-chroma-reference for robust achromaticity ---
+def test_graphite_chroma_reference_is_neutral_axis():
+    """s_gray must use a robust minimum-chroma-reference strategy — not a
+    single stack-specific bulk or substrate reference alone.
+
+    Physics rationale (Phase 19 fix): graphite is intrinsically achromatic and
+    will appear low-chroma relative to AT LEAST ONE of (bulk, substrate).  On
+    illumination-shifted stacks (ml04, ml14) the bulk captures the shift; on
+    contaminated-bulk stacks (AH02) the substrate is near-neutral.  Taking the
+    minimum chroma over both references is universal and not per-stack tuned.
+
+    The test checks:
+    1. LAB_NEUTRAL_AB is still defined (used as substrate fallback).
+    2. The minimum-chroma strategy is present (both chroma_vs_bulk and
+       chroma_vs_sub are computed, and min(...) selects between them).
+    3. A single-reference assignment `neutral_a = float(bulk_mu_lab[...])`
+       without the min strategy is NOT present (that was the Phase 12 bug).
+    """
+    src = (DETECT / "graphite.py").read_text()
+    # LAB_NEUTRAL_AB must still exist (used as substrate-proxy fallback)
+    assert "LAB_NEUTRAL_AB" in src, (
+        "graphite.py must define LAB_NEUTRAL_AB (used as substrate-proxy "
+        "fallback when mu_sub is None)"
+    )
+    # The minimum-chroma strategy must be present
+    assert "chroma_vs_bulk" in src and "chroma_vs_sub" in src, (
+        "s_gray must compute chroma relative to BOTH bulk and substrate "
+        "references (chroma_vs_bulk and chroma_vs_sub) and take the min "
+        "(Phase 19 fix — universal achromatic scoring)"
+    )
+    assert "min(chroma_vs_bulk, chroma_vs_sub)" in src, (
+        "s_gray must use min(chroma_vs_bulk, chroma_vs_sub) to select the "
+        "most favourable achromatic reference (Phase 19 fix)"
+    )
+    # Single-reference bug from before Phase 19 must not be present
+    assert "neutral_a = float(bulk_mu_lab" not in src, (
+        "s_gray still uses a single bulk_mu_lab reference for neutral_a. "
+        "This was the Phase 12 design that regressed AH02. "
+        "Use the min-chroma-reference strategy instead (Phase 19 fix)."
+    )
