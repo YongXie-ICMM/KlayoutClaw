@@ -181,6 +181,18 @@ REFINE_OPEN_UM = 0.218     # ≈ 2.5 px at 0.087 um/px (k=5 ellipse)
 CARVE_OPEN_UM = 0.087      # ≈ 1 px at 0.087 um/px (k=3 ellipse)
 CARVE_DILATE_UM = 0.5      # codex edge dilation
 
+# Dark-strip rescue (path-B fix): k_union groups candidates by LAB colour, so a
+# thin graphite/gold strip sharing its brighter host neighbour's colour cluster
+# is swallowed into a big blob and never becomes its own candidate (e.g. HM08).
+# A strip is markedly DARKER than the hBN host (L channel), so split the host L
+# at its Otsu threshold, take the dark side, and inject the dark high-aspect
+# components as extra strip candidates.  The aspect floor keeps this from firing
+# on stacks whose dark side is a blob (those are already covered by k_union).
+# Universal: Otsu split + physical aspect/area, no per-stack tuning.  Scoring
+# still decides the final rank.
+DARK_STRIP_ASPECT_MIN = 3.0   # only inject strip-like (high PCA aspect) dark CCs
+DARK_STRIP_CLOSE_UM = 1.0     # morphological close to consolidate the dark band
+
 
 def flood_fill_holes_4corners(mask: np.ndarray) -> np.ndarray:
     """Flood-fill holes seeded from all 4 image corners that lie on
@@ -771,6 +783,83 @@ def k_union(image_lab: np.ndarray, host: np.ndarray, lab_r: np.ndarray,
     return unique
 
 
+def rescue_dark_strips(image_lab: np.ndarray, host: np.ndarray,
+                       pixel_size: float, min_cc_um2: float,
+                       existing: list[dict[str, Any]]
+                       ) -> list[dict[str, Any]]:
+    """Inject shape-based strip candidates from the dark band within the host.
+
+    k_union groups candidates by LAB colour, so a thin strip sharing its host
+    neighbour's colour cluster is swallowed into a big blob and never becomes
+    its own candidate (path-B strip loss, e.g. HM08).  A graphite/gold strip is
+    markedly DARKER than the hBN host, so split the host L channel at its Otsu
+    threshold, take the dark side, consolidate it, and keep high-aspect
+    components (>= DARK_STRIP_ASPECT_MIN) above the area floor as extra
+    candidates.  The aspect floor means this only fires when the dark side is a
+    genuine thin strip; stacks whose dark side is a blob are left to k_union.
+    Dedupe against ``existing`` by IoU so we only ADD new strip-shaped
+    candidates; score_candidates still decides the final rank.  Universal: Otsu
+    split + physical aspect/area, no per-stack constants.
+    """
+    from skimage.filters import threshold_otsu
+    # Fallback only: if k_union already produced a strip-like candidate (high
+    # PCA aspect), skip rescue.  That stack is already covered, and injecting an
+    # extra thin fragment could outscore the real strip via aspect-saturated
+    # s_strip (AH03 regression).  Rescue exists solely to cover stacks where the
+    # colour clustering left NO strip-shaped candidate at all (e.g. HM08).
+    for e in existing:
+        ei = np.argwhere(e['mask'] > 0)
+        if ei.shape[0] < MIN_PX_FOR_PCA:
+            continue
+        ev = np.linalg.eigvalsh(np.cov(ei.T.astype(np.float64)))
+        if float(np.sqrt(float(max(ev)) / max(float(min(ev)), 1e-6))) \
+                >= DARK_STRIP_ASPECT_MIN:
+            return []
+    host_bool = host > 0
+    if int(host_bool.sum()) < 16:
+        return []
+    L = image_lab[:, :, 0]
+    host_L = L[host_bool]
+    if float(host_L.max()) - float(host_L.min()) < 1.0:
+        return []
+    try:
+        thr = float(threshold_otsu(host_L))
+    except Exception:
+        return []
+    dark = ((L < thr) & host_bool).astype(np.uint8) * 255
+    close_k = _kernel_from_um(DARK_STRIP_CLOSE_UM, pixel_size, ellipse=True)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, close_k)
+    min_cc_px = int(min_cc_um2 / (pixel_size ** 2))
+    nl, lab, stats, _ = cv2.connectedComponentsWithStats(dark)
+    existing_masks = [e['mask'] for e in existing]
+    rescued: list[dict[str, Any]] = []
+    for i in range(1, nl):
+        if int(stats[i, cv2.CC_STAT_AREA]) < min_cc_px:
+            continue
+        idx = np.argwhere(lab == i)
+        if idx.shape[0] < MIN_PX_FOR_PCA:
+            continue
+        cov = np.cov(idx.T.astype(np.float64))
+        eigs = np.linalg.eigvalsh(cov)
+        lam_max = float(max(eigs)); lam_min = float(max(min(eigs), 1e-6))
+        if float(np.sqrt(lam_max / lam_min)) < DARK_STRIP_ASPECT_MIN:
+            continue  # not strip-like; colour k_union already covers blobs
+        mask = (lab == i).astype(np.uint8) * 255
+        dup = False
+        for em in existing_masks:
+            inter = int((cv2.bitwise_and(mask, em) > 0).sum())
+            uni = int((cv2.bitwise_or(mask, em) > 0).sum())
+            if uni > 0 and inter / uni >= DEDUPE_IOU:
+                dup = True
+                break
+        if dup:
+            continue
+        rescued.append({'mask': mask, 'source_K': -2, 'cluster_id': -1,
+                        'lab_ids': [], 'source_Ks': {-2}})
+        existing_masks.append(mask)
+    return rescued
+
+
 # ---------------------------------------------------------------------------
 # Bulk-mode + scoring
 # ---------------------------------------------------------------------------
@@ -1241,6 +1330,15 @@ def main() -> int:
     # 5. K-union (substrate-aware bulk detection; silhouette-chosen K)
     merged = k_union(image_lab, host, lab_r, cc_records, pixel_size,
                      mu_sub=mu_sub)
+
+    # Path-B fix: inject shape-based strip candidates from the ridge heatmap.
+    # k_union groups by colour and can swallow a thin strip into its host
+    # neighbour; ridge rescue ensures strip-shaped regions become candidates.
+    rescued = rescue_dark_strips(image_lab, host, pixel_size,
+                                 args.min_cc_um2, merged)
+    if rescued:
+        print(f'dark-strip rescue: +{len(rescued)} strip candidate(s)')
+    merged = merged + rescued
 
     # 6. Score (calibrated confidence-driven weights)
     bulk_mu_lab = compute_bulk_mode(image_lab, host)
