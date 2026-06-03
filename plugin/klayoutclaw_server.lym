@@ -815,8 +815,17 @@ def _tool_save_layout(args):
     # never observes a half-written GDS — this closes the save/score race where
     # a verifier fired mid-write and scored a truncated/missing artifact (QH12).
     tmp_path = abs_path + ".tmp"
-    _layout.write(tmp_path, save_opts)
-    os.replace(tmp_path, abs_path)
+    try:
+        _layout.write(tmp_path, save_opts)
+        os.replace(tmp_path, abs_path)
+    except Exception:
+        # Don't leave a half-written .tmp orphan on failure.
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     # DM-4: if a memory-mode VC handle exists for this layout, migrate it
     # to disk now that we have a concrete .gds path.  Best-effort: any
     # failure is logged but does not fail the save itself.
@@ -2369,11 +2378,16 @@ def _handle_jsonrpc(body_str):
             return {"jsonrpc": "2.0", "id": req_id, "result": {
                 "content": [{"type": "text", "text": err_msg}], "isError": True}}, 200
 
+        # `ping` is a trivial liveness probe — answer it BEFORE the busy guard so
+        # a (possibly re-entrant) ping never touches the single-threaded
+        # _tool_busy flags. Going through the busy set/clear below would let a
+        # ping fired mid-tool clear an in-flight tool's guard and corrupt it.
+        if tool_name == "ping":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": _tool_ping(tool_args)}]}}, 200
+
         # Reject parallel tool calls — the server is single-threaded.
-        # `ping` is exempt: it is a trivial liveness probe that must answer even
-        # when a heavy tool is in flight, so the agent can tell a wedge from a
-        # slow call.
-        if _tool_busy and tool_name != "ping":
+        if _tool_busy:
             err_msg = (
                 "Server busy: '{}' is currently running. "
                 "KLayout MCP server is single-threaded and cannot handle parallel tool calls. "

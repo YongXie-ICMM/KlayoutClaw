@@ -117,7 +117,9 @@ The skill does NOT prescribe dimensions, shapes, or layer numbers. The agent der
 
 Use `screenshot` after each major geometry addition to visually verify placement.
 
-**Gate:** Device geometry is present on designated layers. Visual inspection via `screenshot` confirms correct placement. **Frame guard (mandatory):** before passing this gate, assert with `pya.Region` that the active region (mesa/channel) **intersects the union of the aligned flake layers** committed in KLayout (e.g. L11∩L13 for a Hall-bar channel). If the intersection is empty, the device is in the wrong frame — STOP and fix the coordinate source (see the frame contract in ANALYZE) or re-run gdsalign; do not proceed to ROUTE.
+**Gate:** Device geometry is present on designated layers. Visual inspection via `screenshot` confirms correct placement.
+
+**Frame guard (mandatory):** before passing this gate, assert with `pya.Region` that the active region (mesa/channel) **overlaps the material region the device physics requires** — the SAME region you identified in ANALYZE (for a Hall bar that is the graphene∩graphite overlap; for a single-material device it is that one flake region; for a JJ/QD it is whatever its stack needs). Read those regions from the committed flake layers using the layer numbers YOU assigned (do not hard-code L11/L13 — confirm the mapping from your own commit). Procedure: (1) confirm the target flake layer(s) are **non-empty** — an absent material is a detection/commit problem, not a frame error, so skip the guard for it; (2) if the target region is non-empty but its overlap with the active region is empty, the device is in the **wrong frame** — STOP, fix the coordinate source (see the frame contract in ANALYZE) or re-run gdsalign, and do not proceed to ROUTE.
 
 ---
 
@@ -195,24 +197,36 @@ Also take a `screenshot` for visual inspection.
 
 > **BENCHMARK FORMAT WARNING**: If this task is a benchmark run, the required `result.json` schema is defined in the **task prompt itself**. Re-read the task prompt and use the exact schema it specifies. Do **NOT** fall back to the nested general-purpose format below — a schema mismatch makes the evaluator score 0.0.
 
-> ### ⚠️ Atomic save-best — the scored artifact must be your BEST design, intact
+> ### ⚠️ Save-best — the scored artifact must be your BEST design, intact
 >
-> A verifier can read `result.gds` / `result.json` at any moment. Two failure
-> modes lost good work in the benchmark: (1) a verifier read a half-written or
-> missing GDS during a save (QH12), and (2) a later/worse iteration or a
-> truncated-retry overwrote a better earlier result (HM08). Follow this exactly:
+> A verifier can read `result.gds` / `result.json` at any moment. A verifier read
+> a half-written/missing GDS mid-save (QH12), and a later iteration can clobber a
+> better earlier result. Follow this exactly:
 >
 > 1. **Never write the final paths during iteration.** While designing/routing,
 >    do not save to `output/result.gds` or `output/result.json`.
-> 2. **Save-best.** Only after EVALUATE confirms a design is your best so far,
->    promote it. Do not overwrite a promoted better result with a worse one.
-> 3. **Stage then promote atomically.** Save the GDS to a staging path, write
->    the JSON to a staging path, then promote BOTH with a single `bash`:
+> 2. **Save-best with a persistent record — do not rely on memory.** Keep the
+>    best score in the promoted `result.json` itself (or a `output/best.score`
+>    sidecar). Before promoting a new design, **read the existing
+>    `output/result.json` and compare its recorded score**; promote ONLY if the
+>    new EVALUATE score is higher (or no result is promoted yet). This survives a
+>    restart/retry — a fresh session reads the prior best instead of overwriting
+>    it blindly. (If the benchmark's required `result.json` schema has no score
+>    field, keep the score in the `best.score` sidecar instead.)
+> 3. **Stage, then promote — GDS first.** `save_layout` writes the GDS
+>    atomically (tmp + rename), so write to a staging path then promote:
 >    - `save_layout` → `output/result.gds.new`
 >    - write `output/result.json.new`
 >    - `mv -f output/result.gds.new output/result.gds && mv -f output/result.json.new output/result.json`
->    Both finals then appear together and neither is ever observed half-written.
-> 4. **Confirm the save landed.** Read back `output/result.gds` size / `get_layout_info`. If a tool returned a suspicious/stale result, call `ping` to check the bridge is alive, then re-save.
+>    Promote the **GDS before the JSON** so a verifier never sees new JSON
+>    pointing at an old GDS. NOTE: the two `mv`s are two separate renames — the
+>    pair is **not** atomic; a verifier polling both files could briefly see the
+>    new GDS with the old JSON. This is acceptable (the GDS is the scored
+>    artifact; the JSON is the layer map and changes rarely), but do not claim
+>    cross-file atomicity.
+> 4. **Confirm the save landed.** Read back `output/result.gds` size /
+>    `get_layout_info`. If a tool returned a suspicious/stale/repeated result,
+>    call `ping` to check the bridge is alive, then re-save.
 
 1. Save your BEST design atomically per the save-best block above (stage `.new`, promote both with one `mv`).
 2. Write `result.json` — **check if the task or benchmark specifies a required format first and use that exactly**. If no format is specified, use this general-purpose default:

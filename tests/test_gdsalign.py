@@ -26,6 +26,13 @@ def _import_align_gds():
     return importlib.import_module("align_gds")
 
 
+def _import_commit_gds():
+    import importlib
+    if GDSALIGN_DIR not in sys.path:
+        sys.path.insert(0, GDSALIGN_DIR)
+    return importlib.import_module("commit_gds")
+
+
 class TestExtractMarkers:
     """Tests for extract_markers.py — GDS L5/0 marker pair extraction."""
 
@@ -387,3 +394,55 @@ class TestRotationalDisambiguation:
         assert abs(chosen_rot) < 5.0, (
             f"disambiguation kept the wrong branch (rot={chosen_rot:.1f} deg); "
             f"expected ~0 deg")
+
+
+class TestRegistrationFrameCheck:
+    """The commit_gds registration frame check (#4) must key on distance from
+    the marker grid CENTER (scaled by field size), not the huge outer bbox.
+    Regression for the verification finding that bbox+/-25% let HM08/AH06/QH06
+    offsets (~520-1144 um in a 1550 um field) all escape."""
+
+    def _setup(self, tmp, flake_center_xy):
+        cg = _import_commit_gds()
+        # A valid reflected transform: y-flip about y=775, rotation 0, scale 1.
+        M = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 1550.0]])
+        np.save(os.path.join(tmp, "gds_warp.npy"), M)
+        report = {
+            "status": "complete",
+            "transform": {"rotation_deg": 0.0, "scale": 1.0,
+                          "translation_um": [0.0, 1550.0], "reflected": True},
+            "quality": {"inliers": 4, "mean_residual_um": 0.1, "max_residual_um": 0.2},
+        }
+        with open(os.path.join(tmp, "gds_alignment_report.json"), "w") as f:
+            json.dump(report, f)
+        with open(os.path.join(tmp, "gds_markers.json"), "w") as f:
+            json.dump({"grid_center_um": [775.0, 775.0],
+                       "grid_bbox_um": [[0.0, 0.0], [1550.0, 1550.0]]}, f)
+        cx, cy = flake_center_xy
+        traces_gds = {"materials": {"graphene": [{"contour_gds": [
+            [cx - 30, cy - 30], [cx + 30, cy - 30],
+            [cx + 30, cy + 30], [cx - 30, cy + 30]]}]}}
+        return cg, M, os.path.join(tmp, "gds_warp.npy"), traces_gds
+
+    def test_centered_device_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cg, M, warp, traces = self._setup(tmp, (775.0, 775.0))
+            ok, msg = cg.validate_registration(M, warp, None, None, traces)
+            assert ok, f"a centered device must pass: {msg}"
+
+    def test_off_frame_device_at_origin_is_caught(self):
+        """A device at the GDS origin (the QH06 ~1144 um-from-center failure)
+        must now be rejected — the old bbox check let it through."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cg, M, warp, traces = self._setup(tmp, (0.0, 0.0))
+            ok, msg = cg.validate_registration(M, warp, None, None, traces)
+            assert not ok, "flakes at origin must be flagged off-frame"
+            assert "WRONG frame" in msg or "wrong frame" in msg.lower()
+
+    def test_off_frame_device_500um_offset_is_caught(self):
+        """The HM08/AH06 ~520 um displacement (centroid ~(1148,392)) must be
+        caught — it was ~48% of the field half-span, inside the old bbox."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cg, M, warp, traces = self._setup(tmp, (1148.0, 392.0))
+            ok, msg = cg.validate_registration(M, warp, None, None, traces)
+            assert not ok, "a ~520 um off-center device must be flagged off-frame"

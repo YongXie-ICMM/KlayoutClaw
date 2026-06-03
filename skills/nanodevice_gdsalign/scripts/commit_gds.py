@@ -245,34 +245,49 @@ def validate_registration(M, warp_path, align_report_path, gds_markers_path,
     except (KeyError, TypeError, ValueError):
         pass  # older report without a full transform block — skip this check
 
-    # 4. Frame check: the warped flake centroid must land in the marker field.
+    # 4. Frame check: the warped flakes must sit near the CENTER of the marker
+    #    field, not merely anywhere inside the (large) outer marker bbox. The
+    #    device occupies the central region; a wrong frame shifts it out toward
+    #    or past the markers. Key on distance from grid_center, scaled by the
+    #    marker-field half-span — adaptive (no fixed um threshold). The earlier
+    #    bbox+/-25% test was useless: for a 1550 um field even a ~1000 um error
+    #    still landed inside it (the HM08/AH06/QH06 offsets all escaped).
     mk_path = gds_markers_path or os.path.join(
         os.path.dirname(os.path.abspath(warp_path)), "gds_markers.json")
     if os.path.exists(mk_path):
         try:
             with open(mk_path) as f:
                 mk = json.load(f)
+            gc = mk.get("grid_center_um")
             bbox = mk.get("grid_bbox_um")
-            if bbox is None and "grid_center_um" in mk:
-                cx, cy = mk["grid_center_um"]
-                bbox = [[cx - 1000, cy - 1000], [cx + 1000, cy + 1000]]
             pts = []
             for mat_list in traces_gds.get("materials", {}).values():
                 for entry in mat_list:
                     if entry.get("contour_gds"):
                         pts.extend(entry["contour_gds"])
-            if bbox is not None and pts:
-                cen = np.array(pts).mean(axis=0)
-                (x0, y0), (x1, y1) = bbox
-                # expand by 25% so devices legitimately near the field edge pass
-                mx, my = 0.25 * (x1 - x0), 0.25 * (y1 - y0)
-                if not (x0 - mx <= cen[0] <= x1 + mx
-                        and y0 - my <= cen[1] <= y1 + my):
+            if gc is not None and pts:
+                arr = np.array(pts, dtype=float)
+                # bbox-center of the flakes (robust to vertex-density bias,
+                # unlike a vertex mean)
+                flake_center = (arr.min(axis=0) + arr.max(axis=0)) / 2.0
+                gc = np.array(gc, dtype=float)
+                dist = float(np.hypot(*(flake_center - gc)))
+                if bbox is not None:
+                    (x0, y0), (x1, y1) = bbox
+                    half_span = 0.5 * float(np.hypot(x1 - x0, y1 - y0))
+                else:
+                    half_span = float(np.hypot(*(arr.max(axis=0) - arr.min(axis=0))))
+                # Reject when the device sits past ~45% of the way from the field
+                # center toward its corner — well beyond where a centred device
+                # lands, yet inside the ~48-105% range of the real off-frame
+                # failures.
+                if half_span > 0 and dist > 0.45 * half_span:
                     return False, (
-                        "warped flakes land OFF the L5 marker field: centroid "
-                        "({:.0f}, {:.0f}) um is outside marker bbox {} (+/-25% "
-                        "margin). The transform is wrong — re-run align_gds; do "
-                        "not hand-roll.".format(cen[0], cen[1], bbox))
+                        "warped flakes are {:.0f} um from the marker grid center "
+                        "{} — that is >45% of the marker-field half-span ({:.0f} "
+                        "um), so the device is in the WRONG frame. Re-run "
+                        "align_gds; do not hand-roll.".format(
+                            dist, gc.tolist(), half_span))
         except (ValueError, OSError):
             pass
 
