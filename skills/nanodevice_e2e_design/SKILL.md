@@ -77,7 +77,26 @@ The agent derives material analysis logic from its physics knowledge of the devi
 - A QD needs a gate-definable region
 - A JJ needs a superconductor-insulator-superconductor stack
 
-**Gate:** The agent has identified where the device should be placed and what material constraints apply.
+> ### ⚠️ Coordinate-frame contract (read before touching any flake coords)
+>
+> If `nanodevice_gdsalign` has run, the flake polygons already committed in
+> KLayout (layers L10-L13) are in the **GDS reference frame** and are the
+> **single source of truth**. Build the device against THOSE — read them back
+> with `pya.Region` in absolute coordinates; do not re-derive flake geometry
+> from raw JSON.
+>
+> - The ONLY valid JSON flake source after gdsalign is
+>   `traces_gds.json` → per-entry **`contour_gds`**. **NEVER** read
+>   `contour_um` (the un-warped image frame): it places the device hundreds of
+>   um off the GDS template and scores ~0 (the QH07 failure). Do not invent a
+>   `device_geom.json` with a hand-labeled `frame`.
+> - On **session recovery** (live layout empty / `result.gds` missing), rebuild
+>   flakes from `traces_gds.json::contour_gds` ONLY — never from `contour_um`.
+> - If the markers/flakes look off-frame, that is an alignment failure: re-run
+>   gdsalign (see its validated-commit contract), do not patch coordinates by
+>   hand.
+
+**Gate:** The agent has identified where the device should be placed and what material constraints apply, working in the GDS reference frame (the committed L10-L13 flakes).
 
 ---
 
@@ -98,7 +117,7 @@ The skill does NOT prescribe dimensions, shapes, or layer numbers. The agent der
 
 Use `screenshot` after each major geometry addition to visually verify placement.
 
-**Gate:** Device geometry is present on designated layers. Visual inspection via `screenshot` confirms correct placement.
+**Gate:** Device geometry is present on designated layers. Visual inspection via `screenshot` confirms correct placement. **Frame guard (mandatory):** before passing this gate, assert with `pya.Region` that the active region (mesa/channel) **intersects the union of the aligned flake layers** committed in KLayout (e.g. L11∩L13 for a Hall-bar channel). If the intersection is empty, the device is in the wrong frame — STOP and fix the coordinate source (see the frame contract in ANALYZE) or re-run gdsalign; do not proceed to ROUTE.
 
 ---
 
@@ -176,7 +195,26 @@ Also take a `screenshot` for visual inspection.
 
 > **BENCHMARK FORMAT WARNING**: If this task is a benchmark run, the required `result.json` schema is defined in the **task prompt itself**. Re-read the task prompt and use the exact schema it specifies. Do **NOT** fall back to the nested general-purpose format below — a schema mismatch makes the evaluator score 0.0.
 
-1. Call `save_layout` to export the GDS file
+> ### ⚠️ Atomic save-best — the scored artifact must be your BEST design, intact
+>
+> A verifier can read `result.gds` / `result.json` at any moment. Two failure
+> modes lost good work in the benchmark: (1) a verifier read a half-written or
+> missing GDS during a save (QH12), and (2) a later/worse iteration or a
+> truncated-retry overwrote a better earlier result (HM08). Follow this exactly:
+>
+> 1. **Never write the final paths during iteration.** While designing/routing,
+>    do not save to `output/result.gds` or `output/result.json`.
+> 2. **Save-best.** Only after EVALUATE confirms a design is your best so far,
+>    promote it. Do not overwrite a promoted better result with a worse one.
+> 3. **Stage then promote atomically.** Save the GDS to a staging path, write
+>    the JSON to a staging path, then promote BOTH with a single `bash`:
+>    - `save_layout` → `output/result.gds.new`
+>    - write `output/result.json.new`
+>    - `mv -f output/result.gds.new output/result.gds && mv -f output/result.json.new output/result.json`
+>    Both finals then appear together and neither is ever observed half-written.
+> 4. **Confirm the save landed.** Read back `output/result.gds` size / `get_layout_info`. If a tool returned a suspicious/stale result, call `ping` to check the bridge is alive, then re-save.
+
+1. Save your BEST design atomically per the save-best block above (stage `.new`, promote both with one `mv`).
 2. Write `result.json` — **check if the task or benchmark specifies a required format first and use that exactly**. If no format is specified, use this general-purpose default:
 
 **General format (non-benchmark):**

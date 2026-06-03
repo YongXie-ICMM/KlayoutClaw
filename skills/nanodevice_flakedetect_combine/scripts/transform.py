@@ -235,6 +235,38 @@ def build_masks(detections, detect_dir, warp_bot_inv, warp_top, footprint,
     return masks, stage_counts
 
 
+def graphene_warp_validation(masks, stage_counts, encap_frac_warn=0.85):
+    """Soft self-check on the graphene combine warp (top_part -> full_stack).
+
+    Graphene is encapsulated, so after a correct warp it must sit almost
+    entirely inside its bottom_hBN encapsulant; a warp that shifts graphene
+    off-frame (the ml14 failure: ~10.7 um Y offset) drops that fraction. Uses
+    ONLY the agent's own combined masks (no ground truth). Returns a diagnostics
+    dict and NEVER raises — a low score is a WARNING, not a gate: the signal is
+    coarse and a small offset may not trip it, so it must not block a hard stack.
+    """
+    out = {}
+    g = masks.get("graphene")
+    if g is None:
+        return {"status": "skipped", "reason": "no graphene mask"}
+    g_on = g > 0
+    g_area = int(g_on.sum())
+    out["graphene_pixels"] = g_area
+    b = masks.get("bottom_hBN")
+    if b is not None and g_area > 0:
+        frac = int((g_on & (b > 0)).sum()) / g_area
+        out["graphene_in_bottom_hBN_frac"] = round(frac, 4)
+        out["encapsulation_ok"] = bool(frac >= encap_frac_warn)
+    gc = stage_counts.get("graphene", {})
+    pw = gc.get("post_warp_pixels")
+    pb = gc.get("post_bitwise_and_pixels")
+    if pw:
+        out["footprint_retention_frac"] = round(pb / pw, 4) if pb is not None else None
+    out["flag"] = ("graphene_warp_suspect"
+                   if out.get("encapsulation_ok") is False else None)
+    return out
+
+
 def extract_contours(masks, min_area_px=500):
     """Extract and smooth contours from final material masks.
 
@@ -475,6 +507,18 @@ def main():
     # zeroed a valid input at stage X" without re-running the pipeline.
     report["transform_diagnostics"] = stage_counts
     report["traces_file"] = "traces.json"
+
+    # Soft graphene-warp self-check (ml14): graphene must sit inside its
+    # encapsulant. Informational — never blocks; flag a suspect warp for the
+    # orchestrator to inspect the overlay / re-run the top alignment.
+    gv = graphene_warp_validation(masks, stage_counts)
+    report["graphene_warp_validation"] = gv
+    if gv.get("flag"):
+        print("WARNING: graphene_warp_validation flagged 'graphene_warp_suspect' "
+              "— graphene sits only {:.0%} inside bottom_hBN; the top->full_stack "
+              "warp may be off-frame. Inspect the overlay and consider re-running "
+              "the top alignment.".format(
+                  gv.get("graphene_in_bottom_hBN_frac", 0.0)))
 
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)

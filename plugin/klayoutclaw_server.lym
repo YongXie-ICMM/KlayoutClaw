@@ -417,6 +417,11 @@ def _ensure_session():
 
 TOOLS = [
     {
+        "name": "ping",
+        "description": "Cheap liveness probe. Returns {status, ts, busy, busy_tool, pid} without touching the layout. Use it to distinguish a wedged MCP bridge (e.g. one returning a stale/fixed response) from a slow-but-alive tool call — if a tool seems stuck or you get a suspicious repeated/garbled result, call ping: a healthy server replies instantly with status=ok and whether a tool is in flight.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "create_layout",
         "description": "Create a new layout with a top cell. Returns the cell name.",
         "inputSchema": {
@@ -805,7 +810,13 @@ def _tool_save_layout(args):
         save_opts.format = "OASIS"
     else:
         save_opts.format = "GDS2"
-    _layout.write(abs_path, save_opts)
+    # Atomic write: write to a temp file in the SAME directory, then os.replace
+    # (an atomic rename within a filesystem). A verifier or any other reader
+    # never observes a half-written GDS — this closes the save/score race where
+    # a verifier fired mid-write and scored a truncated/missing artifact (QH12).
+    tmp_path = abs_path + ".tmp"
+    _layout.write(tmp_path, save_opts)
+    os.replace(tmp_path, abs_path)
     # DM-4: if a memory-mode VC handle exists for this layout, migrate it
     # to disk now that we have a concrete .gds path.  Best-effort: any
     # failure is logged but does not fail the save itself.
@@ -2241,7 +2252,24 @@ def _tool_vc_status(args):
     return json.dumps(result)
 
 
+def _tool_ping(args):
+    """Cheap liveness probe (also exposed as the JSON-RPC `ping` method).
+
+    Returns server status without touching `_layout`, so the agent can tell a
+    wedged bridge (e.g. one returning a stale/fixed result) from a slow-but-alive
+    call. Exempt from the single-threaded busy rejection.
+    """
+    return json.dumps({
+        "status": "ok",
+        "ts": datetime.datetime.now().isoformat(),
+        "busy": _tool_busy,
+        "busy_tool": _tool_busy_name,
+        "pid": os.getpid(),
+    })
+
+
 _TOOL_DISPATCH = {
+    "ping": _tool_ping,
     "create_layout": _tool_create_layout,
     "execute_script": _tool_execute_script,
     "save_layout": _tool_save_layout,
@@ -2316,6 +2344,20 @@ def _handle_jsonrpc(body_str):
         _notify_request(method, True)
         return {"jsonrpc": "2.0", "id": req_id, "result": result}, 200
 
+    # --- ping (cheap liveness probe) ---
+    # Bypasses the serial tools/call path so a watchdog can distinguish a wedged
+    # bridge from a slow-but-alive one. Reports whether a heavy tool is in flight
+    # (busy/busy_tool) and the server pid. Microsecond response; never touches
+    # _layout.
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "status": "ok",
+            "ts": datetime.datetime.now().isoformat(),
+            "busy": _tool_busy,
+            "busy_tool": _tool_busy_name,
+            "pid": os.getpid(),
+        }}, 200
+
     # --- tools/call ---
     if method == "tools/call":
         tool_name = params.get("name")
@@ -2327,8 +2369,11 @@ def _handle_jsonrpc(body_str):
             return {"jsonrpc": "2.0", "id": req_id, "result": {
                 "content": [{"type": "text", "text": err_msg}], "isError": True}}, 200
 
-        # Reject parallel tool calls — the server is single-threaded
-        if _tool_busy:
+        # Reject parallel tool calls — the server is single-threaded.
+        # `ping` is exempt: it is a trivial liveness probe that must answer even
+        # when a heavy tool is in flight, so the agent can tell a wedge from a
+        # slow call.
+        if _tool_busy and tool_name != "ping":
             err_msg = (
                 "Server busy: '{}' is currently running. "
                 "KLayout MCP server is single-threaded and cannot handle parallel tool calls. "
