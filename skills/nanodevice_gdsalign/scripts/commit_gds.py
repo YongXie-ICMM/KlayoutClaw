@@ -265,29 +265,31 @@ def validate_registration(M, warp_path, align_report_path, gds_markers_path,
                 for entry in mat_list:
                     if entry.get("contour_gds"):
                         pts.extend(entry["contour_gds"])
-            if gc is not None and pts:
+            # Only run the frame check when we have the marker-field bbox to
+            # scale against. Without grid_bbox_um (older marker files) the field
+            # size is unknown — scaling by the flake's OWN extent would make the
+            # threshold meaningless, so skip the frame check and rely on the
+            # (stronger) report-existence + matrix-match checks above.
+            if gc is not None and pts and bbox is not None:
                 arr = np.array(pts, dtype=float)
                 # bbox-center of the flakes (robust to vertex-density bias,
                 # unlike a vertex mean)
                 flake_center = (arr.min(axis=0) + arr.max(axis=0)) / 2.0
                 gc = np.array(gc, dtype=float)
                 dist = float(np.hypot(*(flake_center - gc)))
-                if bbox is not None:
-                    (x0, y0), (x1, y1) = bbox
-                    half_span = 0.5 * float(np.hypot(x1 - x0, y1 - y0))
-                else:
-                    half_span = float(np.hypot(*(arr.max(axis=0) - arr.min(axis=0))))
+                (x0, y0), (x1, y1) = bbox
+                half_span = 0.5 * float(np.hypot(x1 - x0, y1 - y0))
                 # Reject when the device sits past ~45% of the way from the field
                 # center toward its corner — well beyond where a centred device
-                # lands, yet inside the ~48-105% range of the real off-frame
-                # failures.
+                # lands (typically <30%), yet below the ~48-105% range of the
+                # real off-frame failures (HM08/AH06 ~49%, QH06 ~100%).
                 if half_span > 0 and dist > 0.45 * half_span:
                     return False, (
                         "warped flakes are {:.0f} um from the marker grid center "
-                        "{} — that is >45% of the marker-field half-span ({:.0f} "
-                        "um), so the device is in the WRONG frame. Re-run "
-                        "align_gds; do not hand-roll.".format(
-                            dist, gc.tolist(), half_span))
+                        "{} ({:.0f}% of the marker-field half-span {:.0f} um) — "
+                        "the device is in the WRONG frame. Re-run align_gds; do "
+                        "not hand-roll.".format(
+                            dist, gc.tolist(), 100.0 * dist / half_span, half_span))
         except (ValueError, OSError):
             pass
 

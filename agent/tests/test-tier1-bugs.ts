@@ -171,12 +171,38 @@ describe("BUG 6 (layer_map): object-typed MCP params must build an object schema
     expect(schema.properties?.checks?.type).toBe("array");
   });
 
-  it("both schema builders contain an explicit case \"object\" (no silent default→Unknown)", () => {
+  it("subagent buildProxySchema ALSO renders a type:object param as an object schema (behavioral, both builders covered)", async () => {
+    // The subagent path uses a SEPARATE builder (buildProxySchema) with the same
+    // bug class. Exercise it directly so neither builder relies on keyword
+    // matching — assert real schema output, not source text.
+    const { buildProxySchema } = await import("../src/subagent/tool-factory.js");
+    const schema = buildProxySchema({
+      type: "object",
+      properties: {
+        layer_map: { type: "object", description: "component → layer spec" },
+        checks: { type: "array", description: "checks" },
+      },
+      required: ["layer_map", "checks"],
+    }) as any;
+    const lm = schema.properties?.layer_map;
+    expect(lm?.type).toBe("object");
+    expect(lm?.additionalProperties).not.toBe(false);
+    expect(lm?.additionalProperties).toBeTruthy();
+    expect(schema.properties?.checks?.type).toBe("array");
+  });
+
+  it("neither schema builder lets an object param fall through to Type.Unknown (semantic source guard)", () => {
+    // Backstop the two behavioral tests: confirm each builder's `case "object"`
+    // body actually produces an object schema (Type.Object/additionalProperties),
+    // not merely that the token exists — a wrong body (e.g. Type.String) fails.
     for (const f of ["tools/index.ts", "subagent/tool-factory.ts"]) {
       const src = srcFile(f);
-      expect(src, `${f} must handle object-typed params explicitly`).toMatch(
-        /case\s+"object"\s*:/,
-      );
+      // Capture the object-case body up to the next case/default label.
+      const m = src.match(/case\s+"object"\s*:([\s\S]*?)(?:\n\s*(?:case\s+"|default\s*:))/);
+      expect(m, `${f} must have a case "object" block`).toBeTruthy();
+      const body = m![1];
+      expect(body, `${f} case "object" must build an object schema`).toMatch(/Type\.Object\(/);
+      expect(body, `${f} case "object" must allow additional properties`).toMatch(/additionalProperties/);
     }
   });
 });

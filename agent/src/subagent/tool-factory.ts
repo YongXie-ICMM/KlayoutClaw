@@ -36,7 +36,7 @@ export interface ToolFactoryDeps {
 /**
  * Convert MCP ToolInputSchema to TypeBox schema for subagent tool registration.
  */
-function buildProxySchema(inputSchema: ToolInputSchema) {
+export function buildProxySchema(inputSchema: ToolInputSchema) {
   const props: Record<string, any> = {};
   for (const [key, def] of Object.entries(inputSchema.properties ?? {})) {
     let schema: any;

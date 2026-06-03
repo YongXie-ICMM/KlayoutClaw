@@ -80,10 +80,12 @@ The agent derives material analysis logic from its physics knowledge of the devi
 > ### ⚠️ Coordinate-frame contract (read before touching any flake coords)
 >
 > If `nanodevice_gdsalign` has run, the flake polygons already committed in
-> KLayout (layers L10-L13) are in the **GDS reference frame** and are the
-> **single source of truth**. Build the device against THOSE — read them back
-> with `pya.Region` in absolute coordinates; do not re-derive flake geometry
-> from raw JSON.
+> KLayout (the flake layers — L10-L13 by default, but confirm the mapping from
+> your own commit) are in the **GDS reference frame** and are the **single
+> source of truth**. Build the device against THOSE — read them back with
+> `pya.Region` in absolute coordinates; do not re-derive flake geometry from raw
+> JSON, and treat the committed flake layers as read-only reference (do not
+> clear and re-insert flakes from an image-frame source).
 >
 > - The ONLY valid JSON flake source after gdsalign is
 >   `traces_gds.json` → per-entry **`contour_gds`**. **NEVER** read
@@ -197,36 +199,25 @@ Also take a `screenshot` for visual inspection.
 
 > **BENCHMARK FORMAT WARNING**: If this task is a benchmark run, the required `result.json` schema is defined in the **task prompt itself**. Re-read the task prompt and use the exact schema it specifies. Do **NOT** fall back to the nested general-purpose format below — a schema mismatch makes the evaluator score 0.0.
 
-> ### ⚠️ Save-best — the scored artifact must be your BEST design, intact
+> ### Save often — and make sure your BEST result is the one on disk
 >
-> A verifier can read `result.gds` / `result.json` at any moment. A verifier read
-> a half-written/missing GDS mid-save (QH12), and a later iteration can clobber a
-> better earlier result. Follow this exactly:
+> Follow the benchmark's own rule: **save early, save often.** A partial result
+> always scores higher than no result; an agent that finishes a good device but
+> times out before saving scores 0.0. So:
 >
-> 1. **Never write the final paths during iteration.** While designing/routing,
->    do not save to `output/result.gds` or `output/result.json`.
-> 2. **Save-best with a persistent record — do not rely on memory.** Keep the
->    best score in the promoted `result.json` itself (or a `output/best.score`
->    sidecar). Before promoting a new design, **read the existing
->    `output/result.json` and compare its recorded score**; promote ONLY if the
->    new EVALUATE score is higher (or no result is promoted yet). This survives a
->    restart/retry — a fresh session reads the prior best instead of overwriting
->    it blindly. (If the benchmark's required `result.json` schema has no score
->    field, keep the score in the `best.score` sidecar instead.)
-> 3. **Stage, then promote — GDS first.** `save_layout` writes the GDS
->    atomically (tmp + rename), so write to a staging path then promote:
->    - `save_layout` → `output/result.gds.new`
->    - write `output/result.json.new`
->    - `mv -f output/result.gds.new output/result.gds && mv -f output/result.json.new output/result.json`
->    Promote the **GDS before the JSON** so a verifier never sees new JSON
->    pointing at an old GDS. NOTE: the two `mv`s are two separate renames — the
->    pair is **not** atomic; a verifier polling both files could briefly see the
->    new GDS with the old JSON. This is acceptable (the GDS is the scored
->    artifact; the JSON is the layer map and changes rarely), but do not claim
->    cross-file atomicity.
+> 1. **Save as soon as you have a complete, routed device**, then **re-save
+>    whenever you reach a higher EVALUATE score.** Overwriting `output/result.gds`
+>    is free — `save_layout` writes it atomically (temp + rename), so a verifier
+>    never observes a half-written GDS; you do not need staging files.
+> 2. **Write `result.json` in the exact schema the task prompt specifies** (it is
+>    usually a flat object with no `score` field — do not add one). Keep it in
+>    sync with the saved GDS.
+> 3. **Don't let a later, worse iteration become the final artifact.** Only
+>    re-save when EVALUATE confirms the new design is at least as good; if an
+>    experiment makes things worse, revert the geometry before the next save.
 > 4. **Confirm the save landed.** Read back `output/result.gds` size /
->    `get_layout_info`. If a tool returned a suspicious/stale/repeated result,
->    call `ping` to check the bridge is alive, then re-save.
+>    `get_layout_info`. If a tool returns a suspicious, stale, or repeated result
+>    (a wedged bridge), call `ping` to check the server is alive, then re-save.
 
 1. Save your BEST design atomically per the save-best block above (stage `.new`, promote both with one `mv`).
 2. Write `result.json` — **check if the task or benchmark specifies a required format first and use that exactly**. If no format is specified, use this general-purpose default:
