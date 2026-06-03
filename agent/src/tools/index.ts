@@ -82,6 +82,16 @@ function buildToolSchema(inputSchema: NamespacedTool["inputSchema"]) {
       case "array":
         props[key] = Type.Array(Type.Unknown(), { description: def.description });
         break;
+      case "object":
+        // Dynamic-key object (e.g. evaluate_design.layer_map). Must render as
+        // a real object schema with additionalProperties — NOT Type.Unknown()
+        // (which compiles to `{}` and makes Opus serialise the value as a JSON
+        // string, crashing the server on `layer_map.items()`).
+        props[key] = Type.Object(
+          {},
+          { description: def.description, additionalProperties: true },
+        );
+        break;
       default:
         props[key] = Type.Unknown();
     }

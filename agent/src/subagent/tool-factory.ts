@@ -56,6 +56,15 @@ function buildProxySchema(inputSchema: ToolInputSchema) {
       case "array":
         schema = Type.Array(Type.Unknown(), { description: def.description });
         break;
+      case "object":
+        // Dynamic-key object (e.g. evaluate_design.layer_map) — render as a
+        // real object schema, not Type.Unknown() (`{}`), so the model emits a
+        // structured object rather than a JSON string the server can't parse.
+        schema = Type.Object(
+          {},
+          { description: def.description, additionalProperties: true },
+        );
+        break;
       default:
         schema = Type.Unknown();
     }

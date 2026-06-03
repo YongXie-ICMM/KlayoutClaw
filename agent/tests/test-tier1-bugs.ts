@@ -23,6 +23,8 @@ import type {
   ToolAnnotation,
 } from "../src/types/v04-contracts.js";
 import { TOOL_ANNOTATIONS } from "../src/tools/annotations.js";
+import { createMCPTools } from "../src/tools/index.js";
+import type { NamespacedTool } from "../src/mcp/types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -111,6 +113,71 @@ describe("BUG 5 (#9): Empty MCP schemas — must forward real inputSchema", () =
 
     const usesEmptySchema = /parameters:\s*Type\.Object\(\s*\{\s*\}\s*\)/.test(block);
     expect(usesEmptySchema).toBe(false);
+  });
+});
+
+// ============================================================
+// BUG 6 (layer_map): object-typed MCP params must build a real
+// object schema — NOT Type.Unknown(). buildToolSchema/buildProxySchema
+// switch on def.type but have no `case "object"`, so an MCP param declared
+// `{type:"object"}` (the ONLY one is evaluate_design.layer_map) falls to the
+// `default` → Type.Unknown() → renders as the empty schema `{}` (no `type`).
+// Opus then serialises the nested object as a JSON STRING, which reaches the
+// server and crashes `layer_map.items()` with
+//   'str' object has no attribute 'items'
+// This made evaluate_design 100% unusable across the whole benchmark
+// (every call in every transcript — passing AND failing cases — errored).
+// ============================================================
+
+describe("BUG 6 (layer_map): object-typed MCP params must build an object schema, not Unknown", () => {
+  function fakeManager() {
+    return {
+      callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] }),
+    } as any;
+  }
+
+  const evalTool: NamespacedTool = {
+    name: "klayout_native_evaluate_design",
+    originalName: "evaluate_design",
+    serverKey: "klayout",
+    group: "native",
+    description: "Evaluate device design",
+    inputSchema: {
+      type: "object",
+      properties: {
+        layer_map: { type: "object", description: "component name → layer spec" },
+        checks: { type: "array", description: "list of check objects" },
+      },
+      required: ["layer_map", "checks"],
+    },
+  };
+
+  it("createMCPTools renders a type:object param as an object schema (additionalProperties), not the empty {} of Type.Unknown()", () => {
+    const [tool] = createMCPTools(fakeManager(), [evalTool]);
+    const schema = tool.parameters as any;
+    const lm = schema.properties?.layer_map;
+
+    expect(lm).toBeTruthy();
+    // The bug: object props fell to Type.Unknown() → `{}` with NO `type`.
+    // Opus reads "untyped" and emits a JSON string instead of an object.
+    expect(lm.type).toBe("object");
+    // A free-form, dynamic-key object (component names are arbitrary) must
+    // allow additional properties — a strict object would forbid every key.
+    expect(lm.additionalProperties).not.toBe(false);
+    expect(lm.additionalProperties).toBeTruthy();
+
+    // The array param must remain a real array (regression guard — it already
+    // worked, which is exactly why `checks` survived while `layer_map` broke).
+    expect(schema.properties?.checks?.type).toBe("array");
+  });
+
+  it("both schema builders contain an explicit case \"object\" (no silent default→Unknown)", () => {
+    for (const f of ["tools/index.ts", "subagent/tool-factory.ts"]) {
+      const src = srcFile(f);
+      expect(src, `${f} must handle object-typed params explicitly`).toMatch(
+        /case\s+"object"\s*:/,
+      );
+    }
   });
 });
 

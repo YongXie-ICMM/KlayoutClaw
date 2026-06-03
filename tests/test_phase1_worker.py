@@ -345,6 +345,76 @@ class TestPrimitives:
 
 
 # ---------------------------------------------------------------------------
+# Test: arm_material_class accepts all reasonable `classes` forms
+#
+# Regression for the 2026-06-03 harness bug: the primitive only handled the
+# dict form {name, region, region_op} and crashed with
+#   "list indices must be integers or slices, not str"
+# on the nested-list form [["graphene"], ["graphite"]] that agents actually
+# use. A crashing check is then scored 0.0 at full weight (false zero).
+# ---------------------------------------------------------------------------
+
+class TestArmMaterialClass:
+    def _run(self, test_gds, classes):
+        config = {
+            "gds_path": test_gds,
+            "layer_map": LAYER_MAP,
+            "checks": [{"name": "arm_material_class",
+                         "args": {"component": "contact_patch",
+                                  "classes": classes,
+                                  "containment_threshold": 0.8},
+                         "weight": 1.0}],
+        }
+        return _run_worker(config)
+
+    def test_nested_list_form_does_not_crash(self, test_gds, anaconda_has_deps):
+        """[['region_a'], ['region_b']] must return a real score, not ERROR."""
+        rc, result, stderr = self._run(test_gds, [["region_a"], ["region_b"]])
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        chk = result["checks"][0]
+        assert "ERROR" not in chk["detail"], chk["detail"]
+        assert 0.0 <= chk["score"] <= 1.0
+
+    def test_bare_string_form(self, test_gds, anaconda_has_deps):
+        """['region_a', 'region_b'] (list of bare keys) must work."""
+        rc, result, stderr = self._run(test_gds, ["region_a", "region_b"])
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        assert "ERROR" not in result["checks"][0]["detail"]
+
+    def test_dict_form_still_works(self, test_gds, anaconda_has_deps):
+        """The documented dict form must keep working (regression guard)."""
+        rc, result, stderr = self._run(
+            test_gds,
+            [{"name": "a", "region": "region_a"}, {"name": "b", "region": "region_b"}],
+        )
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        assert "ERROR" not in result["checks"][0]["detail"]
+
+    def test_all_forms_agree(self, test_gds, anaconda_has_deps):
+        """Nested-list, bare-string, and dict forms are equivalent → same score."""
+        s = []
+        for classes in (
+            [["region_a"], ["region_b"]],
+            ["region_a", "region_b"],
+            [{"region": "region_a"}, {"region": "region_b"}],
+        ):
+            rc, result, _ = self._run(test_gds, classes)
+            assert rc == 0 and result is not None
+            s.append(result["checks"][0]["score"])
+        assert max(s) - min(s) < 1e-6, f"forms disagree: {s}"
+
+    def test_malformed_class_gives_actionable_error(self, test_gds, anaconda_has_deps):
+        """A genuinely invalid class entry yields a clear message naming the
+        accepted forms — not a cryptic TypeError."""
+        rc, result, stderr = self._run(test_gds, [42])
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        detail = result["checks"][0]["detail"]
+        assert "arm_material_class" in detail
+        # Must mention how to fix it (a key, a list of keys, or a dict).
+        assert "list of keys" in detail or "layer_map key" in detail or "dict" in detail
+
+
+# ---------------------------------------------------------------------------
 # Test: Score Computation
 # ---------------------------------------------------------------------------
 
@@ -364,6 +434,36 @@ class TestScoreComputation:
         checks = result["checks"]
         expected = sum(c["score"] * c["weight"] for c in checks) / sum(c["weight"] for c in checks)
         assert abs(result["overall"] - round(expected, 6)) < 1e-4
+
+    def test_errored_check_excluded_from_overall(self, test_gds, anaconda_has_deps):
+        """A check that ERRORS must be flagged status=error and EXCLUDED from
+        the weighted overall — not folded in as a full-weight 0.0 (false zero).
+        Regression for the 2026-06-03 finding."""
+        config = {
+            "gds_path": test_gds,
+            "layer_map": LAYER_MAP,
+            "checks": [
+                {"name": "solidity",
+                 "args": {"component": "mesa", "threshold": 0.5, "direction": "below"},
+                 "weight": 0.5},
+                # invalid class entry -> primitive raises -> errored check
+                {"name": "arm_material_class",
+                 "args": {"component": "mesa", "classes": [42]},
+                 "weight": 0.5},
+            ],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        checks = {c["name"]: c for c in result["checks"]}
+        amc = checks["arm_material_class"]
+        assert amc.get("status") == "error", f"expected status=error, got {amc}"
+        assert "error" in amc, amc
+        # Overall must equal the solidity score alone — the errored check is
+        # excluded from BOTH numerator and denominator.
+        sol = checks["solidity"]["score"]
+        assert abs(result["overall"] - sol) < 1e-6, (result["overall"], sol)
+        # next_step must mention the errored check so the agent fixes the call.
+        assert "arm_material_class" in result["next_step_suggestion"]
 
     def test_scores_in_valid_range(self, test_gds, anaconda_has_deps):
         """All scores must be in [0.0, 1.0]."""

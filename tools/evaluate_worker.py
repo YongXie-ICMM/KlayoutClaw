@@ -628,10 +628,13 @@ def _prim_arm_material_class(out_lib, ref_lib, layer_map, args):
 
     Args:
         component: component name (required) — shapes are evaluated individually
-        classes: list of class dicts (required), each:
-            {"name": str,
-             "region": layer_map key or list of keys,
-             "region_op": "union" (default) / "intersection" / "difference"}
+        classes: list of classes (required). Each entry may be:
+            - a layer_map key:        "graphene"
+            - a list of keys (union): ["graphene", "graphite"]
+            - a dict:                 {"name": str,
+                                       "region": layer_map key or list of keys,
+                                       "region_op": "union" (default) /
+                                                    "intersection" / "difference"}
         containment_threshold: float, default 0.9
     """
     shapes = _component_list(out_lib, layer_map, args["component"])
@@ -645,10 +648,34 @@ def _prim_arm_material_class(out_lib, ref_lib, layer_map, args):
     threshold = float(args.get("containment_threshold", 0.9))
 
     resolved_classes = []
-    for cls in classes_spec:
+    for idx, cls in enumerate(classes_spec):
+        # Accept three equivalent ways to express a class so the tool is robust
+        # to however the agent phrases it (Postel's law). All resolve to a
+        # region + region_op fed to _resolve_region:
+        #   "graphene"                        single layer_map key (union)
+        #   ["graphene", "graphite"]          list of keys (union)
+        #   {"name","region","region_op"}     explicit dict (documented form)
+        if isinstance(cls, dict):
+            region_spec = cls.get("region")
+            region_op = cls.get("region_op", "union")
+        elif isinstance(cls, (list, tuple)):
+            region_spec = list(cls)
+            region_op = "union"
+        elif isinstance(cls, str):
+            region_spec = cls
+            region_op = "union"
+        else:
+            region_spec = None
+            region_op = "union"
+        if not region_spec:
+            raise ValueError(
+                "arm_material_class: classes[{}] = {!r} is not a valid class. "
+                "Use a layer_map key (\"graphene\"), a list of keys "
+                "([\"graphene\", \"graphite\"]), or a dict "
+                "({{\"name\": .., \"region\": \"graphene\", \"region_op\": \"union\"}}).".format(idx, cls)
+            )
         region = _resolve_region(out_lib, ref_lib, layer_map,
-                                 cls["region"],
-                                 cls.get("region_op", "union"))
+                                 region_spec, region_op)
         resolved_classes.append(region)
 
     ok = 0
@@ -711,7 +738,16 @@ def _build_next_step(overall, results, empty_components):
                 "layer_map and checks list.")
 
     parts = []
-    low = [c for c in results if c.get("score", 0.0) < 0.8]
+    errored = [c for c in results if c.get("status") == "error"]
+    low = [c for c in results
+           if c.get("status") != "error" and c.get("score", 0.0) < 0.8]
+
+    if errored:
+        parts.append(
+            "{} check(s) ERRORED and were EXCLUDED from the overall (NOT scored "
+            "0): {}. These are tool/usage errors, not design failures — read "
+            "each check's 'error' field, fix the call arguments, and re-run.".format(
+                len(errored), ", ".join(sorted(c["name"] for c in errored))))
 
     if overall >= 0.9 and not low:
         parts.append("Overall score passes. Re-read the task instruction "
@@ -828,6 +864,7 @@ def main():
         weight = check.get("weight", 1.0 / len(checks))
         extra = None
         raw = None
+        check_error = None
         try:
             raw = PRIMITIVES[name](out_lib, ref_lib, layer_map, args)
             # Primitives may return a plain float (score) or a dict
@@ -846,12 +883,20 @@ def main():
         except Exception as e:
             score = 0.0
             detail = "{}: ERROR — {}".format(name, e)
+            check_error = str(e)
         entry = {
             "name": name,
             "score": score,
             "weight": weight,
             "detail": detail,
         }
+        if check_error is not None:
+            # A check that RAISED could not be measured — a tool/usage error,
+            # NOT a design that genuinely scored 0.0. Flag it and exclude it
+            # from the weighted overall below; folding it in as a full-weight
+            # zero injected a false zero into the agent's self-evaluation.
+            entry["status"] = "error"
+            entry["error"] = check_error
         if extra is not None:
             # Promote extra diagnostic fields to the top level of the
             # check result so agents can read them directly (e.g.
@@ -866,16 +911,22 @@ def main():
             entry["report"] = raw["report"]
         results.append(entry)
 
-    # Compute overall score (weighted sum)
-    total_weight = sum(c["weight"] for c in results)
+    # Compute overall as a weighted average over checks that actually produced
+    # a measurement. Checks that ERRORED (status == "error") are excluded from
+    # BOTH numerator and denominator so a tool/usage error does not masquerade
+    # as a design failure scoring 0.0.
+    scored = [c for c in results if c.get("status") != "error"]
+    n_errored = len(results) - len(scored)
+    total_weight = sum(c["weight"] for c in scored)
     if total_weight > 0:
-        overall = round(sum(c["score"] * c["weight"] for c in results) / total_weight, 6)
+        overall = round(sum(c["score"] * c["weight"] for c in scored) / total_weight, 6)
     else:
         overall = 0.0
 
     output = {
         "status": "ok",
         "overall": overall,
+        "n_errored_checks": n_errored,
         "checks": results,
         "next_step_suggestion": _build_next_step(overall, results, empty_components),
     }
