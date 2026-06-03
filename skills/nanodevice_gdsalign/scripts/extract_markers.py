@@ -56,6 +56,14 @@ def main():
     all_centers = np.array([m["center"] for m in markers])
     grid_center = all_centers.mean(axis=0)
 
+    # Full marker-array bounding box (over every L5/0 marker's bbox). This is the
+    # legitimate, ground-truth-free frame against which commit_gds.py checks that
+    # warped flakes actually land inside the marker field — catching a warp that
+    # places the device hundreds of um off-frame (HM08/QH06/AH06).
+    _all_bb = np.array([m["bbox"] for m in markers]).reshape(-1, 2)
+    grid_bbox = [[float(_all_bb[:, 0].min()), float(_all_bb[:, 1].min())],
+                 [float(_all_bb[:, 0].max()), float(_all_bb[:, 1].max())]]
+
     dists = np.sqrt(((all_centers - grid_center) ** 2).sum(axis=1))
     inner_idx = np.argsort(dists)[:8]
     inner = [markers[i] for i in inner_idx]
@@ -100,6 +108,7 @@ def main():
         "source_gds": os.path.basename(args.gds),
         "layer": "5/0",
         "grid_center_um": [float(grid_center[0]), float(grid_center[1])],
+        "grid_bbox_um": grid_bbox,
         "pairs": pairs,
     }
 

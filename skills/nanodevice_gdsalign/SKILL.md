@@ -103,8 +103,36 @@ Warps the microscope image and material contours into GDS coordinates using the 
 | `--output-dir` | Optional output directory for warp results (default: current working directory). Set this to the agent's workspace directory to keep warp outputs scoped. Files written: `traces_gds.json`, `full_stack_gds.png`, `image_placement.json` |
 | `--warp-only` | Only produce warped files, skip KLayout commit |
 | `--mcp-config` | Path to MCP config JSON. Fallback chain: `.mcp.json` in CWD → `mcp_config.json` in project root → default `127.0.0.1:8765`. **In Docker**, pass a config pointing to `http://host.docker.internal:8765/mcp` |
+| `--align-report` | Path to `gds_alignment_report.json` for the registration gate. Default: auto-located next to `--warp`. |
+| `--gds-markers` | Path to `gds_markers.json` for the marker-field frame check. Default: auto-located next to `--warp`. |
+| `--skip-registration-check` | **Escape hatch — strongly discouraged.** Bypasses the registration self-validation gate. Only for an intentional hand-built transform. |
 
 **Outputs**: `full_stack_gds.png`, `traces_gds.json`, `image_placement.json`
+
+> ### ⚠️ Validated-commit contract — commit flakes ONLY through `commit_gds.py`
+>
+> `commit_gds.py` is the **only sanctioned way** to place flake polygons in the
+> GDS frame. **Do NOT** hand-place flakes via `execute_script` with a
+> hand-built transform (a centered shift / Y-flip / "1:1 at origin"). That is
+> the dominant failure mode (HM08/QH06/AH06): the device looks perfect against
+> the agent's own flakes but lands hundreds of um off the real marker field and
+> scores ~0.
+>
+> Before committing, `commit_gds.py` runs a **registration self-validation
+> gate** (no ground truth — only the alignment report, the marker grid, and your
+> own warped contours). It hard-fails (exit 3) when:
+> - there is no `gds_alignment_report.json` next to the warp (alignment was
+>   skipped / hand-rolled),
+> - the alignment is bad (`< 3` inliers or mean residual `> 5 um`),
+> - the `--warp` matrix does not match the alignment report (a stale/hand-built
+>   transform), or
+> - the warped flakes land outside the L5 marker field.
+>
+> **If the gate fails, FIX the alignment — do not bypass it.** Almost always the
+> cause is a wrong `pixel_size`: re-run `validate_pixel_size`, then
+> `detect_markers` → `align_gds`, and commit the resulting `gds_warp.npy`. Only
+> pass `--skip-registration-check` if you are deliberately committing a
+> hand-built transform and understand it will likely be off-frame.
 
 ---
 
@@ -151,3 +179,4 @@ Use `validate_pixel_size` to confirm the value before running the alignment pipe
 |------|---------|
 | 0 | Success |
 | 1 | Error (missing file, insufficient markers, transform failure) |
+| 3 | `commit_gds.py` registration self-validation failed (skipped/hand-rolled/off-frame transform) — fix the alignment, do not bypass |

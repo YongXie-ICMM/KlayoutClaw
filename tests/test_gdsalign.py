@@ -4,15 +4,26 @@
 All tests use local fixtures in tests_resources/ml08/.
 """
 import json
+import math
 import os
+import sys
 import tempfile
 
 import numpy as np
 import pytest
 
 from conftest import (
-    FULL_STACK_RAW, PIXEL_SIZE, TEMPLATE_GDS, run_gdsalign_script,
+    FULL_STACK_RAW, GDSALIGN_DIR, PIXEL_SIZE, TEMPLATE_GDS, run_gdsalign_script,
 )
+
+
+def _import_align_gds():
+    """Import align_gds.py as a module — its functions are module-level and
+    main() is guarded by __main__, so importing has no side effects."""
+    import importlib
+    if GDSALIGN_DIR not in sys.path:
+        sys.path.insert(0, GDSALIGN_DIR)
+    return importlib.import_module("align_gds")
 
 
 class TestExtractMarkers:
@@ -273,3 +284,106 @@ class TestCommitGds:
                             f"{mat_name} x={pt[0]} out of range"
                         assert -2000 < pt[1] < 3000, \
                             f"{mat_name} y={pt[1]} out of range"
+
+    def _commit_args(self, tmp, traces_path, *extra):
+        return [
+            "--warp", os.path.join(tmp, "gds_warp.npy"),
+            "--traces", traces_path,
+            "--image", FULL_STACK_RAW,
+            "--pixel-size", PIXEL_SIZE,
+            "--gds", TEMPLATE_GDS,
+            "--output-dir", tmp,
+            "--warp-only",
+        ] + list(extra)
+
+    def test_registration_gate_blocks_missing_align_report(self):
+        """A warp with no gds_alignment_report.json next to it (the skipped /
+        hand-rolled failure mode) must be rejected, not silently committed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_full_pipeline(tmp)
+            traces_path = self._make_synthetic_traces(tmp)
+            os.remove(os.path.join(tmp, "gds_alignment_report.json"))
+            rc, out, err = run_gdsalign_script(
+                "commit_gds.py", self._commit_args(tmp, traces_path))
+            assert rc != 0, "commit should fail without an alignment report"
+            assert "registration" in (out + err).lower()
+            assert "align_gds" in (out + err)
+
+    def test_registration_gate_blocks_mismatched_handrolled_warp(self):
+        """A hand-rolled warp that does not match the alignment report (or lands
+        flakes off the marker field) must be rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_full_pipeline(tmp)
+            traces_path = self._make_synthetic_traces(tmp)
+            # Overwrite the validated warp with a hand-rolled centered y-flip
+            # (the exact AH06/HM08 antipattern) that does NOT match the report.
+            np.save(os.path.join(tmp, "gds_warp.npy"),
+                    np.array([[1.0, 0.0, 600.0], [0.0, -1.0, 600.0]]))
+            rc, out, err = run_gdsalign_script(
+                "commit_gds.py", self._commit_args(tmp, traces_path))
+            assert rc != 0, "commit should reject a hand-rolled mismatched warp"
+
+    def test_skip_registration_check_bypasses_gate(self):
+        """The explicit escape hatch lets an intentional hand-built transform
+        through (so the gate never hard-blocks a deliberate workflow)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_full_pipeline(tmp)
+            traces_path = self._make_synthetic_traces(tmp)
+            os.remove(os.path.join(tmp, "gds_alignment_report.json"))
+            rc, out, err = run_gdsalign_script(
+                "commit_gds.py",
+                self._commit_args(tmp, traces_path, "--skip-registration-check"))
+            assert rc == 0, f"--skip-registration-check should bypass: {err}"
+
+
+class TestRotationalDisambiguation:
+    """Regression for the HM11 gdsalign bug: a 4-fold-symmetric square L5 grid
+    leaves the rotation 4-way ambiguous. The disambiguation must pick the branch
+    closest to 0 deg, but its inlier/acceptance windows (max_res*3, mean_res*2)
+    collapsed to ~0 when the wrong base branch fit perfectly, rejecting every
+    companion and keeping the wrong 90-deg branch. The windows are floored to
+    1.0 um so the correct branch is recovered."""
+
+    def _square_scenario(self):
+        ag = _import_align_gds()
+        C = np.array([775.0, 775.0])
+        # 4 corners of a 75 um square about the grid center
+        gds_pts = np.array([[812.5, 812.5], [737.5, 812.5],
+                            [737.5, 737.5], [812.5, 737.5]])
+        img_pts = gds_pts.copy()
+        # TRUE branch: reflection about y=Cy, rotation 0 deg
+        M_true = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 2 * C[1]]])
+        # WRONG base branch: M_true rotated +90 deg about C (also fits perfectly)
+        R90 = np.array([[0.0, -1.0], [1.0, 0.0]])
+        M_base = np.zeros((2, 3))
+        M_base[:2, :2] = R90 @ M_true[:2, :2]
+        M_base[:2, 2] = R90 @ (M_true[:2, 2] - C) + C
+        theta_base = math.atan2(M_base[1, 0], M_base[0, 0])
+        n_in, _avg, corr = ag._score_transform(
+            M_base, img_pts, gds_pts, inlier_thresh=1.0)
+        src = np.array([img_pts[ii] for ii, gi, _ in corr])
+        dst = np.array([gds_pts[gi] for ii, gi, _ in corr])
+        res = np.sqrt(((ag.apply_transform(M_base, src) - dst) ** 2).sum(axis=1))
+        return ag, dict(M_base=M_base, theta_base=theta_base, mean_res=float(res.mean()),
+                        max_res=float(res.max()), corr=corr, src=src, dst=dst,
+                        res=res, n_in=n_in, img_pts=img_pts, gds_pts=gds_pts, C=C)
+
+    def test_base_branch_is_the_wrong_90deg_branch(self):
+        """Sanity: the synthetic base really is the wrong ~90 deg branch with
+        a perfect (residual ~0) fit — the condition that broke HM11."""
+        _ag, s = self._square_scenario()
+        assert abs(math.degrees(s["theta_base"])) == pytest.approx(90.0, abs=1e-6)
+        assert s["max_res"] == pytest.approx(0.0, abs=1e-6)
+        assert s["n_in"] == 4
+
+    def test_disambiguation_recovers_zero_rotation_branch(self):
+        """With the floored windows, the rotation-0 companion is recovered."""
+        ag, s = self._square_scenario()
+        chosen = ag.disambiguate_rotation(
+            s["M_base"], s["theta_base"], s["mean_res"], s["max_res"],
+            s["corr"], s["src"], s["dst"], s["res"], s["n_in"],
+            s["img_pts"], s["gds_pts"], s["C"], True)
+        chosen_rot = math.degrees(chosen[1])
+        assert abs(chosen_rot) < 5.0, (
+            f"disambiguation kept the wrong branch (rot={chosen_rot:.1f} deg); "
+            f"expected ~0 deg")

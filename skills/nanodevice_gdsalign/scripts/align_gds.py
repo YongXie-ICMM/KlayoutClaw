@@ -192,6 +192,62 @@ def find_best_correspondence(img_pts, gds_pts, inlier_thresh=1.0):
 # Main
 # ---------------------------------------------------------------------------
 
+def disambiguate_rotation(M_refined, theta, mean_res, max_res, correspondences,
+                          src_inlier, dst_inlier, residuals, n_inliers,
+                          img_pts, gds_pts, gds_center, is_reflected):
+    """Resolve the N*90-deg rotational ambiguity of a (near-)square marker grid.
+
+    A square L5 marker grid is 4-fold symmetric, so the base fit, plus its
+    90/180/270-deg companions about ``gds_center``, all match the markers
+    equally well under permuted assignment. Return the 8-tuple of the branch
+    whose rotation is closest to 0 deg.
+
+    The inlier / acceptance windows are FLOORED to 1.0 um. When the (possibly
+    wrong) base branch fits perfectly (``max_res`` ~= 0), an unfloored
+    ``max_res*3`` inlier window and ``mean_res*2`` acceptance window reject every
+    companion, leaving only the wrong base branch — this was the HM11 failure
+    (kept rot=88.8 deg when the correct branch was -1.2 deg).
+    """
+    candidates = [(M_refined, theta, mean_res, max_res,
+                   correspondences, src_inlier, dst_inlier, residuals)]
+
+    inlier_window = max(max_res * 3.0, 1.0)
+    accept_window = max(mean_res * 2.0, 1.0)
+
+    for angle_deg in (90, 180, 270):
+        angle_rad = math.radians(angle_deg)
+        c_r, s_r = math.cos(angle_rad), math.sin(angle_rad)
+        R = np.array([[c_r, -s_r], [s_r, c_r]])
+
+        M_comp = np.zeros((2, 3))
+        M_comp[:2, :2] = R @ M_refined[:2, :2]
+        M_comp[:2, 2] = R @ (M_refined[:2, 2] - gds_center) + gds_center
+
+        n_comp, avg_comp, corr_comp = _score_transform(
+            M_comp, img_pts, gds_pts, inlier_thresh=inlier_window)
+
+        if n_comp >= n_inliers:
+            src_comp = np.array([img_pts[ii] for ii, gi, _ in corr_comp])
+            dst_comp = np.array([gds_pts[gi] for ii, gi, _ in corr_comp])
+            M_comp_ref = refine_similarity(
+                src_comp, dst_comp, M_comp, reflected=is_reflected)
+            trans_comp = apply_transform(M_comp_ref, src_comp)
+            res_comp = np.sqrt(((trans_comp - dst_comp) ** 2).sum(axis=1))
+            mean_comp = float(res_comp.mean())
+            max_comp = float(res_comp.max())
+
+            if mean_comp <= accept_window:
+                a_c, b_c = M_comp_ref[0, 0], M_comp_ref[1, 0]
+                theta_c = math.atan2(b_c, a_c)
+                candidates.append((M_comp_ref, theta_c, mean_comp,
+                                   max_comp, corr_comp, src_comp,
+                                   dst_comp, res_comp))
+
+    best_idx = min(range(len(candidates)),
+                   key=lambda i: abs(candidates[i][1]))
+    return candidates[best_idx]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Match markers and compute image->GDS similarity transform")
@@ -307,48 +363,14 @@ def main():
     # Prefer the solution with rotation closest to 0°.
     if is_reflected and "grid_center_um" in gds_data:
         gds_center = np.array(gds_data["grid_center_um"])
+        chosen = disambiguate_rotation(
+            M_refined, theta, mean_res, max_res, correspondences,
+            src_inlier, dst_inlier, residuals, n_inliers,
+            img_pts, gds_pts, gds_center, is_reflected)
 
-        # Current solution is the first candidate
-        candidates = [(M_refined, theta, mean_res, max_res,
-                        correspondences, src_inlier, dst_inlier, residuals)]
-
-        for angle_deg in [90, 180, 270]:
-            angle_rad = math.radians(angle_deg)
-            c_r, s_r = math.cos(angle_rad), math.sin(angle_rad)
-            R = np.array([[c_r, -s_r], [s_r, c_r]])
-
-            M_comp = np.zeros((2, 3))
-            M_comp[:2, :2] = R @ M_refined[:2, :2]
-            M_comp[:2, 2] = R @ (M_refined[:2, 2] - gds_center) + gds_center
-
-            n_comp, avg_comp, corr_comp = _score_transform(
-                M_comp, img_pts, gds_pts, inlier_thresh=max_res * 3)
-
-            if n_comp >= n_inliers:
-                src_comp = np.array([img_pts[ii] for ii, gi, _ in corr_comp])
-                dst_comp = np.array([gds_pts[gi] for ii, gi, _ in corr_comp])
-                M_comp_ref = refine_similarity(
-                    src_comp, dst_comp, M_comp, reflected=is_reflected)
-                trans_comp = apply_transform(M_comp_ref, src_comp)
-                res_comp = np.sqrt(
-                    ((trans_comp - dst_comp) ** 2).sum(axis=1))
-                mean_comp = float(res_comp.mean())
-                max_comp = float(res_comp.max())
-
-                if mean_comp <= mean_res * 2.0:
-                    a_c, b_c = M_comp_ref[0, 0], M_comp_ref[1, 0]
-                    theta_c = math.atan2(b_c, a_c)
-                    candidates.append((M_comp_ref, theta_c, mean_comp,
-                                       max_comp, corr_comp, src_comp,
-                                       dst_comp, res_comp))
-
-        # Pick the candidate with rotation closest to 0°
-        best_idx = min(range(len(candidates)),
-                       key=lambda i: abs(candidates[i][1]))
-
-        if best_idx > 0:
+        if chosen[0] is not M_refined:
             (M_refined, theta, mean_res, max_res, correspondences,
-             src_inlier, dst_inlier, residuals) = candidates[best_idx]
+             src_inlier, dst_inlier, residuals) = chosen
             a, b = M_refined[0, 0], M_refined[1, 0]
             scale = math.sqrt(a**2 + b**2)
             tx, ty = float(M_refined[0, 2]), float(M_refined[1, 2])

@@ -17,6 +17,7 @@ Outputs:
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 
@@ -172,6 +173,113 @@ def warp_image(img, M, pixel_size_in, pixel_size_out=None):
     return warped, (x_min, y_min), pixel_size_out, (out_w, out_h)
 
 
+def _expected_M_from_report(rep):
+    """Reconstruct the 2x3 affine align_gds.py recorded, so commit can check the
+    committed --warp actually came from that alignment (not a hand-build).
+
+    Mirrors align_gds.refine_similarity's reflected/non-reflected matrix forms:
+      reflected:      [[s*c,  s*sn, tx], [s*sn, -s*c, ty]]
+      non-reflected:  [[s*c, -s*sn, tx], [s*sn,  s*c, ty]]
+    """
+    t = rep["transform"]
+    s = float(t["scale"])
+    th = math.radians(float(t["rotation_deg"]))
+    tx, ty = t["translation_um"]
+    c, sn = math.cos(th), math.sin(th)
+    if t.get("reflected"):
+        return np.array([[s * c, s * sn, tx], [s * sn, -s * c, ty]])
+    return np.array([[s * c, -s * sn, tx], [s * sn, s * c, ty]])
+
+
+def validate_registration(M, warp_path, align_report_path, gds_markers_path,
+                          traces_gds):
+    """Registration self-validation gate.
+
+    Uses ONLY the alignment report, the GDS marker grid, and the agent's own
+    warped contours — NO ground truth (Aligned_Stack.gds). Blocks the silent
+    skip / hand-rolled-transform failure mode (HM08/QH06/AH06): a warp not
+    produced by a valid align_gds.py run, or one that places the flakes off the
+    marker field. Returns ``(ok: bool, message: str)``.
+    """
+    # 1. The alignment report must exist next to the warp (or be passed).
+    rep_path = align_report_path or os.path.join(
+        os.path.dirname(os.path.abspath(warp_path)), "gds_alignment_report.json")
+    if not os.path.exists(rep_path):
+        return False, (
+            "No gds_alignment_report.json found next to the warp ({}).\n"
+            "This is the skipped/hand-rolled-alignment failure mode — a warp not\n"
+            "produced by align_gds.py. Run the gdsalign pipeline (extract_markers\n"
+            "-> detect_markers -> align_gds) to produce a VALIDATED transform; do\n"
+            "NOT hand-build a centered/Y-flip transform. If you are intentionally\n"
+            "committing a hand-built transform, pass --skip-registration-check."
+            .format(rep_path))
+    try:
+        with open(rep_path) as f:
+            rep = json.load(f)
+    except (ValueError, OSError) as exc:
+        return False, "alignment report {} is unreadable: {}".format(rep_path, exc)
+
+    # 2. It must be a successful, low-residual alignment.
+    if rep.get("status") != "complete":
+        return False, "alignment report status != 'complete'; re-run align_gds."
+    q = rep.get("quality", {})
+    inliers = q.get("inliers")
+    mean_res = q.get("mean_residual_um")
+    if inliers is not None and inliers < 3:
+        return False, ("alignment used only {} marker inliers (need >=3); fix "
+                       "pixel_size and re-run align_gds.".format(inliers))
+    if mean_res is not None and mean_res > 5.0:
+        return False, ("alignment mean residual {:.2f} um > 5 um; fix pixel_size "
+                       "and re-run align_gds (do not hand-roll).".format(mean_res))
+
+    # 3. The committed warp must MATCH the alignment it claims to come from.
+    try:
+        exp = _expected_M_from_report(rep)
+        if not (np.allclose(M[:2, :2], exp[:2, :2], atol=1e-2)
+                and np.allclose(M[:2, 2], exp[:2, 2], atol=2.0)):
+            return False, (
+                "the --warp matrix does not match gds_alignment_report.json's\n"
+                "transform — this warp was not produced by that alignment (a\n"
+                "hand-built or stale transform). Re-run align_gds and commit its\n"
+                "gds_warp.npy.")
+    except (KeyError, TypeError, ValueError):
+        pass  # older report without a full transform block — skip this check
+
+    # 4. Frame check: the warped flake centroid must land in the marker field.
+    mk_path = gds_markers_path or os.path.join(
+        os.path.dirname(os.path.abspath(warp_path)), "gds_markers.json")
+    if os.path.exists(mk_path):
+        try:
+            with open(mk_path) as f:
+                mk = json.load(f)
+            bbox = mk.get("grid_bbox_um")
+            if bbox is None and "grid_center_um" in mk:
+                cx, cy = mk["grid_center_um"]
+                bbox = [[cx - 1000, cy - 1000], [cx + 1000, cy + 1000]]
+            pts = []
+            for mat_list in traces_gds.get("materials", {}).values():
+                for entry in mat_list:
+                    if entry.get("contour_gds"):
+                        pts.extend(entry["contour_gds"])
+            if bbox is not None and pts:
+                cen = np.array(pts).mean(axis=0)
+                (x0, y0), (x1, y1) = bbox
+                # expand by 25% so devices legitimately near the field edge pass
+                mx, my = 0.25 * (x1 - x0), 0.25 * (y1 - y0)
+                if not (x0 - mx <= cen[0] <= x1 + mx
+                        and y0 - my <= cen[1] <= y1 + my):
+                    return False, (
+                        "warped flakes land OFF the L5 marker field: centroid "
+                        "({:.0f}, {:.0f}) um is outside marker bbox {} (+/-25% "
+                        "margin). The transform is wrong — re-run align_gds; do "
+                        "not hand-roll.".format(cen[0], cen[1], bbox))
+        except (ValueError, OSError):
+            pass
+
+    return True, ("registration validated (residual={} um, inliers={})"
+                  .format(mean_res, inliers))
+
+
 def build_parser():
     """Build and return the argument parser for commit_gds."""
     parser = argparse.ArgumentParser(
@@ -198,6 +306,18 @@ def build_parser():
                              "layer (L10/11/12/13) and fail loudly if any "
                              "expected layer has zero polygons. Catches the "
                              "silent partial-commit failure mode.")
+    parser.add_argument("--align-report", default=None,
+                        help="Path to gds_alignment_report.json. Default: "
+                             "auto-locate next to --warp. Used by the "
+                             "registration self-validation gate.")
+    parser.add_argument("--gds-markers", default=None,
+                        help="Path to gds_markers.json (for the marker-field "
+                             "frame check). Default: auto-locate next to --warp.")
+    parser.add_argument("--skip-registration-check", action="store_true",
+                        help="Bypass the registration self-validation gate. Use "
+                             "ONLY when intentionally committing a hand-built "
+                             "transform — this is the HM08/QH06/AH06 failure mode "
+                             "and is strongly discouraged.")
     return parser
 
 
@@ -255,6 +375,20 @@ def main():
     with open(traces_gds_path, "w") as f:
         json.dump(traces_gds, f, indent=2)
     print(f"Saved {traces_gds_path}")
+
+    # --- Registration self-validation gate ---
+    # Block the silent skip / hand-rolled-transform failure mode: a warp that
+    # did not come from a valid align_gds run, or that lands the flakes off the
+    # marker field. Uses only the alignment report + marker grid + warped
+    # contours (no ground truth).
+    if not args.skip_registration_check:
+        ok, msg = validate_registration(
+            M, args.warp, args.align_report, args.gds_markers, traces_gds)
+        if not ok:
+            print("ERROR: registration self-validation failed:\n" + msg,
+                  file=sys.stderr)
+            sys.exit(3)
+        print("Registration check: " + msg)
 
     # --- Step 2: Warp image ---
     print("Warping image to GDS coordinate frame...")
