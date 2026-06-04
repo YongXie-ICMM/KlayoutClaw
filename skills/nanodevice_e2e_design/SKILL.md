@@ -123,6 +123,34 @@ Use `screenshot` after each major geometry addition to visually verify placement
 
 **Frame guard (mandatory):** before passing this gate, assert with `pya.Region` that the active region (mesa/channel) **overlaps the material region the device physics requires** — the SAME region you identified in ANALYZE (for a Hall bar that is the graphene∩graphite overlap; for a single-material device it is that one flake region; for a JJ/QD it is whatever its stack needs). Read those regions from the committed flake layers using the layer numbers YOU assigned (do not hard-code L11/L13 — confirm the mapping from your own commit). Procedure: (1) confirm the target flake layer(s) are **non-empty** — an absent material is a detection/commit problem, not a frame error, so skip the guard for it; (2) if the target region is non-empty but its overlap with the active region is empty, the device is in the **wrong frame** — STOP, fix the coordinate source (see the frame contract in ANALYZE) or re-run gdsalign, and do not proceed to ROUTE.
 
+> ### ⚠️ Material-containment guard — contacts/arm-tips must land ON the flake (not just the mesa body)
+>
+> The frame guard above only checks that the mesa *body* overlaps the flake. It
+> does **not** catch a mesa whose **probe arms / contact patches extend PAST the
+> flake boundary** — the central body still overlaps, so the frame guard passes,
+> yet the arm-tip ohmic contacts sit in void and every material-keyed metric
+> (`contacts_in_regions`, `connectivity`, `mesa_probes`, `mesa_on_overlap`)
+> silently collapses. This is a distinct, common failure (it caps a structurally
+> clean, correctly-framed device well below where it should score).
+>
+> **Principle — material-correctness outranks cosmetic shape.** A device's
+> contacts and the arm tips that carry them MUST sit inside the required flake
+> region. **Never lengthen a probe arm past the flake edge to satisfy a shape
+> target** (e.g. a low-`solidity` / "make the mesa concave" goal). Solidity,
+> aspect ratio, and similar shape metrics are cosmetic and rank *below* keeping
+> every contact on material. If the two conflict, shorten the arm and keep the
+> contact on the flake.
+>
+> **Check before passing this gate** (in addition to the frame guard): with
+> `pya.Region`, intersect the **contact-patch** shapes (and the probe-arm tips,
+> if separate) with the required flake region. If any contact patch's in-flake
+> area fraction is below ~0.9, that arm is **over-extended** — pull it back so
+> the patch is fully on the flake, then re-check. (Equivalently, once you have
+> committed flakes you can run `evaluate_design` with `arm_material_class` /
+> `component_containment` on the contact component and require a high fraction —
+> the same measurement the official scorer makes.) Do not proceed to ROUTE while
+> contacts hang off the flake.
+
 ---
 
 ## Step 5: ROUTE
