@@ -541,6 +541,25 @@ class TestRouteMaterialCompat:
         assert chk["score"] == 1.0, chk
         assert chk.get("violating_routes") == [], chk
 
+    def test_missing_material_layers_errors_not_false_zero(self, rmc_clean_gds, anaconda_has_deps):
+        """When layer_map omits the flake material layers, the check must raise an
+        actionable ERROR (excluded from overall) — NOT a misleading 0.0 with an
+        empty violating_routes list. Regression for the QH06 live-run bug where
+        the benchmark result.json schema (no graphene/graphite) made the agent's
+        evaluate_design call return a false route_material_compat=0.0."""
+        lm = {k: v for k, v in RMC_LAYER_MAP.items() if k not in ("graphene", "graphite")}
+        config = {
+            "gds_path": rmc_clean_gds,
+            "layer_map": lm,
+            "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        chk = result["checks"][0]
+        assert chk.get("status") == "error", f"expected errored check, got {chk}"
+        assert "material" in chk["detail"].lower() and "layer_map" in chk["detail"]
+        assert result.get("n_errored_checks", 0) >= 1
+
     def test_crossing_scores_below_one_with_violation(self, rmc_crossing_gds, anaconda_has_deps):
         """A graphene-contact route sweeping through graphite → score < 1.0 and
         violating_routes non-empty, naming graphite as the crossed material."""

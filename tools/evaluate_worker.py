@@ -425,7 +425,26 @@ def _prim_route_material_compat(out_lib, ref_lib, layer_map, args):
     graphene = _resolve_region(out_lib, ref_lib, layer_map, graphene_key, "union")
     graphite = _resolve_region(out_lib, ref_lib, layer_map, graphite_key, "union")
     if graphene.is_empty and graphite.is_empty:
-        return _empty(0.0)
+        # The flake material regions could not be resolved. Returning a 0.0 here
+        # is MISLEADING — it looks like "every route shorts" with an empty
+        # violating_routes list (internally inconsistent). Raise an actionable
+        # error instead: an errored check is excluded from the weighted overall
+        # and the agent sees exactly what to add. Almost always the cause is that
+        # the agent's evaluate_design layer_map omits the flake material layers
+        # (the benchmark result.json schema does not include them, but the check
+        # needs them).
+        missing = [k for k, present in
+                   ((graphene_key, graphene_key in layer_map),
+                    (graphite_key, graphite_key in layer_map)) if not present]
+        raise ValueError(
+            "route_material_compat could not resolve the flake material regions "
+            "(graphene='{}', graphite='{}'). {} Add the committed graphene/graphite "
+            "flake layers to layer_map (or pass graphene=/graphite= args pointing "
+            "at them) so the check can tell which material each route crosses."
+            .format(graphene_key, graphite_key,
+                    "Missing from layer_map: " + ", ".join(missing) + "." if missing
+                    else "Both layers are present in layer_map but have no shapes "
+                         "— commit the flakes first."))
 
     graphene_only = graphene.difference(graphite) if not graphene.is_empty else sg.Polygon()
     graphite_only = graphite.difference(graphene) if not graphite.is_empty else sg.Polygon()
