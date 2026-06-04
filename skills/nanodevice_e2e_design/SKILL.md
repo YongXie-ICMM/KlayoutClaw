@@ -161,14 +161,23 @@ Run the `evaluate_design` MCP tool as a nanodevice DRC + metric pass, with a che
 | `bulk_containment` | component, bulk_region/materials, region_op, core_bbox | Fraction of a device body/core inside a caller-declared bulk region |
 | `arm_material_class` | component, classes, containment_threshold | Fraction of shapes landing in exactly one material class |
 | `material_overlap_report` | materials | Pairwise and multi-way material-region report |
-| `contact_isolation` | component | Fraction of route pairs that don't cross |
+| `contact_isolation` | component | Fraction of route pairs that don't cross (promotes `crossing_pairs`) |
 | `connectivity` | contact_component, pad_component, route_component, tolerance | Fraction of contacts reaching pads |
 | `route_endpoints` | route_component, target_components, tolerance | Fraction of route endpoints on valid targets |
+| `route_material_compat` | (optional graphene/graphite keys) | Fraction of ohmic routes that stay OFF the opposing flake material (promotes `violating_routes`) |
 | `adjacency` | component_a, component_b, tolerance | Fraction of A shapes within tolerance of B |
 | `solidity` | component, threshold, direction | Shape solidity above/below threshold |
 | `spacing` | component_a, component_b, min_distance | Fraction of pairs meeting min distance |
 
 The `region` arg can be a single layer_map key or a list of keys combined via `region_op` (union, intersection, difference).
+
+> **Always include `route_material_compat` once routes exist** (for devices with
+> distinct ohmic materials, e.g. a Hall bar's graphene vs graphite contacts). A
+> route that crosses the opposing flake material is an electrical short and is a
+> common, easily-missed cause of a low score. The check returns `violating_routes`
+> [{route_id, contact_kind, crossed_material, area_um2}] — reroute each violator
+> (e.g. fan it out away from the opposing flake) and re-check, exactly as you use
+> `contact_isolation`'s `crossing_pairs` to fix route-route crossings.
 
 **Example check list for a Hall bar:**
 ```json
