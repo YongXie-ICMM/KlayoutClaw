@@ -111,10 +111,46 @@ This applies to all CLI flags (`--layer`, `--inner-layer`, `--outer-layer`, `--p
 
 ---
 
+## Dense Fan-Out Recipe (tight clusters, 8+ contacts)
+
+When many contacts fan out from a small cluster (e.g. 8 ohmic contacts on a
+~30 um device), the **last** route in the bundle used to fail "No path found":
+each contact ends up walled in by its sibling-contact pin markers plus the
+clearance halos of routes already laid, even though a legal, non-crossing path
+to the pad still exists. This capped connectivity (HM08 ended at 3/8 contacts
+routed → score 0.387 despite perfect placement).
+
+`auto_route` now handles this automatically:
+
+- **Per-net rescue (on by default).** Any net that fails the first pathfinding
+  pass is retried with a local, then global, relaxation that opens the
+  clearance halos + sibling pin-markers blocking it while keeping every
+  already-routed path cell HARD — so the rescued lead reaches its pad without
+  crossing any prior route. The response reports `rescued_nets` (how many nets
+  needed the rescue) and a `rescue_note`. After a rescue, still run
+  `route_inspect` / `evaluate_design` with `contact_isolation` to confirm no
+  crossings — the rescue is designed never to add one, but verify.
+- The rescue is a strict no-op on layouts that already route fully, so it never
+  perturbs clean cases.
+
+If a net still fails after the rescue (genuine over-saturation — a contact
+sitting directly on top of a prior route), drop the assignment with
+`pin_pairs_override` to a topology with more corridor room, widen the field, or
+fall back to the manual L-route below for that one lead. Do **not** reflexively
+lower `map_resolution`: a finer grid does **not** reliably improve dense-fan-out
+connectivity and costs ~4x runtime per halving (≈4 s → 15 s → 66 s at
+2.0 → 1.0 → 0.5 um on a 2 mm field). Use `auto_map_resolution=true` only when
+contacts are genuinely small (~3 um) and the default under-resolves them.
+
 ## Known Limitations
 
-- Auto-router may produce overlapping routes in dense fan-out scenarios (48+ pins from a small cluster)
-- Workaround: increase `path_safe_distance`, or manually adjust problem routes via execute_script
+- In extreme cases a route may still fail after rescue when a contact sits
+  directly on a previously-routed path (no non-crossing path exists). Re-assign
+  via `pin_pairs_override`, widen the write field, or route that lead manually.
+- Auto-router may produce overlapping routes near very tight contact clusters
+  (sub-pitch spacing). These are usually junction overlaps near the shared
+  cluster that `contact_isolation` filters; increase `path_safe_distance` or
+  narrow `path_width` if `route_inspect` flags genuine mid-body crossings.
 
 ## auto_route Environment
 

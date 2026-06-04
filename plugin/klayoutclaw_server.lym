@@ -517,7 +517,8 @@ TOOLS = [
                 "path_hardness": {"type": "number", "description": "Max cost near previously routed paths (higher = more spacing). Default 10.", "default": 10.0},
                 "sort_pairs": {"type": "boolean", "description": "Route assigned pairs/nets by distance after assignment; default ordering is shortest first. Default true.", "default": True},
                 "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds. Clamped to [10, 600]. Default 120."},
-                "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping steps. Lower = stronger avoidance. Default 4."}
+                "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping steps. Lower = stronger avoidance. Default 4."},
+                "rescue_unrouted_nets": {"type": "boolean", "default": True, "description": "Dense-fan-out rescue. When a net fails 'No path found' (typically the last route in a tight 8+ contact bundle, walled in by sibling pins + prior routes' clearance halos), retry it with a local-then-global relaxation that opens the blocking halo + pin-marker cells while keeping every already-routed path cell HARD, so the rescued lead reaches its pad WITHOUT crossing any prior route. The response reports rescued_nets and rescue_note. Strict no-op on layouts that already route fully. Default true; set false for legacy fail-fast behaviour."}
             },
             "required": ["pin_layer_a", "pin_layer_b"]
         }
@@ -988,6 +989,7 @@ def _tool_auto_route(args):
     pin_pairs_override = args.get("pin_pairs_override", None)
     if pin_pairs_override is not None and not isinstance(pin_pairs_override, list):
         raise ValueError("pin_pairs_override must be a list of [a_idx, b_idx] pairs (or omitted).")
+    rescue_unrouted_nets = bool(args.get("rescue_unrouted_nets", True))
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_route_")
@@ -1022,6 +1024,7 @@ def _tool_auto_route(args):
         "obs_damping_step": obs_damping_step,
         "dry_run": dry_run,
         "auto_map_resolution": auto_map_resolution,
+        "rescue_unrouted_nets": rescue_unrouted_nets,
     }
     if per_pair_obstacle_layers is not None:
         config["per_pair_obstacle_layers"] = per_pair_obstacle_layers
@@ -1164,10 +1167,16 @@ def _tool_auto_route(args):
     n_errors = len(result.get("errors", []))
     status = result.get("status", "unknown")
     total_pairs = min(result.get("total_pins_a", 0), result.get("total_pins_b", 0))
+    rescued_nets = result.get("rescued_nets", 0)
+    rescue_hint = ""
+    if rescued_nets:
+        rescue_hint = (" NOTE: {} net(s) needed the dense-fan-out rescue (relaxed the clearance halos blocking the "
+                       "last route(s); prior routes stayed hard, so no crossing should have been added). "
+                       "Confirm contact_isolation is still clean via route_inspect / evaluate_design.").format(rescued_nets)
     if status == "success" and n_errors == 0 and inserted == total_pairs:
         next_step = ("Routes committed. Call screenshot (optionally with zoom_box over the device region) to visually verify, "
                      "then route_inspect to map each route_id back to its contact/pad, "
-                     "and evaluate_design with contact_isolation to detect crossings.")
+                     "and evaluate_design with contact_isolation to detect crossings." + rescue_hint)
     elif inserted &gt; 0:
         next_step = ("Partial routing ({}/{} pairs). Call route_inspect to see which pairs succeeded, "
                      "screenshot(zoom_box=...) over the unrouted region, and consider per_pair_obstacle_layers or a higher timeout for the retry.".format(inserted, total_pairs))
@@ -1175,7 +1184,7 @@ def _tool_auto_route(args):
         next_step = ("No routes inserted. Re-check pin_layer_a / pin_layer_b have geometry via get_layout_info, "
                      "try dry_run=True first to preview the ordered-loop assignment, and consult the errors list.")
 
-    return json.dumps({
+    response = {
         "status": status,
         "routed_pairs": inserted,
         "total_pins_a": result.get("total_pins_a", 0),
@@ -1185,9 +1194,13 @@ def _tool_auto_route(args):
         "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
         "assignment_engine": result.get("assignment_engine"),
         "n_nets": result.get("n_nets"),
+        "rescued_nets": rescued_nets,
         "errors": result.get("errors", []),
         "next_step_suggestion": next_step,
-    })
+    }
+    if result.get("rescue_note"):
+        response["rescue_note"] = result.get("rescue_note")
+    return json.dumps(response)
 
 
 def _iter_routes_on_layer(layer_num, datatype):

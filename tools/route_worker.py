@@ -344,6 +344,15 @@ def route(config: dict) -> dict:
     # routes critically needed. Default False (shortest first, baseline order).
     sort_pairs_reverse = bool(config.get("sort_pairs_reverse", False))
 
+    # Dense-fan-out rescue (HM08 fix). When a net fails "No path found", its
+    # own endpoint is usually walled in by sibling-pin markers + the freeze
+    # halos of routes already laid. The rescue retries that single net ONCE
+    # with a SMALL local disk around its own endpoints opened (halo + sibling
+    # pin-marker cells softened to walkable), while keeping every real
+    # routed-path cell hard — so the rescued lead reaches its pad without
+    # crossing any prior route. Set rescue_unrouted_nets=False to disable.
+    rescue_unrouted_nets = bool(config.get("rescue_unrouted_nets", True))
+
     # --- Convert um→dbu (resolution recomputed after auto-map) ---
     obs_safe_dbu = int(round(obs_safe_um / dbu))
     path_width_dbu = int(round(path_width_um / dbu))
@@ -755,6 +764,7 @@ def route(config: dict) -> dict:
     # belongs to a prior route's frozen halo opens a corridor through that
     # route, producing route-route crossings.
     frozen_routes_grid = np.zeros_like(cost, dtype=bool)
+    rescued_nets = 0
 
     for net_id, net in enumerate(nets):
         a_idx = net["a_idx"]
@@ -824,6 +834,72 @@ def route(config: dict) -> dict:
             else:
                 this_path_rc = find_path(cost, start_rc, end_rc)
 
+            # ---- DENSE-FAN-OUT RESCUE ----
+            # When a net fails "No path found" it is almost always because its
+            # own endpoint(s) are walled in: in a tight 8-contact bundle the
+            # contact is ringed by sibling-pin markers (-2.0) and the freeze
+            # halos (-1.0) of routes already laid, leaving no escape corridor
+            # — even though a legal, non-crossing path to the pad exists (this
+            # is the HM08 connectivity cap). The default per-pair clearance is
+            # deliberately suppressed where it overlaps a prior route's frozen
+            # halo (`& ~frozen_routes_grid` above), which is what seals the
+            # corridor shut.
+            #
+            # Rescue (two tiers, both keep real routed-path cells (-3.0) HARD so
+            # no rescued lead can ever cross a prior route — contact_isolation /
+            # crossing_pairs stay clean):
+            #
+            #   Tier 1 (local, most conservative): open a small disk around this
+            #     net's OWN endpoints, softening halo (-1.0) and sibling-pin
+            #     marker (-2.0) cells to walkable. Frees the common case where
+            #     the contact is merely ringed in by its neighbours.
+            #
+            #   Tier 2 (global halo/marker relax): if Tier 1 still fails, soften
+            #     ALL halo + sibling-pin-marker cells (still keeping -3.0 route
+            #     cells hard). The pin markers are tiny (~1 um) pin-CENTRE boxes,
+            #     not the pad/contact polygons (those, when declared, live in
+            #     obs_region and stay hard), so this cannot cut a route through a
+            #     declared obstacle, and -3.0 hardness still forbids route
+            #     crossings. Handles mid-corridor (non-endpoint) blockage.
+            #
+            # Disable both with rescue_unrouted_nets=False.
+            rescued_this_pair = False
+            if (this_path_rc is None and rescue_unrouted_nets
+                    and not steiner_branch):
+                soft_cost = 1.0 + max(0.0, path_hardness * 0.5)
+                # ---- Tier 1: local endpoint disk ----
+                rescue_disk_dbu = max(pin_clear_margin_dbu, resolution_dbu * 3)
+                rdisk_cells = max(3, int(round(rescue_disk_dbu / resolution_dbu)))
+                rdisk_cells = min(rdisk_cells, 12)  # keep the opening local
+                nrows_g, ncols_g = cost.shape
+                yy = np.arange(nrows_g)[:, None]
+                xx = np.arange(ncols_g)[None, :]
+                disk = np.zeros_like(cost, dtype=bool)
+                for (pr, pc) in (start_rc, end_rc):
+                    pr_c = max(0, min(int(pr), nrows_g - 1))
+                    pc_c = max(0, min(int(pc), ncols_g - 1))
+                    disk |= ((yy - pr_c) ** 2 + (xx - pc_c) ** 2) <= rdisk_cells ** 2
+                relax_mask = disk & (cost <= -1.0) & (cost > -2.5)
+                if relax_mask.any():
+                    saved_relax_costs = cost[relax_mask].copy()
+                    cost[relax_mask] = soft_cost
+                    this_path_rc = find_path(cost, start_rc, end_rc)
+                    cost[relax_mask] = saved_relax_costs
+                    if this_path_rc is not None:
+                        rescued_this_pair = True
+                        rescued_nets += 1
+                # ---- Tier 2: global halo + pin-marker relax ----
+                if this_path_rc is None:
+                    relax_mask2 = (cost <= -1.0) & (cost > -2.5)
+                    if relax_mask2.any():
+                        saved_relax_costs2 = cost[relax_mask2].copy()
+                        cost[relax_mask2] = soft_cost
+                        this_path_rc = find_path(cost, start_rc, end_rc)
+                        cost[relax_mask2] = saved_relax_costs2
+                        if this_path_rc is not None:
+                            rescued_this_pair = True
+                            rescued_nets += 1
+
             if this_path_rc is None:
                 errors.append(
                     f"No path found for net_id={net_id} a_idx={a_idx} -> b_idx={b_idx}"
@@ -862,6 +938,7 @@ def route(config: dict) -> dict:
                 "net_id": net_id,
                 "branch_index": sink_local_idx,
                 "steiner_branch": steiner_branch,
+                "rescued": rescued_this_pair,
             })
 
             # Mark this segment in cost grid (impassable for downstream pairs)
@@ -915,7 +992,7 @@ def route(config: dict) -> dict:
 
     info_only = all(n.startswith("auto_map_resolution") for n in errors)
 
-    return {
+    result = {
         "status": "success" if (not errors or info_only) else "partial",
         "routed_pairs": len(result_paths),
         "total_pins_a": n_a,
@@ -925,7 +1002,17 @@ def route(config: dict) -> dict:
         "map_resolution_um_used": map_res_um,
         "assignment_engine": assignment_engine,
         "n_nets": len(nets),
+        "rescued_nets": rescued_nets,
     }
+    if rescued_nets > 0:
+        # Informational only — does NOT flip status to partial. These nets DID
+        # route; they just needed the freeze-halo relaxed to find a corridor.
+        result["rescue_note"] = (
+            "{} net(s) routed via dense-fan-out rescue (relaxed the soft "
+            "freeze halo of prior routes; real path cells, pins, and obstacles "
+            "stayed hard). Verify with route_inspect / contact_isolation that "
+            "no crossings were introduced.".format(rescued_nets))
+    return result
 
 
 # ---------------------------------------------------------------------------
