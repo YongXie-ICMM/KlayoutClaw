@@ -338,6 +338,183 @@ def _prim_contact_isolation(out_lib, ref_lib, layer_map, args):
     }
 
 
+# Inline format legend for violating_routes (surfaced in the evaluate_design
+# response so agents don't need to look up the docstring).
+_VIOLATING_ROUTES_HELP = (
+    "[{route_id, contact_kind, crossed_material, area_um2}] — route_id is the "
+    "0-based index into the contact_route layer; contact_kind is the ohmic "
+    "contact class the route terminates at (graphene_only/graphite_only); "
+    "crossed_material is the opposing flake the route sweeps; area_um2 is the "
+    "swept forbidden area. A contact violates when its routes sweep "
+    "> tolerance_area um2 of the opposing flake (an electrical short)."
+)
+
+
+def _meaningful_region_hit(patch, region, min_area=0.1, min_fraction=0.10):
+    """True when a contact substantially occupies a region.
+
+    Mirrors composite_evaluator._meaningful_region_hit: centroid containment
+    keeps compatibility with the old evaluator, while the area threshold
+    catches contacts that legitimately straddle an edge.
+    """
+    if patch is None or patch.is_empty or region is None or region.is_empty:
+        return False
+    if region.covers(patch.centroid):
+        return True
+    threshold = max(min_area, min_fraction * patch.area)
+    return patch.intersection(region).area >= threshold
+
+
+def _prim_route_material_compat(out_lib, ref_lib, layer_map, args):
+    """Each ohmic route must stay off the opposing flake material.
+
+    Mirrors composite_evaluator._check_route_material_compat (the official
+    scorer's Metric 10 / Bug #8). An ohmic contact patch is classified by the
+    single flake it sits on:
+
+      - graphene_only  → forbidden region is FULL graphite (includes overlap,
+        since the overlap region also contains graphite).
+      - graphite_only  → forbidden region is FULL graphene (same in reverse).
+
+    A route *terminates at* a contact when ``route.buffer(attach_buffer)``
+    intersects the patch (default attach_buffer 0.5 µm). A contact passes when
+    the total forbidden-region area swept by all of its terminating routes is
+    ≤ ``tolerance_area`` µm² (numerical-noise allowance). Gate contacts are
+    excluded — only graphene_only / graphite_only ohmic contacts are scored,
+    exactly as the official metric (a topgate bonding route legitimately
+    traverses bare flake en route to the perimeter pad).
+
+    Scoring uses the same steep penalty curve as the scorer:
+
+      0 violators                → 1.0
+      v violators (out of denom) → ``0.5^v × passing/denom``
+
+    where ``denom = max(len(classified ohmic contacts), _expected_arms)`` so
+    that extra contacts cannot lift passing/total to 1.0 when violators exist.
+
+    Args (all optional):
+      route_component   layer_map key for routes      (default "contact_route")
+      contact_component layer_map key for patches      (default "contact_patch")
+      graphene          layer_map key for graphene     (default "graphene")
+      graphite          layer_map key for graphite     (default "graphite")
+      tolerance_area    µm² noise allowance per contact (default 0.5)
+      attach_buffer     µm route→patch attach distance  (default 0.5)
+
+    Returns a dict {"score": float, "extra": {"violating_routes": [...]}} so the
+    agent gets per-route actionable feedback — mirroring contact_isolation's
+    crossing_pairs that drives route-route fixes.
+    """
+    route_comp = args.get("route_component", "contact_route")
+    contact_comp = args.get("contact_component", "contact_patch")
+    graphene_key = args.get("graphene", "graphene")
+    graphite_key = args.get("graphite", "graphite")
+    tolerance_area = float(args.get("tolerance_area", 0.5))
+    attach_buffer = float(args.get("attach_buffer", 0.5))
+
+    def _empty(score):
+        return {
+            "score": score,
+            "extra": {
+                "violating_routes": [],
+                "violating_routes_format": _VIOLATING_ROUTES_HELP,
+            },
+        }
+
+    # Resolve full-flake regions (ref-preferring, out-lib fallback) — same as
+    # the official metric's _ref_material(ref_lib, REF_GRAPHENE/REF_GRAPHITE).
+    graphene = _resolve_region(out_lib, ref_lib, layer_map, graphene_key, "union")
+    graphite = _resolve_region(out_lib, ref_lib, layer_map, graphite_key, "union")
+    if graphene.is_empty and graphite.is_empty:
+        return _empty(0.0)
+
+    graphene_only = graphene.difference(graphite) if not graphene.is_empty else sg.Polygon()
+    graphite_only = graphite.difference(graphene) if not graphite.is_empty else sg.Polygon()
+
+    # Forbidden region per ohmic kind: graphene_only contacts must avoid full
+    # graphite, graphite_only contacts must avoid full graphene.
+    forbidden_by_kind = {
+        "graphene_only": graphite,
+        "graphite_only": graphene,
+    }
+
+    routes = _component_list(out_lib, layer_map, route_comp)
+    if not routes:
+        return _empty(0.0)
+
+    patches = _component_list(out_lib, layer_map, contact_comp)
+    if not patches:
+        return _empty(0.0)
+
+    # Classify each ohmic contact patch (gate contacts are not handled here,
+    # so a patch that hits neither single-material region is simply unclassified
+    # and excluded — matching the official metric, which drops material_kind
+    # values outside forbidden_by_kind).
+    classified = []
+    for patch in patches:
+        in_graphene_only = _meaningful_region_hit(patch, graphene_only)
+        in_graphite_only = _meaningful_region_hit(patch, graphite_only)
+        if in_graphene_only and not in_graphite_only:
+            classified.append((patch, "graphene_only"))
+        elif in_graphite_only and not in_graphene_only:
+            classified.append((patch, "graphite_only"))
+
+    if not classified:
+        return _empty(1.0)
+
+    violating_routes = []
+    passing = 0
+    for patch, kind in classified:
+        forb = forbidden_by_kind[kind]
+        if forb.is_empty:
+            passing += 1
+            continue
+        crossed_material = "graphite" if kind == "graphene_only" else "graphene"
+        bad_area = 0.0
+        contact_violations = []
+        for idx, r in enumerate(routes):
+            if not r.buffer(attach_buffer).intersects(patch):
+                continue
+            swept = r.intersection(forb).area
+            bad_area += swept
+            if swept > 0.0:
+                contact_violations.append((idx, swept))
+        if bad_area <= tolerance_area:
+            passing += 1
+        else:
+            # This contact is shorted — surface every route that swept the
+            # opposing flake so the agent can re-route or re-place it.
+            for idx, swept in contact_violations:
+                violating_routes.append({
+                    "route_id": int(idx),
+                    "contact_kind": kind,
+                    "crossed_material": crossed_material,
+                    "area_um2": round(float(swept), 6),
+                })
+
+    try:
+        expected = int(layer_map.get("_expected_arms", 8))
+    except (TypeError, ValueError):
+        expected = 8
+    if expected <= 0:
+        expected = 8
+    denom = max(len(classified), expected)
+    violators = len(classified) - passing
+    if denom == 0:
+        score = 0.0
+    elif violators == 0:
+        score = 1.0
+    else:
+        score = (0.5 ** violators) * (passing / float(denom))
+
+    return {
+        "score": score,
+        "extra": {
+            "violating_routes": violating_routes,
+            "violating_routes_format": _VIOLATING_ROUTES_HELP,
+        },
+    }
+
+
 def _prim_connectivity(out_lib, ref_lib, layer_map, args):
     """Fraction of contacts that reach a bonding pad via routes."""
     contact_comp = args.get("contact_component", "contact_patch")
@@ -705,6 +882,7 @@ PRIMITIVES = {
     "arm_material_class": _prim_arm_material_class,
     "material_overlap_report": _prim_material_overlap_report,
     "contact_isolation": _prim_contact_isolation,
+    "route_material_compat": _prim_route_material_compat,
     "connectivity": _prim_connectivity,
     "route_endpoints": _prim_route_endpoints,
     "adjacency": _prim_adjacency,
@@ -765,6 +943,13 @@ def _build_next_step(overall, results, empty_components):
             "For contact_isolation < 0.8: call route_inspect with the same "
             "route_layer / contact_layers / pad_layer you used when routing, "
             "then screenshot(zoom_box=...) over each crossing to inspect.")
+    if "route_material_compat" in names:
+        parts.append(
+            "For route_material_compat < 0.8: read the violating_routes list "
+            "(each names route_id, contact_kind, crossed_material, area_um2 — "
+            "a route shorting an ohmic contact onto the opposing flake). "
+            "screenshot(zoom_box=...) over each violating route_id and re-route "
+            "or re-place that contact so it no longer crosses the wrong flake.")
     if "component_containment" in names or "bulk_containment" in names:
         parts.append(
             "For containment < 0.8: call screenshot(zoom_box=...) on the "

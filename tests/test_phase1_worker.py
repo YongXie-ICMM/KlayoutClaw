@@ -415,6 +415,217 @@ class TestArmMaterialClass:
 
 
 # ---------------------------------------------------------------------------
+# Test: route_material_compat — ohmic routes must stay off the opposing flake
+#
+# Mirrors composite_evaluator._check_route_material_compat (Metric 10 / Bug #8).
+# A live HM11 e2e run scored 0.74 capped by route_material_compat=0.125 (two
+# ohmic routes crossing graphite) precisely because the agent had NO self-check
+# primitive for this. This class drives both the clean case (no short) and the
+# shorted case (route sweeps the opposing flake → violating_routes populated).
+# ---------------------------------------------------------------------------
+
+# Layers: graphene L11, graphite L13 (mirrors the official scorer's
+# REF_GRAPHENE=(11,0) / REF_GRAPHITE=(13,0)). Two disjoint flakes side by side.
+RMC_LAYER_MAP = {
+    "graphene": [11, 0],
+    "graphite": [13, 0],
+    "contact_patch": [21, 0],
+    "contact_route": [30, 0],
+}
+
+
+def _make_route_material_gds(crossing):
+    """Build a synthetic GDS for route_material_compat.
+
+    Geometry (all µm):
+      - graphene flake L11: x in [-60, -10], y in [-40, 40]  (left)
+      - graphite flake L13: x in [ 10,  60], y in [-40, 40]  (right)
+      - one graphene_only ohmic contact patch sitting well inside graphene
+        at x in [-45, -35], y in [-5, 5]
+      - one route attached to that patch.
+
+    crossing=False: the route runs LEFT, away from the graphite flake → it
+        sweeps 0 µm² of graphite → contact passes → score 1.0.
+    crossing=True: the route runs RIGHT from the patch straight through the
+        graphite flake (a fabricated short) → it sweeps a large graphite area
+        → contact violates → score < 1.0, violating_routes non-empty with
+        crossed_material == "graphite".
+    """
+    tmp = tempfile.mktemp(suffix=".gds", prefix="test_rmc_")
+    if crossing:
+        # Route from the patch (x=-40) rightward to x=40, at y=0, width 6 →
+        # sweeps graphite x in [10,43], y in [-3,3] ≈ 33*6 = ~198 µm² ≫ 0.5.
+        route_pts = "[(-40, 0), (40, 0)]"
+    else:
+        # Route from the patch leftward, out the side of the graphene flake →
+        # never touches graphite.
+        route_pts = "[(-40, 0), (-90, 0)]"
+    script = f'''
+import gdstk
+
+lib = gdstk.Library()
+cell = lib.new_cell("TOP")
+
+# graphene flake (L11) — left
+cell.add(gdstk.rectangle((-60, -40), (-10, 40), layer=11, datatype=0))
+# graphite flake (L13) — right
+cell.add(gdstk.rectangle((10, -40), (60, 40), layer=13, datatype=0))
+
+# graphene_only ohmic contact patch (L21), deep inside graphene
+cell.add(gdstk.rectangle((-45, -5), (-35, 5), layer=21, datatype=0))
+
+# the ohmic route (L30)
+cell.add(gdstk.FlexPath({route_pts}, 6, layer=30, datatype=0))
+
+lib.write_gds("{tmp}")
+print("OK")
+'''
+    proc = subprocess.run(
+        [ANACONDA_PYTHON, "-c", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode == 0 and os.path.isfile(tmp):
+        return tmp
+    return None
+
+
+@pytest.fixture(scope="session")
+def rmc_clean_gds(anaconda_has_deps):
+    path = _make_route_material_gds(crossing=False)
+    if path is None:
+        pytest.skip("Could not create clean route_material GDS")
+    yield path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+@pytest.fixture(scope="session")
+def rmc_crossing_gds(anaconda_has_deps):
+    path = _make_route_material_gds(crossing=True)
+    if path is None:
+        pytest.skip("Could not create crossing route_material GDS")
+    yield path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+class TestRouteMaterialCompat:
+    def test_registered(self, rmc_clean_gds, anaconda_has_deps):
+        """The primitive must be a known check name (not an unknown-primitive
+        error)."""
+        config = {
+            "gds_path": rmc_clean_gds,
+            "layer_map": RMC_LAYER_MAP,
+            "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        assert result.get("status") == "ok", result
+
+    def test_clean_scores_one_no_violations(self, rmc_clean_gds, anaconda_has_deps):
+        """A graphene-contact route that never touches graphite → 1.0, no
+        violating_routes."""
+        config = {
+            "gds_path": rmc_clean_gds,
+            "layer_map": RMC_LAYER_MAP,
+            "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        chk = result["checks"][0]
+        assert "ERROR" not in chk["detail"], chk["detail"]
+        assert chk["score"] == 1.0, chk
+        assert chk.get("violating_routes") == [], chk
+
+    def test_crossing_scores_below_one_with_violation(self, rmc_crossing_gds, anaconda_has_deps):
+        """A graphene-contact route sweeping through graphite → score < 1.0 and
+        violating_routes non-empty, naming graphite as the crossed material."""
+        config = {
+            "gds_path": rmc_crossing_gds,
+            "layer_map": RMC_LAYER_MAP,
+            "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        chk = result["checks"][0]
+        assert "ERROR" not in chk["detail"], chk["detail"]
+        assert chk["score"] < 1.0, chk
+        vrs = chk.get("violating_routes")
+        assert vrs, f"expected non-empty violating_routes, got {vrs}"
+        v = vrs[0]
+        assert v["crossed_material"] == "graphite", v
+        assert v["contact_kind"] == "graphene_only", v
+        assert v["area_um2"] > 0.5, v
+
+    def test_violating_routes_format_present(self, rmc_crossing_gds, anaconda_has_deps):
+        """The actionable-format legend is surfaced like crossing_pairs_format."""
+        config = {
+            "gds_path": rmc_crossing_gds,
+            "layer_map": RMC_LAYER_MAP,
+            "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+        }
+        rc, result, stderr = _run_worker(config)
+        assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+        chk = result["checks"][0]
+        assert "violating_routes_format" in chk, chk
+
+    def test_matches_official_scorer(self, rmc_clean_gds, rmc_crossing_gds, anaconda_has_deps):
+        """Worker primitive score must agree with the official
+        composite_evaluator._check_route_material_compat on the same layouts."""
+        official = os.path.expanduser(
+            "~/KLayout_Harbour/shared/composite_evaluator.py")
+        if not os.path.isfile(official):
+            pytest.skip("composite_evaluator.py not available for cross-check")
+
+        for gds in (rmc_clean_gds, rmc_crossing_gds):
+            # Official score (in-process import of the scorer).
+            cross_script = f'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ce", "{official}")
+ce = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ce)
+import gdstk
+lib = gdstk.read_gds("{gds}")
+# Official scorer reads ref material from REF_GRAPHENE=(11,0)/REF_GRAPHITE=(13,0)
+# in the *reference* lib; here out_lib == ref_lib (single GDS holds both
+# flakes and routes), exactly as the cross-check intends.
+layer_map = {{
+    "graphene": [(11, 0)],
+    "graphite": [(13, 0)],
+    "contact_patch": [(21, 0)],
+    "contact_route": [(30, 0)],
+    "mesa": [],
+    "topgate": [],
+}}
+score = ce._check_route_material_compat(lib, lib, layer_map)
+print(repr(round(float(score), 6)))
+'''
+            proc = subprocess.run(
+                [ANACONDA_PYTHON, "-c", cross_script],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert proc.returncode == 0, f"official scorer failed: {proc.stderr[:500]}"
+            official_score = float(proc.stdout.strip())
+
+            # Worker score.
+            config = {
+                "gds_path": gds,
+                "layer_map": RMC_LAYER_MAP,
+                "checks": [{"name": "route_material_compat", "args": {}, "weight": 1.0}],
+            }
+            rc, result, stderr = _run_worker(config)
+            assert rc == 0 and result is not None, f"Failed: {stderr[:300]}"
+            worker_score = float(result["checks"][0]["score"])
+
+            assert abs(worker_score - official_score) < 1e-6, (
+                f"gds={gds}: worker={worker_score} official={official_score}")
+
+
+# ---------------------------------------------------------------------------
 # Test: Score Computation
 # ---------------------------------------------------------------------------
 
