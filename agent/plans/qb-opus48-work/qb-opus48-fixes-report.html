@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qlaybot Opus 4.8 — 反馈核实与修复报告 (2026-06-05)</title>
+<style>
+  :root{--bg:#0e1116;--card:#161b22;--ink:#e6edf3;--mut:#9aa7b4;--line:#30363d;
+        --ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;--vio:#bc8cff;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:.3px}
+  h2{font-size:20px;margin:38px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px;color:var(--acc)}
+  .sub{color:var(--mut);font-size:13.5px;margin-bottom:22px}
+  code{background:#1f2630;padding:1px 6px;border-radius:5px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:#d6e2f0}
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:13px 15px;overflow:auto;font:12.5px ui-monospace,Menlo,monospace;color:#cdd9e5}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:18px 20px;margin:16px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .stat .n{font-size:25px;font-weight:700}
+  .stat .l{color:var(--mut);font-size:12.5px;margin-top:2px}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.4px}
+  tr:hover td{background:#1b222c}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:11.5px;font-weight:600;white-space:nowrap}
+  .b-fix{background:rgba(63,185,80,.16);color:var(--ok)}
+  .b-open{background:rgba(248,81,73,.16);color:var(--bad)}
+  .b-part{background:rgba(210,153,34,.16);color:var(--warn)}
+  .b-skip{background:rgba(154,167,180,.16);color:var(--mut)}
+  .b-na{background:rgba(88,166,255,.16);color:var(--acc)}
+  .done{color:var(--ok);font-weight:600}
+  .tag{font-size:11px;color:var(--vio);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-right:4px}
+  ul{margin:8px 0 8px 2px;padding-left:20px}
+  li{margin:4px 0}
+  .lead{font-size:16px}
+  .kbd{border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:0 6px;font:12px ui-monospace,monospace;background:#1f2630}
+  .muted{color:var(--mut)}
+  .hr{height:1px;background:var(--line);margin:26px 0}
+  a{color:var(--acc)}
+  .flag{color:var(--bad);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>qlaybot Opus 4.8 — 反馈核实与修复报告</h1>
+<div class="sub">KlayoutClaw · 分支 <code>fix/evaluate-design-harness</code> · 2026-06-05 ·
+来源：<code>2026-06-05-qb-opus48-feedback-report.md</code>（54 任务 sweep <code>qb-opus48-full-20260605-023231</code> 的 36 份 design/e2e <code>feedback.json</code> 聚合）</div>
+
+<div class="card">
+<div class="lead">📌 一句话结论</div>
+<p>这次 sweep 报告的大量 <b>critical</b> 问题（尤以 #1 <code>route_material_compat</code> 18/36 居首）的<b>根因不是代码缺陷，而是跑 MCP server 的 <code>klayout-mcp</code> 镜像停留在 2026-05-10</b>——它早于 06-03/06-04 的修复批次。换言之，<b>一批问题在当前代码里早已修好，只是从未用新镜像验证过</b>。本轮工作：(1) 用 19 个并行 subagent 对<b>当前代码</b>逐条核实；(2) 对仍开放的高影响问题做 TDD（写失败测试→对抗 review→实现）；(3) 在 host KLayout 真实 MCP server 上端到端验证。</p>
+<p style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)"><b>已验证成果：</b>真实 agent E2E（修复后代码，非 docker）<b>e2e/ml04 0.317 → 0.7790（+0.462，翻倍多）</b>、design/ml11 0.915 → 0.9449。机制：旧镜像下 <code>route_material_compat</code> 一调用即 abort 整个 evaluate_design 自评；修复后 agent 这一 run 成功调用它 ×15 来检测并修正短路 → 器件质量大幅提升。全套测试 0 回归。</p>
+</div>
+
+<div class="grid">
+  <div class="stat"><div class="n">19</div><div class="l">反馈问题（并行核实）</div></div>
+  <div class="stat"><div class="n">10</div><div class="l">已修复/加固（本轮）</div></div>
+  <div class="stat"><div class="n">35</div><div class="l">新增对抗测试（全绿）</div></div>
+  <div class="stat"><div class="n">5/5</div><div class="l">测试经对抗 review：无 weak</div></div>
+  <div class="stat"><div class="n">6/6</div><div class="l">真实 MCP 端到端验证</div></div>
+  <div class="stat"><div class="n">0</div><div class="l">引入的回归</div></div>
+</div>
+
+<h2>1. 根因：sweep 用的是过期镜像</h2>
+<p>直接检查两个 pin 住的镜像里<b>烤进去的真实代码</b>：</p>
+<table>
+<thead><tr><th>镜像</th><th>构建时间</th><th>角色</th><th><code>route_material_compat</code></th><th>UA 修复</th></tr></thead>
+<tbody>
+<tr><td><code>klayout-mcp:0.30.5-arm64</code></td><td class="flag">2026-05-10</td><td>跑 MCP server（<code>.lym</code>）</td><td class="flag">❌ 0（旧）</td><td>—</td></tr>
+<tr><td><code>klayout-harbour-qlaybot</code></td><td>2026-06-04 23:05</td><td>跑 qlaybot agent</td><td class="done">✓ 3（新）</td><td class="done">✓ 3（新）</td></tr>
+</tbody>
+</table>
+<p>根因链条（= 反馈 #1，18/36 任务的头号 critical）：agent 镜像是新的，正确地按 e2e SKILL 调用 <code>route_material_compat</code>；但真正跑 MCP server 的 <code>klayout-mcp</code> 镜像停留在 5 月 10 日，其烤进去的 <code>.lym</code> 里 <code>_known_primitives</code>（旧文件 line 1692）<b>根本没有</b>这个 primitive，于是协议层直接抛 <code>unknown primitive … aborted the whole batch</code>。<code>.lym</code> 是 <code>COPY</code> 烤入（非 bind-mount），所以即便 worker <code>.py</code> 用 symlink 能热更新，<code>.lym</code> 这套<b>独立的</b>注册表始终是旧的。</p>
+<div class="card" style="border-color:var(--warn)">
+<b>⚙️ 给 operator 的独立行动项（与本轮代码改动无关，但优先级最高）：</b>
+<ul>
+<li>下次 benchmark sweep 前<b>必须重建 <code>klayout-mcp</code> 镜像</b>。klayout 源码编译在 <code>builder</code> stage 有缓存，只有 <code>COPY .</code> + <code>install.py</code> 几层重跑，很快。</li>
+<li>建议加一步 CI 守卫：构建后断言镜像内 <code>.lym</code> 的 <code>_known_primitives</code> 与 <code>tools/evaluate_worker.PRIMITIVES</code> set-equal（本轮已加该单测，见 §4 #1）。</li>
+</ul>
+</div>
+
+<h2>2. 并行核实：19 个问题 vs 当前代码</h2>
+<p class="muted">19 个 general-purpose subagent 并行，对<b>当前工作树</b>（含未提交改动）逐条核实：状态 / 证据(file:line) / 是否值得修 / 现有测试是否为弱测试。完整结论见 <code>agent/plans/qb-opus48-work/triage_verdicts.json</code>。</p>
+<table>
+<thead><tr><th>#</th><th>问题</th><th>核实状态</th><th>值得修?</th><th>本轮处理</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>route_material_compat</code> 未在 MCP registry 注册</td><td><span class="pill b-fix">已修复</span></td><td>✓</td><td>加 registry set-equality 守卫单测（防再漂移）</td></tr>
+<tr><td>2</td><td><code>solidity</code> detail 把 (1−solidity) 标成 <code>solidity:</code>（指标反转）</td><td><span class="pill b-open">OPEN</span></td><td>✓</td><td class="done">已修 + TDD</td></tr>
+<tr><td>3</td><td><code>auto_route</code> 对整个 cell bbox 建网格 → OOM/超时</td><td><span class="pill b-open">OPEN</span></td><td>✓</td><td class="done">已修 + TDD</td></tr>
+<tr><td>4</td><td>net-aware <code>route_crossings</code> primitive</td><td><span class="pill b-open">OPEN</span></td><td class="flag">✗</td><td><span class="pill b-skip">跳过</span> net-lenient 与官方 scorer 矛盾</td></tr>
+<tr><td>5</td><td>region-algebra MCP helper</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td><span class="pill b-skip">延后</span> <code>material_overlap_report</code> 已覆盖大半</td></tr>
+<tr><td>6</td><td><code>auto_route</code> ordered-loop 产生 route-route 交叉</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td><span class="pill b-skip">延后</span> DP 已防交叉；价值在补测试</td></tr>
+<tr><td>7</td><td>未知 arg key 被静默忽略 / schema 不可发现</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td class="done">已修 + TDD（拒绝未知 key + <code>describe_checks</code>）</td></tr>
+<tr><td>8</td><td><code>auto_route</code> 默认值对 sub-30µm 器件过粗</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td class="done">已修（opt-in pitch floor）+ TDD</td></tr>
+<tr><td>9</td><td><code>core_bbox=true</code> 触发 bool-len 崩溃</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td class="done">已修 + TDD（可操作报错）</td></tr>
+<tr><td>10</td><td><code>footprint.py</code> GrabCut 退化 + OOM</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td>内存上限已修（未提交改动）；退化 fallback 延后</td></tr>
+<tr><td>11</td><td>screenshot 无法隐藏背景图 / 空白渲染</td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td><span class="pill b-skip">延后</span> 大部分已修</td></tr>
+<tr><td>12</td><td>无法按 id 删除/重路由单条 route</td><td><span class="pill b-open">OPEN</span></td><td class="flag">✗</td><td><span class="pill b-skip">跳过</span> 低价值</td></tr>
+<tr><td>13</td><td><code>filter_bonding_pads</code> helper</td><td><span class="pill b-open">OPEN</span></td><td class="flag">✗</td><td><span class="pill b-skip">跳过</span> 反过拟合；benchmark 用程序化 pad</td></tr>
+<tr><td>14</td><td><code>route_inspect</code> tolerance 与 connectivity 不一致 → from/to=null</td><td><span class="pill b-open">OPEN</span></td><td>✓</td><td class="done">已修 + TDD（5→15 对齐）</td></tr>
+<tr><td>15</td><td><code>execute_script</code> 缺 numpy/scipy</td><td><span class="pill b-na">非 bug</span></td><td>✓</td><td>KLayout 内置 py 已有 numpy/scipy/gdstk；仅文档延后</td></tr>
+<tr><td>16</td><td>planner CLI 模板 arg 与脚本 argparse 不匹配</td><td><span class="pill b-open">OPEN</span></td><td>✓</td><td class="done">已修 + TDD（数据驱动揪出 <b>10 处</b>错误模板）</td></tr>
+<tr><td>17</td><td><code>auto_route</code> 长调用假 <code>fetch failed</code></td><td><span class="pill b-open">OPEN</span></td><td>✓</td><td class="done">已修 + TDD（client timeout ≥ server 上限）</td></tr>
+<tr><td>18</td><td>SKILL.md 硬编码 <code>conda run -n instrMCPdev</code></td><td><span class="pill b-part">PARTIAL</span></td><td>✓</td><td class="done">已修 + TDD（<code>${PYTHON_PATH:-…}</code> 间接化 ×26）</td></tr>
+<tr><td>19</td><td>auto_route 显式 net-label / 真质心</td><td><span class="pill b-part">PARTIAL</span></td><td class="flag">✗</td><td><span class="pill b-skip">跳过</span> 高价值部分（<code>pin_pairs_override</code>）已实现</td></tr>
+</tbody>
+</table>
+
+<h2>3. 方法：TDD + 对抗性测试 review</h2>
+<p>严格遵循用户要求的流程，对每个修复：</p>
+<ol>
+<li><b>RED</b>：先写真实对抗测试，确认在修复前<b>失败</b>（断言真实行为，不做关键词匹配/硬编码预期值）。</li>
+<li><b>对抗 review</b>：5 个 subagent 并行审查每个测试是否弱测试（关键词匹配、硬编码、可被平凡实现骗过、tautology、断言字符串字面量、环境依赖 skip）。结果：<b>3 strong / 2 acceptable，无 weak，无可被平凡实现骗过</b>。按建议加固了 2 个 acceptable（如 core_bbox 的 valid 测试原本是 no-op clip、registry 正则可能空集假通过）。</li>
+<li><b>GREEN</b>：实现修复，确认测试通过 + 现有套件无回归。</li>
+<li><b>真实 MCP 验证</b>：通过 host KLayout 真实 MCP 协议端到端再验一遍（期间又抓出 2 个真实 bug：<code>.lym</code> 没透传 <code>routing_grid</code>、<code>describe_checks</code> 分支返回 dict 而非 json 字符串）。</li>
+</ol>
+
+<h2>4. 已实现的修复（10 项）</h2>
+
+<h3>#2 — solidity 详情指标反转 <span class="tag">tools/evaluate_worker.py</span></h3>
+<p><code>_prim_solidity</code> 原返回裸 float；direction=below 时 score=(1−solidity)，再被通用格式化器标成 <code>solidity: 0.60</code>，让 raw solidity 0.40 的合格凹形 mesa 读起来像不合格。改为返回 dict，detail 同时给出 <b>raw solidity</b> 与归一化 score，并把 <code>raw_solidity</code> 提升到 check 结果。</p>
+<pre>detail: "solidity raw=0.4012 threshold=0.90 direction=below -> pass score=0.5988"
+extra:  {"raw_solidity": 0.4012, "threshold": 0.9, "direction": "below", "passed": true}</pre>
+
+<h3>#3 — auto_route 网格裁剪到 pin 子区域 + cell 数守卫 <span class="tag">tools/route_worker.py</span></h3>
+<ul>
+<li>路由窗口从「整个 <code>cell.bbox()</code> + margin」改为「全部 pin 区域并集 + 30% 对角 slack」，clamp 到 cell（只会变小，已 fit 的布局路由结果不变）。</li>
+<li>新增<b>硬性 cell 数守卫</b>（25M 上限）：超限自动粗化 <code>map_resolution</code>，避免 numpy 被 SIGKILL（exit -9/137）。</li>
+<li>新增可选 <code>routing_bbox</code> 参数；返回新增 <code>routing_grid {rows,cols,cells,window_um}</code>（可观测，便于 agent 与测试）。</li>
+</ul>
+
+<h3>#7 — 未知 arg 拒绝 + describe_checks + 扩展 layer_map 校验 <span class="tag">plugin/klayoutclaw_server.lym</span></h3>
+<ul>
+<li>新增 <code>_allowed_args</code> 表（已交叉验证为 worker 实际读取 args 的<b>超集</b>，不会误拒合法调用）；未知 arg key 现在抛<b>可操作报错</b>而非静默忽略。</li>
+<li>新增 <code>describe_checks</code> 模式：返回 <code>{primitives, required_args, allowed_args, layer_ref_args}</code>，schema 可自描述。</li>
+<li>把 layer_map 引用校验扩展到 <code>materials/bulk_region/graphene/graphite/classes</code>（typo 原本静默 0.0，现报错）。</li>
+</ul>
+
+<h3>#16 — planner CLI 模板对齐脚本 argparse <span class="tag">agent/src/tools/klayout/nanodevice.ts</span></h3>
+<p>数据驱动测试（解析每个脚本 argparse 对比命令）揪出 <b>10 处</b>错误模板（远超 triage 列的 3 例）：image 作位置参数、footprint 缺 <code>--source/--target/--bottom</code>、transform 用了不存在的 <code>--detect-dir</code>、sweep/refine/top_hbn/ecc_register/overlay 缺多个 required flag。全部修正为与 argparse 一致。</p>
+
+<h3>其余 6 项</h3>
+<table>
+<thead><tr><th>#</th><th>修复</th><th>文件</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>registry set-equality 守卫单测（防 .lym↔worker↔_required_args 三表漂移）</td><td><code>tests/test_qb_opus48_fixes.py</code></td></tr>
+<tr><td>8</td><td>auto_map_resolution 增加 pitch floor <code>min(edge/3, pitch/2)</code>（opt-in，不动默认）</td><td><code>tools/route_worker.py</code></td></tr>
+<tr><td>9</td><td><code>core_bbox</code> 类型+形状守卫：bool/短列表/非数值 → 清晰报错而非 <code>bool has no len()</code></td><td><code>tools/evaluate_worker.py</code></td></tr>
+<tr><td>14</td><td><code>route_inspect</code> 默认 tolerance 5→15，对齐 connectivity/route_endpoints</td><td><code>plugin/klayoutclaw_server.lym</code></td></tr>
+<tr><td>17</td><td>client tool timeout 300/600s → 960s（≥ server evaluate_design 900s 上限）</td><td><code>agent/src/mcp/klayout-client.ts</code>, <code>config.ts</code></td></tr>
+<tr><td>18</td><td>26 处 <code>conda run -n instrMCPdev python</code> → <code>${PYTHON_PATH:-…}</code>（保留 conda 默认，允许覆盖）</td><td>4 × <code>SKILL.md</code></td></tr>
+</tbody>
+</table>
+
+<h2>5. 测试结果</h2>
+<div class="grid">
+  <div class="stat"><div class="n done">18</div><div class="l">qb 修复单测（确定性）</div></div>
+  <div class="stat"><div class="n done">6</div><div class="l">qb live MCP（真实 server）</div></div>
+  <div class="stat"><div class="n done">11</div><div class="l">test_phase1_mcp（重写 stale→当前 API，live）</div></div>
+  <div class="stat"><div class="n done">43</div><div class="l">route_worker/worker 回归</div></div>
+  <div class="stat"><div class="n done">115</div><div class="l">agent 单测（config-tui+planner）</div></div>
+</div>
+<p>agent 完整单测：<b>1254 passed / 7 skipped / 4 failed</b>。4 个失败<b>全部预先存在或环境性，无一由本轮引入</b>（git 确认未触碰相关文件）：</p>
+<ul class="muted">
+<li>×3 版本/配置断言陈旧：<code>version is 0.4.3</code>（package 已 0.4.4，2 处）+ <code>thinkingLevel=high</code>（默认已 xhigh）。</li>
+<li>×1 <code>test-phase5-vc-mcp</code>：host 的 python 缺 <code>pygit2/libgit2</code>，vc_* 工具未注册（docker <code>klayout-mcp</code> 镜像装了 libgit2，故 docker 下正常）——纯环境问题。</li>
+</ul>
+<p>对抗 review 已识别并清理的<b>弱/stale 测试</b>：<code>test_phase1_mcp.py</code> 中引用已移除的 <code>mode="drc"/"score"</code> API 的 15 个测试（已重写为当前 <code>checks/layer_map</code> API 的 live 测试）。</p>
+
+<h2>6. 真实 E2E 验证（host KLayout MCP，非 docker）</h2>
+<p class="muted">按用户指示<b>不重建重型 docker 镜像</b>；用 <code>install.py</code> 把当前 <code>.lym</code>/worker 装入 host KLayout，本地 <code>qlaybot</code> CLI（npm-link 到本仓 agent）连 <code>127.0.0.1:8765</code> 跑真实 agent E2E（<code>run_local.py</code>，opus-4-8，bench2 endpoint）。</p>
+<p>两个真实 agent run（均连修复后的 host KLayout MCP；评分用各数据集的 <code>Aligned_Stack.gds</code>，已确认跨变体 md5 一致）：</p>
+<table>
+<thead><tr><th>任务</th><th>修复后（host MCP）</th><th>sweep 基线（旧镜像）</th><th>Δ</th><th>耗时</th><th>退出</th></tr></thead>
+<tbody>
+<tr><td><b>e2e/ml04</b>（全流程）</td><td class="done"><b>0.7790</b></td><td>0.317</td><td class="done"><b>+0.462</b>（翻倍多）</td><td>60.7m</td><td class="done">干净</td></tr>
+<tr><td><b>design/ml11</b></td><td class="done"><b>0.9449</b></td><td>0.915</td><td class="done">+0.030</td><td>18.1m</td><td class="done">干净</td></tr>
+</tbody>
+</table>
+<p><b>e2e/ml04 跳幅的机制解释</b>（非偶然）：旧镜像里 <code>route_material_compat</code> 一被调用就抛 <code>unknown primitive</code> 并 <b>abort 整个 evaluate_design batch</b>，agent 失去全部 DRC/metric 自评反馈，在路由/材料决策上"盲飞"。修复后，agent 在这次 run 里成功调用 <code>route_material_compat</code> <b>×15</b> + <code>evaluate_design</code> ×9 来检测并修正短路/材料问题 → 器件质量大幅提升。</p>
+<div class="grid">
+  <div class="stat"><div class="n done">×15</div><div class="l">route_material_compat 成功调用（旧镜像下=abort）</div></div>
+  <div class="stat"><div class="n done">×19</div><div class="l">auto_route 调用（0 fetch failed / 0 OOM）</div></div>
+  <div class="stat"><div class="n done">×9</div><div class="l">evaluate_design（0 unknown-primitive abort）</div></div>
+  <div class="stat"><div class="n done">完整</div><div class="l">flake-detect 跑通（refine×33, graphite×15, sweep×13…）</div></div>
+</div>
+<p><b>真实 agent 行为证据</b>（从 <code>transcript.jsonl</code> 提取，opus-4-8 自主选工具）：</p>
+<table>
+<thead><tr><th>信号</th><th>观测</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>修复路径调用</td><td><code>auto_route</code> ×8、<code>evaluate_design</code> ×6、<code>route_inspect</code> ×1</td><td>agent 重度使用了被修复的工具</td></tr>
+<tr><td class="done">"unknown primitive" abort</td><td><b>0 次</b></td><td>sweep #1 头号失败（18/36）在实战中<b>消失</b></td></tr>
+<tr><td class="done">#2 solidity raw</td><td>结果含 <code>raw_solidity</code> / <code>raw=</code></td><td>agent 读到真实 solidity（非反转值）</td></tr>
+<tr><td class="done">#3 routing_grid</td><td>auto_route 返回 <code>routing_grid</code> ×2</td><td>网格裁剪到 pin 子区域生效</td></tr>
+<tr><td class="done">#7 unknown-arg 拒绝</td><td><b>2 次</b>拦下 agent 打错的 arg key</td><td>agent 当场得到可操作报错并自纠（旧行为下会被静默忽略 → 困惑/错分）</td></tr>
+<tr><td class="done">真实 OOM / fetch failed / timeout</td><td><b>0 次</b>（13 个 "OOM" 关键词均为 "zoom" 误匹配）</td><td>无 #3/#17 类失败</td></tr>
+</tbody>
+</table>
+<p class="muted">注：单次运行，且评分用 <code>device_design_ml11</code> 的 <code>Aligned_Stack.gds</code> 参考；分数有 run-to-run 方差，重点在于<b>修复路径端到端跑通、sweep 头号失败不再发生、agent 借新校验自纠</b>，而非追单点分数差。</p>
+
+<h2>7. 未处理项与后续建议</h2>
+<ul>
+<li><b>#8 默认 auto-on</b>：把 <code>auto_map_resolution</code> 默认开启是真正的高频价值点，但会改变路由几何，需在全部 18 个数据集上做 routing-quality E2E 验证后再翻默认（本轮只做了零风险的 opt-in pitch floor）。</li>
+<li><b>#10 GrabCut 退化 fallback</b>、<b>#6 ordered_loop DP 测试空白</b>、<b>#11 toggle_image</b>、<b>#5 region-algebra Tier-1</b>：均为加固/补测试空白，价值中低，建议作为后续 TRD 小批次。</li>
+<li><b>flake-detect 主导误差</b>：反馈分析指出 detect/e2e 的<b>主导误差是材料内容/footprint 选择</b>（auto-pick 抓到反光/过曝伪影、金背栅误判为 graphite），而非几何配准。这是独立于本轮 MCP/eval/routing 修复的较大工作面。</li>
+</ul>
+
+<h2>8. 后续特性：auto_route 自适应两层路由（用户追加需求）</h2>
+<div class="card">
+<b>动机（用户指出 #3 的真实短板）：</b>真实器件里 inner contacts 在中心、bonding pads 在最外围，<code>pin_a ∪ pin_b</code> ≈ 整个 layout，所以 #3 的"裁到 pin 子区域"对真实拓扑是 <b>no-op</b>，单遍网格只能统一粗化、糊掉密集的 inner contacts。正解是<b>自适应两层（inner 细 / outer 粗）</b>：像 <code>route_multiwindow</code> skill，但<b>自动判定样品区域</b>（两组 pin 里 bbox span 小的那组 = 样品）而非写死在中心。决策（用户选）：做进 <code>auto_route</code> MCP 工具（agent 默认就用它，杠杆最大）。</div>
+
+<h3>设计（route() 零改动，复用它跑两遍 — 低风险）</h3>
+<ul>
+<li>新增 <code>two_level</code> 参数 <code>auto</code>(默认)/<code>on</code>/<code>off</code>。<b>auto 仅在</b>"清晰内外分离(≥3x) + 细分辨率铺满全场会超 25M cell(单遍本就 OOM) + ≥3 pin/组 + inner 窗细分辨率能 fit"时触发，否则单遍——<b>对正常布局完全无副作用</b>。</li>
+<li><code>route_two_level</code> orchestrator：检测内外→<code>ordered_loop_match</code> 配对(唯一一次,crossing-free)→每网算边界点(从内窗中心朝 pad 射线∩内窗边)→写临时边界 pin 层→<code>route()</code> pass1(inner,<code>routing_bbox</code>=内窗,细 res,<code>pin_pairs_override</code>)→内层路由写临时障碍层→<code>route()</code> pass2(outer,粗 res,障碍+内层层)→边界 patch→合并返回。</li>
+<li>边界 pin↔net 用<b>坐标精确对账</b>（不赌 shape 迭代顺序==插入顺序）；端点连续性由 route() 既有的"端点对齐 pin 中心"保证 <code>inner[-1]==outer[0]</code>，patch 兜底。</li>
+<li>纯几何/触发逻辑独立成 <code>tools/two_level.py</code>（仅 math，可单测）。</li>
+</ul>
+
+<h3>验证（TDD + 对抗 review + 真实 MCP）</h3>
+<div class="grid">
+  <div class="stat"><div class="n done">28</div><div class="l">two_level 测试（纯函数+编排）</div></div>
+  <div class="stat"><div class="n done">A/D/E</div><div class="l">触发/强制/回退 fixture 全过</div></div>
+  <div class="stat"><div class="n done">live</div><div class="l">真实 MCP 强制 + auto 触发均通过</div></div>
+  <div class="stat"><div class="n done">0</div><div class="l">单遍回归（route() 零改动）</div></div>
+</div>
+<div class="card" style="border-color:var(--warn)">
+<b>🔬 对抗 review 抓到并修复了 2 个真实 orchestrator bug</b>（3 个 subagent 审查测试弱点 + 代码正确性）：
+<ul>
+<li><span class="flag">CRITICAL</span>：两个 pad 近共线于窗口中心时 round 到<b>同一边界点</b> → <code>jk</code> 重复 → net k 的 contact 连到 net j 的 pad（<b>静默错配</b>，还可能报 success）。修复：<code>jk</code> 注入性守卫，坍缩则回退单遍 + 回归测试。</li>
+<li><span class="flag">HIGH</span>：某网只在一遍布通时，孤立线段 + 悬空 patch 仍被插入（浮空走线，比单遍还糟）。修复：只保留<b>两遍都成功</b>的网（inner∩outer），孤儿段与对应 patch 一并丢弃 + 回归测试（紧密 8-contact 簇 + 关 rescue 造真 partial）。</li>
+<li>MINOR：异常安全的 temp 清理（try/finally）；scratch 层改为<b>自动选空闲层</b>（不再硬编码 9001/9002，避免撞用户几何）；dispatch 加异常兜底（任何两层失败都回退单遍，绝不破坏已验证的单遍路径）。</li>
+</ul>
+弱测试也按建议加固：补 <code>s==1.0</code>/等-span/coords_span 高瘦/sep 恰好 3x 边界用例；新增 <b>off==单遍字节相等</b>（真正的向后兼容证明，而非"没触发"）；Fixture A 加"无孤儿/patch==routed"不变量。最终 5 份 review 无 weak、无可被平凡实现骗过。</div>
+<p><b>真实 MCP auto 触发证据</b>（4mm 场，<code>two_level="auto"</code> 未强制）：自动判定触发，reason=<code>full-fine=126M &gt; cap</code>（单网格会 OOM），拆成 <b>inner 50×50=2500 格（±16.67µm 细窗）</b> + <b>outer 粗网格（覆盖全 8mm 场）</b>，放 6 个边界 patch。价值证明测试：同一大场上单遍被迫粗化的 res &gt; 两层 inner res（严格更细）——这正是"两层在真实拓扑保住 inner 精度"的直接证据。</p>
+<p class="muted">说明：两层 <code>auto</code> 只在"细分辨率铺满全场会 OOM"时触发，标准 benchmark 器件场不够大时不会自然触发（保持单遍），所以未跑 60 分钟 agent E2E 去验它——那不会触发本特性；改用确定性 Fixture + 真实 MCP auto/forced 直接验证。它替代的是反馈 #3（10/36）里 auto_route 因 OOM/超时<b>零产出</b>的失败：现在改为内细外粗两遍，partial 也远胜 0。</p>
+
+<div class="hr"></div>
+<p class="muted">附：qb-opus48 修复改动 11 个源文件（<code>+289/−80</code>）+ 3 个测试文件；two-level 特性新增 <code>tools/two_level.py</code> + orchestrator + <code>.lym</code> 接线 + <code>tests/test_two_level_routing.py</code>（21 测试）。详见 <code>git diff</code> 与 <code>agent/plans/qb-opus48-work/</code>。</p>
+
+</div>
+</body>
+</html>
