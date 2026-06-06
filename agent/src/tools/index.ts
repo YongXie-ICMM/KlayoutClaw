@@ -294,6 +294,7 @@ export function assembleTools(opts: any): any {
         defaultModel: opts.defaultModel,
         defaultThinkingLevel: opts.defaultThinkingLevel,
         modelRegistry: opts.modelRegistry,
+        providers: opts.config.models?.providers ?? {},
       });
       const delegateTool = createDelegateTool(runner, subagentConfig, planManager);
       toolMap[delegateTool.name] = delegateTool;

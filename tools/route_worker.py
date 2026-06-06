@@ -47,6 +47,9 @@ import klayout.db as kdb
 # Ordered-loop module is co-located.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ordered_loop import ordered_loop_match  # noqa: E402
+from two_level import (  # noqa: E402
+    detect_inner_outer, compute_boundary_point, should_two_level,
+    coords_span, DEFAULT_MAX_GRID_CELLS)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +293,22 @@ def find_path_to_existing(cost, start_rc, existing_path_grid):
 def route(config: dict) -> dict:
     errors: list[str] = []
 
+    # --- Adaptive two-level dispatch ---------------------------------------
+    # When the two pin groups span the whole layout (inner contacts clustered
+    # at centre, bonding pads on the perimeter) a single fine grid OOMs. If
+    # auto-detected as that topology, route in two passes (inner fine / outer
+    # coarse) joined by boundary patches — reusing this same route() unchanged
+    # for each pass. Returns None to fall through to single-pass.
+    if config.get("two_level", "auto") != "off" and not config.get("_tl_subpass"):
+        try:
+            _tl = route_two_level(config)
+        except Exception as _e:
+            # Never let a two-level orchestration failure break routing — fall
+            # back to the proven single-pass engine on the original config.
+            _tl = None
+        if _tl is not None:
+            return _tl
+
     # --- Parse config ---
     gds_path = config["gds_path"]
     cell_name = config.get("cell_name", "TOP")
@@ -406,9 +425,33 @@ def route(config: dict) -> dict:
         bb_a = extract_pin_bboxes(cell, layout, la, da)
         bb_b = extract_pin_bboxes(cell, layout, lb, db)
         m = min_pin_edge_um(bb_a, bb_b, dbu)
+        # Contact PITCH: nearest-neighbour distance between pin centres. The grid
+        # must resolve the gap between adjacent contacts (map_resolution <=
+        # pitch/2) or a tight fan-out grid-snaps into false crossings (issue #8).
+        # For well-separated square markers edge/3 already satisfies this, but the
+        # pitch floor handles large/overlapping/irregular markers where edge/3
+        # would otherwise be coarser than half the contact spacing.
+        pitch_um = None
+        all_pins = pins_a + pins_b
+        for ip in range(len(all_pins)):
+            for jp in range(ip + 1, len(all_pins)):
+                d = math.hypot(all_pins[ip][0] - all_pins[jp][0],
+                               all_pins[ip][1] - all_pins[jp][1]) * dbu
+                if d > 0 and (pitch_um is None or d < pitch_um):
+                    pitch_um = d
+        candidates = []
         if m is not None and m > 0:
-            chosen = max(0.2, min(5.0, round(m / 3.0, 1)))
-            auto_map_note = f"auto_map_resolution: min_pin_edge_um={m:.2f}, map_resolution_um set to {chosen}"
+            candidates.append(m / 3.0)
+        if pitch_um is not None and pitch_um > 0:
+            candidates.append(pitch_um / 2.0)
+        if candidates:
+            chosen = max(0.2, min(5.0, round(min(candidates), 1)))
+            auto_map_note = (
+                "auto_map_resolution: min_pin_edge_um={}, pitch_um={}, "
+                "map_resolution_um set to {}".format(
+                    "{:.2f}".format(m) if m else "n/a",
+                    "{:.2f}".format(pitch_um) if pitch_um else "n/a",
+                    chosen))
             map_res_um = chosen
 
     resolution_dbu = int(round(map_res_um / dbu))
@@ -669,11 +712,73 @@ def route(config: dict) -> dict:
     pin_b_clear = [pin_clearance_region(px, py) for (px, py) in pins_b]
     # No global pin_exclusion — keep obs_region full.
 
-    # Cell bbox routing window
+    # ---------------------------------------------------------------------
+    # Routing window: crop the cost grid to the PIN sub-region (+ detour
+    # slack), clamped to the cell — NOT the whole cell.bbox(). Gridding the
+    # full cell made fine map_resolution OOM-kill (exit -9/137) or time out
+    # when pads sat on a far perimeter or unrelated geometry inflated the
+    # cell bbox. The window can only SHRINK vs the legacy full-cell window,
+    # so layouts that already fit route identically.
+    # ---------------------------------------------------------------------
     cell_bbox = cell.bbox()
     margin = max(obs_safe_dbu, resolution_dbu * 10)
-    bbox = kdb.Box(cell_bbox.left - margin, cell_bbox.bottom - margin,
-                   cell_bbox.right + margin, cell_bbox.top + margin)
+    cell_win = kdb.Box(cell_bbox.left - margin, cell_bbox.bottom - margin,
+                       cell_bbox.right + margin, cell_bbox.top + margin)
+
+    routing_bbox_um = config.get("routing_bbox")  # optional [x1,y1,x2,y2] um
+    if routing_bbox_um is not None and len(routing_bbox_um) == 4:
+        rx1, ry1, rx2, ry2 = routing_bbox_um
+        win = kdb.Box(int(round(min(rx1, rx2) / dbu)),
+                      int(round(min(ry1, ry2) / dbu)),
+                      int(round(max(rx1, rx2) / dbu)),
+                      int(round(max(ry1, ry2) / dbu)))
+        bbox = kdb.Box(win.left - margin, win.bottom - margin,
+                       win.right + margin, win.top + margin)
+    else:
+        pin_union = kdb.Region()
+        for r in (pin_regions_a + pin_regions_b):
+            pin_union.insert(r)
+        pin_union.merge()
+        if pin_union.is_empty():
+            pb = cell_bbox
+        else:
+            pb = pin_union.bbox()
+        span_diag = math.hypot(pb.width(), pb.height())
+        win_margin = max(margin, int(0.30 * span_diag))  # detour slack
+        bbox = kdb.Box(pb.left - win_margin, pb.bottom - win_margin,
+                       pb.right + win_margin, pb.top + win_margin)
+
+    # Clamp so the window never exceeds the legacy full-cell+margin window.
+    bbox = bbox & cell_win
+    if bbox.empty():
+        bbox = cell_win
+
+    # Hard grid-cell-count guard: auto-coarsen resolution before numpy OOM.
+    MAX_GRID_CELLS = 25_000_000
+
+    def _grid_dims(res):
+        nc = max(1, (bbox.width() + res - 1) // res)
+        nr = max(1, (bbox.height() + res - 1) // res)
+        return int(nc), int(nr)
+
+    ncols_w, nrows_w = _grid_dims(resolution_dbu)
+    if ncols_w * nrows_w > MAX_GRID_CELLS:
+        scale = math.sqrt((ncols_w * nrows_w) / float(MAX_GRID_CELLS))
+        resolution_dbu = max(1, int(math.ceil(resolution_dbu * scale)))
+        map_res_um = resolution_dbu * dbu
+        ncols_w, nrows_w = _grid_dims(resolution_dbu)
+        _guard_note = ("auto_map_resolution: routing grid exceeded {} cells; "
+                       "map_resolution coarsened to {:.3f} um to avoid OOM"
+                       ).format(MAX_GRID_CELLS, map_res_um)
+        auto_map_note = (auto_map_note + "; " + _guard_note
+                         if auto_map_note else _guard_note)
+
+    routing_grid_info = {
+        "rows": int(nrows_w), "cols": int(ncols_w),
+        "cells": int(ncols_w * nrows_w),
+        "window_um": [round(bbox.left * dbu, 3), round(bbox.bottom * dbu, 3),
+                      round(bbox.right * dbu, 3), round(bbox.top * dbu, 3)],
+    }
 
     obs_grid = rasterize_region_kdb(obs_region, bbox, resolution_dbu)
     cost = build_cost_grid_graduated(
@@ -738,6 +843,7 @@ def route(config: dict) -> dict:
             "errors": notes,
             "assignment_engine": assignment_engine,
             "map_resolution_um_used": map_res_um,
+            "routing_grid": routing_grid_info,
         }
 
     # Validate per_pair_obs_layers length when supplied.
@@ -1003,6 +1109,7 @@ def route(config: dict) -> dict:
         "assignment_engine": assignment_engine,
         "n_nets": len(nets),
         "rescued_nets": rescued_nets,
+        "routing_grid": routing_grid_info,
     }
     if rescued_nets > 0:
         # Informational only — does NOT flip status to partial. These nets DID
@@ -1013,6 +1120,303 @@ def route(config: dict) -> dict:
             "stayed hard). Verify with route_inspect / contact_isolation that "
             "no crossings were introduced.".format(rescued_nets))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Adaptive two-level (inner-fine / outer-coarse) orchestration
+# ---------------------------------------------------------------------------
+
+def _min_pitch_dbu(coords):
+    """Nearest-neighbour distance (dbu) among a list of (x,y) coords, or None."""
+    best = None
+    n = len(coords)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = math.hypot(coords[i][0] - coords[j][0], coords[i][1] - coords[j][1])
+            if d > 0 and (best is None or d < best):
+                best = d
+    return best
+
+
+def route_two_level(config: dict):
+    """Adaptive two-pass routing. Returns a merged result dict when two-level
+    fires, or None to fall back to single-pass route(). Reuses route() unchanged
+    for each pass (with two_level='off', _tl_subpass=True).
+
+    Pass 1 routes the inner (sample) contacts to per-net boundary points on the
+    inner-window edge at FINE resolution; pass 2 routes those boundary points to
+    the outer (perimeter) pads at COARSE resolution, with the inner routes added
+    as an obstacle layer. A small patch at each boundary point bridges the two
+    write fields on the output layer.
+    """
+    mode = config.get("two_level", "auto")
+    if mode == "off":
+        return None
+    # per-pair obstacle layers use a flat cross-net accumulator incompatible
+    # with the two-pass split — fall back to single-pass.
+    if config.get("per_pair_obstacle_layers"):
+        return None
+
+    dbu = config.get("dbu", 0.001)
+    cell_name = config.get("cell_name", "TOP")
+    gds_path = config["gds_path"]
+    la, da = parse_layer(config["pin_layer_a"])
+    lb, db = parse_layer(config["pin_layer_b"])
+
+    layout = kdb.Layout()
+    layout.read(gds_path)
+    layout.dbu = dbu
+    cell = None
+    for ci in range(layout.cells()):
+        c = layout.cell(ci)
+        if c.name == cell_name:
+            cell = c
+            break
+    if cell is None:
+        cell = layout.top_cell()
+    if cell is None:
+        return None
+
+    pins_a = extract_pin_centers(cell, layout, la, da)
+    pins_b = extract_pin_centers(cell, layout, lb, db)
+    if len(pins_a) < 3 or len(pins_b) < 3:
+        return None
+    side = detect_inner_outer(pins_a, pins_b)
+    if side is None:
+        return None
+    if side == "a":
+        inner_layer, inner_pins, inner_ld = config["pin_layer_a"], pins_a, (la, da)
+        outer_layer, outer_pins = config["pin_layer_b"], pins_b
+    else:
+        inner_layer, inner_pins, inner_ld = config["pin_layer_b"], pins_b, (lb, db)
+        outer_layer, outer_pins = config["pin_layer_a"], pins_a
+
+    # Inner window from the inner pin bounding boxes, centred on their centroid.
+    inner_bbs = extract_pin_bboxes(cell, layout, inner_ld[0], inner_ld[1])
+    il = min(b[0] for b in inner_bbs)
+    ib = min(b[1] for b in inner_bbs)
+    ir = max(b[2] for b in inner_bbs)
+    it = max(b[3] for b in inner_bbs)
+    cx, cy = (il + ir) // 2, (ib + it) // 2
+    inner_w, inner_h = ir - il, it - ib
+
+    pitch_dbu = _min_pitch_dbu(inner_pins) or max(inner_w, inner_h, 1)
+    inner_margin_um = config.get("inner_margin")
+    if inner_margin_um is not None:
+        margin_dbu = int(round(inner_margin_um / dbu))
+    else:
+        margin_dbu = max(int(2 * pitch_dbu), int(0.15 * max(inner_w, inner_h)))
+    Hx = inner_w // 2 + margin_dbu
+    Hy = inner_h // 2 + margin_dbu
+    # Clamp half-extents so the window stays inside the cell, centred on (cx,cy).
+    cellbb = cell.bbox()
+    Hx = max(1, min(Hx, cx - cellbb.left, cellbb.right - cx))
+    Hy = max(1, min(Hy, cy - cellbb.bottom, cellbb.top - cy))
+    win = kdb.Box(cx - Hx, cy - Hy, cx + Hx, cy + Hy)
+
+    # Resolutions: inner fine from contact pitch/edge; outer coarse from config.
+    _edges = [min(b[2] - b[0], b[3] - b[1]) for b in inner_bbs
+              if min(b[2] - b[0], b[3] - b[1]) > 0]
+    edge_um = (min(_edges) * dbu) if _edges else None
+    pitch_um = pitch_dbu * dbu
+    fine_candidates = [pitch_um / 2.0]
+    if edge_um and edge_um > 0:
+        fine_candidates.append(edge_um / 3.0)
+    fine_res_um = max(0.2, min(5.0, round(min(fine_candidates), 3)))
+    coarse_res_um = float(config.get("map_resolution_um", 2.0))
+    fine_res_dbu = int(round(fine_res_um / dbu))
+    coarse_res_dbu = int(round(coarse_res_um / dbu))
+
+    _, outer_span = coords_span(outer_pins)
+    ok, reason = should_two_level(
+        len(inner_pins), len(outer_pins),
+        inner_span_dbu=max(inner_w, inner_h), outer_span_dbu=outer_span,
+        full_w_dbu=cellbb.width(), full_h_dbu=cellbb.height(),
+        inner_w_dbu=2 * Hx, inner_h_dbu=2 * Hy,
+        fine_res_dbu=fine_res_dbu, coarse_res_dbu=coarse_res_dbu,
+        max_cells=DEFAULT_MAX_GRID_CELLS)
+    if mode == "auto" and not ok:
+        return None
+
+    # Pairing: ordered_loop_match requires the smaller-count set first.
+    if len(inner_pins) <= len(outer_pins):
+        assign, _ = ordered_loop_match(inner_pins, outer_pins)
+        pairs = [(ii, oo) for (ii, oo) in assign]            # (inner_idx, outer_idx)
+    else:
+        assign, _ = ordered_loop_match(outer_pins, inner_pins)
+        pairs = [(ii, oo) for (oo, ii) in assign]            # remap to (inner, outer)
+    if not pairs:
+        return None
+
+    # Boundary point per net (ray from window centre toward the outer pin).
+    boundary = []
+    for (ii, oo) in pairs:
+        px, py = outer_pins[oo]
+        bp = compute_boundary_point(cx, cy, Hx, Hy, px, py)
+        if bp is None:
+            return None  # pad inside window / degenerate -> single-pass fallback
+        boundary.append(bp)
+
+    # Pick scratch layer numbers that the layout does NOT already use, so we
+    # never clobber the caller's geometry / obstacle / pin layers.
+    _used = set()
+    for _li in layout.layer_indices():
+        _info = layout.get_info(_li)
+        _used.add((_info.layer, _info.datatype))
+
+    def _free_layer(start):
+        n = start
+        while (n, 0) in _used:
+            n += 1
+        _used.add((n, 0))
+        return n
+    bnd_ln = _free_layer(9001)
+    obs_ln = _free_layer(9002)
+    bnd_spec = "{}/0".format(bnd_ln)
+    obs_spec = "{}/0".format(obs_ln)
+
+    # Write boundary-pin markers on the scratch layer; save a temp GDS for pass 1.
+    bnd_idx = layout.layer(bnd_ln, 0)
+    cell.shapes(bnd_idx).clear()
+    pin_s = max(fine_res_dbu * 2, int(round(2.0 / dbu)))
+    for (bx, by) in boundary:
+        cell.shapes(bnd_idx).insert(
+            kdb.Box(bx - pin_s // 2, by - pin_s // 2, bx + pin_s // 2, by + pin_s // 2))
+
+    # Map each net to the boundary pin's ITERATION index (shape iteration order
+    # need not equal insertion order, and route() reads pins by iteration order)
+    # so pin_pairs_override references the correct boundary pin in both passes.
+    bnd_centers = extract_pin_centers(cell, layout, bnd_ln, 0)
+
+    def _bnd_index(coord):
+        for j, c in enumerate(bnd_centers):
+            if abs(c[0] - coord[0]) <= 1 and abs(c[1] - coord[1]) <= 1:
+                return j
+        return None
+    jk = [_bnd_index(boundary[k]) for k in range(len(boundary))]
+    if any(j is None for j in jk):
+        return None  # boundary pin lookup failed -> single-pass fallback
+    # Injectivity guard: two outer pads nearly collinear with the window centre
+    # round to the SAME boundary point, which would wire net k's contact to net
+    # j's pad (silent mis-route). If the net->marker map is not 1:1, bail to
+    # single-pass rather than emit scrambled topology.
+    if len(set(jk)) != len(jk):
+        return None
+
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="route_two_level_")
+
+    inner_width_um = float(config.get("inner_width", config.get("path_width_um", 1.0)))
+    outer_width_um = float(config.get("outer_width", config.get("path_width_um", 2.0)))
+
+    def _subcfg(**over):
+        c = dict(config)
+        c["two_level"] = "off"
+        c["_tl_subpass"] = True
+        c["output_path"] = None
+        c["per_pair_obstacle_layers"] = None
+        c.pop("routing_bbox", None)
+        c.update(over)
+        return c
+
+    try:
+        tmp1 = os.path.join(tmp_dir, "pass1.gds")
+        layout.write(tmp1)
+        pass1 = _subcfg(
+            gds_path=tmp1, pin_layer_a=inner_layer, pin_layer_b=bnd_spec,
+            map_resolution_um=fine_res_um, auto_map_resolution=False,
+            path_width_um=inner_width_um,
+            routing_bbox=[win.left * dbu, win.bottom * dbu, win.right * dbu, win.top * dbu],
+            pin_pairs_override=[[pairs[k][0], jk[k]] for k in range(len(pairs))],
+        )
+        inner_res = route(pass1)
+        inner_paths = inner_res.get("paths", [])
+
+        # Write the inner routes as an obstacle layer; save a temp GDS for pass 2.
+        obs_idx = layout.layer(obs_ln, 0)
+        cell.shapes(obs_idx).clear()
+        iw_dbu = max(1, int(round(inner_width_um / dbu)))
+        for p in inner_paths:
+            pts = [kdb.Point(int(round(x)), int(round(y))) for x, y in p["points_dbu"]]
+            if len(pts) >= 2:
+                cell.shapes(obs_idx).insert(kdb.Path(pts, iw_dbu))
+        tmp2 = os.path.join(tmp_dir, "pass2.gds")
+        layout.write(tmp2)
+
+        obstacles2 = list(config.get("obstacle_layers", [])) + [obs_spec]
+        pass2 = _subcfg(
+            gds_path=tmp2, pin_layer_a=bnd_spec, pin_layer_b=outer_layer,
+            obstacle_layers=obstacles2,
+            map_resolution_um=coarse_res_um, auto_map_resolution=False,
+            path_width_um=outer_width_um,
+            pin_pairs_override=[[jk[k], pairs[k][1]] for k in range(len(pairs))],
+        )
+        outer_res = route(pass2)
+        outer_paths = outer_res.get("paths", [])
+    finally:
+        # Exception-safe temp cleanup.
+        try:
+            for _f in os.listdir(tmp_dir):
+                os.remove(os.path.join(tmp_dir, _f))
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+    # Keep ONLY nets that routed in BOTH passes — drop orphan single-pass
+    # segments (and below, their patches) so we never insert a floating trace
+    # or a patch connected on only one side. Dropped nets are reported via the
+    # partial status; that is strictly better than dangling geometry.
+    inner_nets = {p["net_id"] for p in inner_paths}
+    outer_nets = {p["net_id"] for p in outer_paths}
+    routed_set = inner_nets & outer_nets
+    inner_paths = [p for p in inner_paths if p["net_id"] in routed_set]
+    outer_paths = [p for p in outer_paths if p["net_id"] in routed_set]
+
+    # Boundary patches: large enough to bridge fine/coarse grid snap + widths.
+    # Only for fully-routed nets (patch k corresponds to net k).
+    fine_used_dbu = int(round(inner_res.get("map_resolution_um_used", fine_res_um) / dbu))
+    coarse_used_dbu = int(round(outer_res.get("map_resolution_um_used", coarse_res_um) / dbu))
+    user_patch_dbu = int(round(float(config.get("patch_size", 0.0)) / dbu))
+    patch_dbu = max(user_patch_dbu,
+                    int(round(outer_width_um / dbu)) + 2 * coarse_used_dbu,
+                    int(round(inner_width_um / dbu)) + 2 * fine_used_dbu)
+    patches = [{"x_dbu": boundary[k][0], "y_dbu": boundary[k][1], "size_dbu": patch_dbu}
+               for k in range(len(boundary)) if k in routed_set]
+
+    # Tag each path with its write-field width so the inserter uses inner vs
+    # outer line width (a single output_layer carries both).
+    for p in inner_paths:
+        p["width_um"] = inner_width_um
+    for p in outer_paths:
+        p["width_um"] = outer_width_um
+
+    nets_routed = len(routed_set)
+    errors = list(inner_res.get("errors", [])) + list(outer_res.get("errors", []))
+    info_only = all(n.startswith("auto_map_resolution") for n in errors)
+    status = "success" if (nets_routed == len(pairs) and (not errors or info_only)) else "partial"
+
+    return {
+        "status": status,
+        "two_level": True,
+        "two_level_reason": reason if mode == "auto" else "forced on",
+        "routed_pairs": nets_routed,
+        "inner_routed": len(inner_paths),
+        "outer_routed": len(outer_paths),
+        "total_pins_a": len(pins_a),
+        "total_pins_b": len(pins_b),
+        "n_nets": len(pairs),
+        "paths": inner_paths + outer_paths,
+        "patches": patches,
+        "inner_grid": inner_res.get("routing_grid"),
+        "outer_grid": outer_res.get("routing_grid"),
+        "map_resolution_um_used": {
+            "inner": inner_res.get("map_resolution_um_used"),
+            "outer": outer_res.get("map_resolution_um_used"),
+        },
+        "assignment_engine": "two_level",
+        "boundary_points_um": [[round(bx * dbu, 4), round(by * dbu, 4)] for bx, by in boundary],
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------

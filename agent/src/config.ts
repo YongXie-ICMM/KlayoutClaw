@@ -32,6 +32,13 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   api: string;
+  /**
+   * Optional per-provider HTTP headers. Overrides the default neutral
+   * User-Agent (see DEFAULT_USER_AGENT / applyModelHeaders). Use this to send
+   * a specific User-Agent (or extra headers) for a provider whose endpoint sits
+   * behind a Cloudflare bot rule that filters on SDK User-Agents.
+   */
+  headers?: Record<string, string>;
   models: ModelConfig[];
 }
 
@@ -229,7 +236,10 @@ function defaultConfig(): QlayBotConfig {
     },
     mcpTimeouts: {
       requestMs: 5000,
-      toolExecutionMs: 300000,
+      // >= the server's largest subprocess clamp (evaluate_design 900s) so the
+      // client never aborts a long route/eval the server is still running and
+      // misreports it as "fetch failed" (feedback issue #17).
+      toolExecutionMs: 960000,
       healthCheckMs: 5000,
       autoLaunchDelaysMs: [1000, 2000, 4000, 8000],
     },
@@ -444,6 +454,39 @@ export function saveSettingsConfig(config: QlayBotConfig, configDir?: string): v
     autoApprovePlans: config.autoApprovePlans,
   };
   writeFileSync(join(cfgDir, "settings.json"), JSON.stringify(data, null, 2));
+}
+
+/**
+ * Neutral default User-Agent applied to every resolved model.
+ *
+ * The pi-ai OpenAI/Anthropic JS SDKs otherwise send `OpenAI/JS <v>` /
+ * `Anthropic/JS <v>`, which Cloudflare bot rules on some provider endpoints
+ * block with an instant 403 (surfacing as an empty agent response). Overriding
+ * the UA on `Model.headers` — read by every pi-ai provider as `defaultHeaders`
+ * — defeats that block uniformly. Overridable per provider via
+ * ProviderConfig.headers. See qdevbot's
+ * docs/troubleshooting/cloudflare-403-provider-user-agent.md.
+ */
+export const DEFAULT_USER_AGENT = "qlaybot/0.4 (+pi-agent)";
+
+/**
+ * Apply the default User-Agent (plus any per-provider header overrides) to a
+ * resolved pi-ai Model. pi-ai's providers read `Model.headers` and merge it into
+ * the request `defaultHeaders`, so this is the single point that overrides the
+ * SDK User-Agent fingerprint for every provider/api type.
+ *
+ * Non-mutating: returns a new object so the registry's cached Model is never
+ * altered. Provider headers win over the default UA; pi-ai stream-option headers
+ * still win over both (merged last by the providers).
+ */
+export function applyModelHeaders<T extends { headers?: Record<string, string> }>(
+  model: T,
+  providerHeaders?: Record<string, string>,
+): T {
+  return {
+    ...model,
+    headers: { "User-Agent": DEFAULT_USER_AGENT, ...model.headers, ...providerHeaders },
+  };
 }
 
 /**

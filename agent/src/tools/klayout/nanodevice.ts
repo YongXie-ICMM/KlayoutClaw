@@ -132,22 +132,22 @@ function registerFlakedetectTools(): CodeGenTool[] {
               check: "Verify ≥min-inliers inliers and scale ≈ 1.0. Masks bottom-right scalebar region automatically.",
             },
             "2_source_contour": {
-              command: `python ${scriptsDir}/source_contour.py <top_part_image> --output-dir <out>/align/`,
+              command: `python ${scriptsDir}/source_contour.py --image <top_part_image> --output-dir <out>/align/`,
               when: "Always run if top_part_image provided",
               check: "View output image — contour should trace the full flake outline",
             },
             "3_footprint": {
-              command: `python ${scriptsDir}/footprint.py <full_stack_image> --pixel-size <px> --output-dir <out>/align/`,
+              command: `python ${scriptsDir}/footprint.py --source <top_part_image> --target <full_stack_image> --bottom <bottom_part_image> --source-contour <out>/align/source_contour.npy --source-mask <out>/align/source_mask.png --pixel-size <px> --output-dir <out>/align/`,
               when: "Always run for cross-substrate alignment",
               check: "CRITICAL: View 03_footprint_candidates.png. Default candidate (#1) is often WRONG. May need --candidate-rank 2 or 3",
             },
             "4_sweep": {
-              command: `python ${scriptsDir}/sweep.py --output-dir <out>/align/`,
+              command: `python ${scriptsDir}/sweep.py --source-contour <out>/align/source_contour.npy --source-mask <out>/align/source_mask.png --footprint-contour <out>/align/footprint_contour.npy --footprint-mask <out>/align/footprint_mask.png --target-image <full_stack_image> --pixel-size <px> --output-dir <out>/align/`,
               when: "After footprint",
               check: "View 05_sweep_grid.png and candidate images",
             },
             "5_refine": {
-              command: `python ${scriptsDir}/refine.py --rot-hint <picked_rot> --output-dir <out>/align/`,
+              command: `python ${scriptsDir}/refine.py --source-contour <out>/align/source_contour.npy --source-mask <out>/align/source_mask.png --footprint-contour <out>/align/footprint_contour.npy --footprint-mask <out>/align/footprint_mask.png --target-image <full_stack_image> --rot-hint <picked_rot> --pixel-size <px> --output-dir <out>/align/`,
               when: "After user selects rotation from sweep results",
               check: "fwd_chamfer < 2.5um, IoU > 0.70, top_containment > 0.90, outside_fraction < 0.10",
               important: "MUST run as foreground blocking bash with timeout=1200000 (20 min). DO NOT background this.",
@@ -194,12 +194,12 @@ function registerFlakedetectTools(): CodeGenTool[] {
           read_first: "Read the skill_doc for candidate review workflow and cluster-id override protocol.",
           scripts: {
             graphite: {
-              command: `python ${scriptsDir}/graphite.py <bottom_part_image> --pixel-size <px> --output-dir <out>/detect/`,
+              command: `python ${scriptsDir}/graphite.py --image <bottom_part_image> --pixel-size <px> --output-dir <out>/detect/`,
               check: "View 00_graphite_candidates.png. Graphite is typically 2nd-darkest, not absolute darkest. Override with --cluster-id <N> if auto-selection wrong.",
               look_for: "Coherent dark elongated strip — not scattered edges or fold lines",
             },
             graphene: {
-              command: `python ${scriptsDir}/graphene.py <top_part_image> --pixel-size <px> --output-dir <out>/detect/ ${args.mirror ? "--mirror" : ""}`,
+              command: `python ${scriptsDir}/graphene.py --image <top_part_image> --pixel-size <px> --output-dir <out>/detect/ ${args.mirror ? "--mirror" : ""}`,
               check: "View 00_graphene_candidates.png. Auto-selects brightest. Override with --cluster-id <N> if wrong.",
               look_for: "Bright region within the flake — not artifacts or overexposure",
             },
@@ -208,7 +208,7 @@ function registerFlakedetectTools(): CodeGenTool[] {
               check: "Review 03_bottom_hbn_on_full.png — contour should trace the bottom hBN on full_stack. If offset, check SIFT alignment quality.",
             },
             top_hbn: {
-              command: `python ${scriptsDir}/top_hbn.py --output-dir <out>/detect/ --align-dir <out>/align/`,
+              command: `python ${scriptsDir}/top_hbn.py --footprint-mask <out>/align/footprint_mask.png --footprint-contour <out>/align/footprint_contour.npy --image <full_stack_image> --pixel-size <px> --output-dir <out>/detect/`,
               check: "Copies footprint from align step. Automatic.",
             },
           },
@@ -246,17 +246,17 @@ function registerFlakedetectTools(): CodeGenTool[] {
           read_first: "Read the skill_doc for script arguments and ECC registration details.",
           scripts: {
             "1_ecc_register": {
-              command: `python ${scriptsDir}/ecc_register.py <full_stack_raw> <full_stack_lut> --output-dir <out>/combine/`,
+              command: `python ${scriptsDir}/ecc_register.py --raw <full_stack_raw> --lut <full_stack_lut> --output-dir <out>/combine/`,
               when: "Only if LUT image is available",
               purpose: "Compute translation between raw and LUT images",
             },
             "2_transform": {
-              command: `python ${scriptsDir}/transform.py --align-dir <out>/align/ --detect-dir <out>/detect/ --output-dir <out>/combine/`,
+              command: `python ${scriptsDir}/transform.py --detections <out>/detect/detections.json --align-dir <out>/align/ --image <full_stack_image> --pixel-size <px> --output-dir <out>/combine/`,
               when: "Always",
               purpose: "Transform graphite (invert SIFT), graphene (apply top warp + clip to footprint), pass through hBN",
             },
             "3_overlay": {
-              command: `python ${scriptsDir}/overlay.py --output-dir <out>/combine/ --full-stack <full_stack_image>`,
+              command: `python ${scriptsDir}/overlay.py --traces <out>/combine/traces.json --raw <full_stack_image> --output-dir <out>/combine/`,
               when: "Always",
               purpose: "Draw contours on desaturated image: top_hBN=green, graphene=red, bottom_hBN=blue, graphite=yellow",
             },

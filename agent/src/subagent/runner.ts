@@ -26,6 +26,7 @@ import type {
   ToolEndEvent,
   ToolAnnotation,
 } from "../types/v04-contracts.js";
+import { applyModelHeaders, type ProviderConfig } from "../config.js";
 import { resolveRole } from "./role-resolver.js";
 import { createSubagentTools } from "./tool-factory.js";
 import { buildSubagentPrompt, buildTaskMessage } from "./prompt-builder.js";
@@ -51,6 +52,13 @@ export interface SubagentRunnerDeps {
   defaultThinkingLevel: string;
   /** Model registry — resolves model ID strings to Model<any> objects for Agent construction */
   modelRegistry: ModelRegistry;
+  /**
+   * Provider configs keyed by provider name. Used to apply per-provider header
+   * overrides (e.g. a custom User-Agent) to the resolved subagent model, in
+   * parity with the parent agent. Optional — the default User-Agent is applied
+   * regardless.
+   */
+  providers?: Record<string, ProviderConfig>;
 }
 
 interface RunningSubagent {
@@ -195,10 +203,15 @@ export class SubagentRunner extends EventEmitter {
       return errorResult;
     }
 
+    // Inject the neutral default User-Agent (plus any per-provider override) so
+    // subagent requests carry the same UA as the parent agent — defeating
+    // Cloudflare UA-fingerprint 403s uniformly (see applyModelHeaders).
+    const model = applyModelHeaders(resolvedModel, this.deps.providers?.[provider]?.headers);
+
     // Create the agent + session with proper config (getApiKey, convertToLlm, model)
     const agent = new Agent({
       initialState: {
-        model: resolvedModel,
+        model,
         thinkingLevel,
       },
       convertToLlm,

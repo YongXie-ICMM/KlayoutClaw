@@ -32,6 +32,7 @@ export const unitFiles = [
   "tests/test-plan-reinjection.ts",
   "tests/test-thinking-only.ts",
   "tests/test-issue-36-planner-prefix.ts",
+  "tests/test-nanodevice-planner.ts",
 ];
 
 export const integrationFiles = [

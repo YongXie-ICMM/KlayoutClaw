@@ -632,20 +632,43 @@ def _prim_adjacency(out_lib, ref_lib, layer_map, args):
 
 
 def _prim_solidity(out_lib, ref_lib, layer_map, args):
-    """Score based on shape solidity relative to threshold."""
+    """Score based on shape solidity relative to threshold.
+
+    Returns a dict so the detail field echoes the RAW geometric solidity
+    (area / convex-hull area) AND the normalized pass-score separately.
+    Previously this returned a bare float; for direction="below" the score is
+    (1 - solidity), and the generic formatter then printed that inverted value
+    under a "solidity:" label, misreading a passing concave mesa as a fail.
+    """
     comp = _component_union(out_lib, layer_map, args["component"])
-    if comp.is_empty:
-        return 0.0
-    hull = comp.convex_hull
-    if hull.is_empty or hull.area == 0:
-        return 0.0
-    solidity = comp.area / hull.area
     threshold = args.get("threshold", 0.5)
     direction = args.get("direction", "below")
+    if comp.is_empty:
+        return {"score": 0.0,
+                "detail": "solidity: component empty (no shapes)",
+                "extra": {"raw_solidity": None, "threshold": threshold,
+                          "direction": direction}}
+    hull = comp.convex_hull
+    if hull.is_empty or hull.area == 0:
+        return {"score": 0.0,
+                "detail": "solidity: degenerate convex hull",
+                "extra": {"raw_solidity": None, "threshold": threshold,
+                          "direction": direction}}
+    solidity = comp.area / hull.area
     if direction == "below":
-        return max(0.0, min(1.0, 1.0 - solidity)) if solidity < threshold else 0.0
+        passed = solidity < threshold
+        score = max(0.0, min(1.0, 1.0 - solidity)) if passed else 0.0
     else:
-        return max(0.0, min(1.0, solidity)) if solidity >= threshold else 0.0
+        passed = solidity >= threshold
+        score = max(0.0, min(1.0, solidity)) if passed else 0.0
+    detail = ("solidity raw={:.4f} threshold={:.2f} direction={} "
+              "-> {} score={:.4f}").format(
+                  solidity, threshold, direction,
+                  "pass" if passed else "fail", score)
+    return {"score": score, "detail": detail,
+            "extra": {"raw_solidity": round(solidity, 6),
+                      "threshold": threshold, "direction": direction,
+                      "passed": bool(passed)}}
 
 
 def _prim_spacing(out_lib, ref_lib, layer_map, args):
@@ -699,7 +722,17 @@ def _prim_bulk_containment(out_lib, ref_lib, layer_map, args):
         return 0.0
 
     core_bbox = args.get("core_bbox")
-    if core_bbox is not None and len(core_bbox) == 4:
+    if core_bbox is not None:
+        # Validate shape up front: a bare bool/number/short list used to reach
+        # len()/unpack and raise a cryptic 'object of type bool has no len()'.
+        if (isinstance(core_bbox, bool)
+                or not isinstance(core_bbox, (list, tuple))
+                or len(core_bbox) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       for v in core_bbox)):
+            raise ValueError(
+                "bulk_containment: core_bbox must be [x1, y1, x2, y2] in um "
+                "(four numbers); got {!r}".format(core_bbox))
         x1, y1, x2, y2 = core_bbox
         core = sg.box(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
         comp = comp.intersection(core)

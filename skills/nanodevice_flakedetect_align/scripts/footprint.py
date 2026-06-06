@@ -331,7 +331,13 @@ def enumerate_footprint_candidates(label_map, candidate_ids, source_desc,
             if desc is None:
                 continue
             dist = shape_distance(source_desc, desc, source_contour, contour)
-            results.append((dist, list(subset), contour, merged))
+            results.append((dist, list(subset), contour, merged.copy()))
+            # Bound memory: keep only the top-K candidates by shape distance.
+            # Each stored candidate retains a full-frame uint8 mask (~3 MB),
+            # so thousands of passing subsets would OOM a 4 GB cgroup.
+            if len(results) > 60:
+                results.sort(key=lambda x: x[0])
+                del results[30:]
     results.sort(key=lambda x: x[0])
     return results
 

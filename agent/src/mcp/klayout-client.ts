@@ -23,12 +23,15 @@ const KLAYOUT_PREFIX = "klayout";
 
 /**
  * Default HTTP timeout for tool-invoking calls (execute_script, auto_route,
- * evaluate_design). Matches the evaluate_design subprocess cap on the server
- * side (300s) and the shared Python mcp_client's DEFAULT_TIMEOUT_SECONDS.
+ * evaluate_design). Must stay >= the KLayout server's LARGEST subprocess clamp
+ * (evaluate_design max 900s, auto_route max 600s). A client timeout below the
+ * server cap made long routes/evals surface a spurious "fetch failed" while the
+ * server was still legitimately running and writing a valid result on disk
+ * (feedback issue #17). 960s = 900s server cap + 60s transport margin.
  * Short RPC calls (initialize, listTools, healthCheck) use their own
  * explicit shorter timeouts so connection failures still surface quickly.
  */
-export const DEFAULT_TOOL_TIMEOUT_MS = 300_000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 960_000;
 
 export interface KLayoutClientOptions {
   url: string;

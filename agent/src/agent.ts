@@ -24,6 +24,7 @@ import {
   getWorkspaceDir,
   getMemoryDir,
   resolveModel,
+  applyModelHeaders,
   isInitialized,
   getAllMCPServers,
   type QlayBotConfig,
@@ -163,6 +164,14 @@ export async function createDesignSession(
   const modelRef = opts.model ?? config.agent.defaultModel;
   const resolved = resolveModel(modelRef, config);
   let model = modelRegistry.find(resolved.provider, resolved.model.id);
+
+  // Inject a neutral default User-Agent (overridable per provider) onto the
+  // resolved Model. pi-ai's providers read Model.headers as defaultHeaders, so
+  // this overrides the SDK UA that Cloudflare bot rules 403 on (see
+  // applyModelHeaders / DEFAULT_USER_AGENT).
+  if (model) {
+    model = applyModelHeaders(model, resolved.providerConfig.headers);
+  }
 
   // Ensure auth for the model's provider
   if (model && !authStorage.hasAuth(model.provider)) {

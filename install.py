@@ -21,8 +21,9 @@ def main():
         print(f"Installed: {dst}")
 
     tools_dir = Path(__file__).parent / "tools"
-    # ordered_loop.py is imported by route_worker.py (assignment_engine="ordered_loop").
-    for worker in ["route_worker.py", "evaluate_worker.py", "ordered_loop.py"]:
+    # ordered_loop.py + two_level.py are imported by route_worker.py
+    # (assignment_engine="ordered_loop" / adaptive two-level routing).
+    for worker in ["route_worker.py", "evaluate_worker.py", "ordered_loop.py", "two_level.py"]:
         src = tools_dir / worker
         if not src.exists():
             print(f"ERROR: Worker script not found: {src}")

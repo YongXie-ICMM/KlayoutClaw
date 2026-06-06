@@ -23,7 +23,7 @@ Detect each material from its optimal source image. Four independent scripts, on
 - For `graphite.py`: just `bottom_part.jpg` + pixel size. The script runs its own substrate / host detection — no upstream dependencies.
 - For `bottom_hbn.py`: `warp_sift_bottom.npy` from the align step + `full_stack_raw.jpg` for warp target.
 - For `top_hbn.py`: `footprint_mask.png` from the align step.
-- All scripts: `conda run -n instrMCPdev python <script>`
+- All scripts: `${PYTHON_PATH:-conda run -n instrMCPdev python} <script>`
 
 ---
 
@@ -90,21 +90,21 @@ One adaptive pipeline. Every per-stack threshold is data-driven — no priors, n
 
 ```bash
 # First pass — auto-pick top, generate refined_candidates.png for review
-conda run -n instrMCPdev python graphite.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path>
 
 # Agent reviewed the panel — graphite is rank #2 in the panel
-conda run -n instrMCPdev python graphite.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
     --cluster-id 2
 
 # Graphite not in top-8: raise top-n + lower area floor to expose more candidates
-conda run -n instrMCPdev python graphite.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
     --top-n 12 --min-cc-um2 10
 
 # Refined contour visibly truncated at the rough region's boundary
-conda run -n instrMCPdev python graphite.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphite.py \
     --image <bottom_part.jpg> --pixel-size <um/px> --output-dir <path> \
     --cluster-id 0 --refine-iters 8
 ```
@@ -150,11 +150,11 @@ If the align step used `--mirror` for the top_part, **you must also pass --mirro
 
 ```bash
 # Pass 1: auto-detect + review
-conda run -n instrMCPdev python graphene.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphene.py \
     --image <top_part.jpg> --pixel-size <um/px> --mirror --output-dir <path>
 
 # Pass 2: override after reviewing 00_graphene_candidates.png
-conda run -n instrMCPdev python graphene.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} graphene.py \
     --image <top_part.jpg> --pixel-size <um/px> --mirror \
     --cluster-id 0 --output-dir <path>
 ```
@@ -185,7 +185,7 @@ conda run -n instrMCPdev python graphene.py \
 | Host extends across bare substrate (gold-backgate stacks like HM05) | Gold backgate is correctly classified as non-substrate and gets included | Expected — `combine.py` aligns the union (hBN + gold), and `graphite.py` independently localises the gold |
 
 ```bash
-conda run -n instrMCPdev python bottom_hbn.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} bottom_hbn.py \
     --image <bottom_part.jpg> \
     --warp-matrix <align/warp_sift_bottom.npy> \
     --target-image <full_stack_raw.jpg> \
@@ -203,7 +203,7 @@ conda run -n instrMCPdev python bottom_hbn.py \
 If the top hBN detection looks wrong, the fix is in the **align** step (re-run footprint.py or adjust Chamfer alignment), not here.
 
 ```bash
-conda run -n instrMCPdev python top_hbn.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} top_hbn.py \
     --footprint-mask <align/footprint_mask.png> \
     --footprint-contour <align/footprint_contour.npy> \
     --image <full_stack_raw.jpg> \

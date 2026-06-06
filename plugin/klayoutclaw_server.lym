@@ -518,7 +518,12 @@ TOOLS = [
                 "sort_pairs": {"type": "boolean", "description": "Route assigned pairs/nets by distance after assignment; default ordering is shortest first. Default true.", "default": True},
                 "timeout": {"type": "number", "default": 120, "minimum": 10, "maximum": 600, "description": "Subprocess timeout in seconds. Clamped to [10, 600]. Default 120."},
                 "obs_damping_step": {"type": "number", "default": 4, "description": "Obstacle cost damping steps. Lower = stronger avoidance. Default 4."},
-                "rescue_unrouted_nets": {"type": "boolean", "default": True, "description": "Dense-fan-out rescue. When a net fails 'No path found' (typically the last route in a tight 8+ contact bundle, walled in by sibling pins + prior routes' clearance halos), retry it with a local-then-global relaxation that opens the blocking halo + pin-marker cells while keeping every already-routed path cell HARD, so the rescued lead reaches its pad WITHOUT crossing any prior route. The response reports rescued_nets and rescue_note. Strict no-op on layouts that already route fully. Default true; set false for legacy fail-fast behaviour."}
+                "rescue_unrouted_nets": {"type": "boolean", "default": True, "description": "Dense-fan-out rescue. When a net fails 'No path found' (typically the last route in a tight 8+ contact bundle, walled in by sibling pins + prior routes' clearance halos), retry it with a local-then-global relaxation that opens the blocking halo + pin-marker cells while keeping every already-routed path cell HARD, so the rescued lead reaches its pad WITHOUT crossing any prior route. The response reports rescued_nets and rescue_note. Strict no-op on layouts that already route fully. Default true; set false for legacy fail-fast behaviour."},
+                "two_level": {"type": "string", "enum": ["auto", "on", "off"], "default": "auto", "description": "Adaptive two-level (inner-fine / outer-coarse) routing for real nanodevices where inner contacts cluster at the centre and bonding pads sit on the perimeter (so the two pin groups span the whole layout and a single fine grid OOMs). 'auto' (default) auto-detects that topology (smaller-bbox pin group = sample) and, only when a single fine grid over the full field would exceed the cell cap, routes in two passes joined by boundary patches — otherwise single-pass. 'on' forces it; 'off' disables it. Response carries two_level, inner_grid, outer_grid, patches, boundary_points_um."},
+                "inner_width": {"type": "number", "description": "Two-level inner (sample-region) route width in um. Default = path_width."},
+                "outer_width": {"type": "number", "description": "Two-level outer (perimeter) route width in um. Default = path_width."},
+                "patch_size": {"type": "number", "description": "Two-level boundary connection patch size in um. Auto-sized to bridge the inner/outer grid snap + widths if omitted."},
+                "inner_margin": {"type": "number", "description": "Two-level inner-window margin in um around the sample contacts. Default auto (max of 2x contact pitch, 15% of inner span)."}
             },
             "required": ["pin_layer_a", "pin_layer_b"]
         }
@@ -582,7 +587,7 @@ TOOLS = [
                     "description": "Layer specs for contact shapes that route endpoints may land on. Accepts a list of layer specs. Required — there is no default."
                 },
                 "pad_layer": {"type": "string", "description": "Layer spec for bonding pads. Required — there is no default."},
-                "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 5.0).", "default": 5.0},
+                "tolerance_um": {"type": "number", "description": "Endpoint-to-shape matching tolerance in microns (default 15.0, matching evaluate_design connectivity/route_endpoints so the two tools agree on reachability).", "default": 15.0},
                 "image_path": {"type": "string", "description": "Optional output PNG path for the labeled-crossings image. Defaults to /tmp/route_inspect_&lt;ts&gt;.png. Only written when crossings are detected; with no crossings the response field 'image_path' is null."}
             },
             "required": ["route_layer", "contact_layers", "pad_layer"]
@@ -990,6 +995,13 @@ def _tool_auto_route(args):
     if pin_pairs_override is not None and not isinstance(pin_pairs_override, list):
         raise ValueError("pin_pairs_override must be a list of [a_idx, b_idx] pairs (or omitted).")
     rescue_unrouted_nets = bool(args.get("rescue_unrouted_nets", True))
+    two_level = args.get("two_level", "auto")
+    if two_level not in ("auto", "on", "off"):
+        raise ValueError("two_level must be 'auto', 'on', or 'off'.")
+    inner_width = args.get("inner_width", None)
+    outer_width = args.get("outer_width", None)
+    patch_size = args.get("patch_size", None)
+    inner_margin = args.get("inner_margin", None)
 
     # Save current layout to temp GDS
     tmp_dir = tempfile.mkdtemp(prefix="klayoutclaw_route_")
@@ -1025,11 +1037,16 @@ def _tool_auto_route(args):
         "dry_run": dry_run,
         "auto_map_resolution": auto_map_resolution,
         "rescue_unrouted_nets": rescue_unrouted_nets,
+        "two_level": two_level,
     }
     if per_pair_obstacle_layers is not None:
         config["per_pair_obstacle_layers"] = per_pair_obstacle_layers
     if pin_pairs_override is not None:
         config["pin_pairs_override"] = pin_pairs_override
+    for _k, _v in (("inner_width", inner_width), ("outer_width", outer_width),
+                   ("patch_size", patch_size), ("inner_margin", inner_margin)):
+        if _v is not None:
+            config[_k] = _v
     with open(config_json, "w") as f:
         json.dump(config, f)
 
@@ -1120,6 +1137,7 @@ def _tool_auto_route(args):
             "pairs": preview_pairs,
             "assignment_engine": assignment_engine,
             "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
+            "routing_grid": result.get("routing_grid"),
             "errors": result.get("errors", []),
             "next_step_suggestion": (
                 "dry_run preview: {} assignments computed by {}, no routes inserted. "
@@ -1142,15 +1160,33 @@ def _tool_auto_route(args):
         pts = route.get("points_dbu", [])
         if len(pts) &lt; 2:
             continue
+        # Two-level paths carry their own write-field width (inner vs outer);
+        # single-pass paths use the tool's path_width.
+        w_dbu = path_width_dbu
+        if route.get("width_um") is not None:
+            w_dbu = int(round(float(route["width_um"]) / dbu))
         path_obj = pya.Path(
             [pya.Point(int(round(p[0])), int(round(p[1]))) for p in pts],
-            path_width_dbu
+            w_dbu
         )
         _top_cell.shapes(layer_idx).insert(path_obj)
         inserted += 1
 
+    # Two-level boundary connection patches: square boxes on output_layer that
+    # bridge the inner and outer route segments at the write-field boundary.
+    patches_inserted = 0
+    for patch in result.get("patches", []) or []:
+        try:
+            px = int(round(patch["x_dbu"]))
+            py = int(round(patch["y_dbu"]))
+            hs = int(round(patch["size_dbu"])) // 2
+        except (KeyError, TypeError, ValueError):
+            continue
+        _top_cell.shapes(layer_idx).insert(pya.Box(px - hs, py - hs, px + hs, py + hs))
+        patches_inserted += 1
+
     _refresh_view()
-    _log("auto_route: inserted {} paths".format(inserted))
+    _log("auto_route: inserted {} paths, {} patches".format(inserted, patches_inserted))
 
     # Cleanup temp files
     try:
@@ -1166,32 +1202,43 @@ def _tool_auto_route(args):
     # nudge the agent, not to prescribe.
     n_errors = len(result.get("errors", []))
     status = result.get("status", "unknown")
-    total_pairs = min(result.get("total_pins_a", 0), result.get("total_pins_b", 0))
+    is_two_level = result.get("two_level") is True
+    # For two-level the worker reports routed_pairs as fully-connected NETS
+    # (inner+outer+patch), and `inserted` counts both segments — use the
+    # worker's net count so the success/partial hint is meaningful.
+    routed_pairs_out = result.get("routed_pairs", inserted) if is_two_level else inserted
+    total_pairs = (result.get("n_nets", routed_pairs_out) if is_two_level
+                   else min(result.get("total_pins_a", 0), result.get("total_pins_b", 0)))
     rescued_nets = result.get("rescued_nets", 0)
     rescue_hint = ""
     if rescued_nets:
         rescue_hint = (" NOTE: {} net(s) needed the dense-fan-out rescue (relaxed the clearance halos blocking the "
                        "last route(s); prior routes stayed hard, so no crossing should have been added). "
                        "Confirm contact_isolation is still clean via route_inspect / evaluate_design.").format(rescued_nets)
-    if status == "success" and n_errors == 0 and inserted == total_pairs:
+    tl_hint = ""
+    if is_two_level:
+        tl_hint = (" two-level routing used (inner-fine / outer-coarse, joined by "
+                   "{} boundary patch(es)); inspect inner_grid/outer_grid.".format(patches_inserted))
+    if status == "success" and n_errors == 0 and routed_pairs_out == total_pairs:
         next_step = ("Routes committed. Call screenshot (optionally with zoom_box over the device region) to visually verify, "
                      "then route_inspect to map each route_id back to its contact/pad, "
-                     "and evaluate_design with contact_isolation to detect crossings." + rescue_hint)
+                     "and evaluate_design with contact_isolation to detect crossings." + rescue_hint + tl_hint)
     elif inserted &gt; 0:
         next_step = ("Partial routing ({}/{} pairs). Call route_inspect to see which pairs succeeded, "
-                     "screenshot(zoom_box=...) over the unrouted region, and consider per_pair_obstacle_layers or a higher timeout for the retry.".format(inserted, total_pairs))
+                     "screenshot(zoom_box=...) over the unrouted region, and consider per_pair_obstacle_layers or a higher timeout for the retry.".format(routed_pairs_out, total_pairs) + tl_hint)
     else:
         next_step = ("No routes inserted. Re-check pin_layer_a / pin_layer_b have geometry via get_layout_info, "
                      "try dry_run=True first to preview the ordered-loop assignment, and consult the errors list.")
 
     response = {
         "status": status,
-        "routed_pairs": inserted,
+        "routed_pairs": routed_pairs_out,
         "total_pins_a": result.get("total_pins_a", 0),
         "total_pins_b": result.get("total_pins_b", 0),
         "output_layer": output_layer,
         "path_width_um": path_width,
         "map_resolution_um_used": result.get("map_resolution_um_used", map_resolution),
+        "routing_grid": result.get("routing_grid"),
         "assignment_engine": result.get("assignment_engine"),
         "n_nets": result.get("n_nets"),
         "rescued_nets": rescued_nets,
@@ -1200,6 +1247,13 @@ def _tool_auto_route(args):
     }
     if result.get("rescue_note"):
         response["rescue_note"] = result.get("rescue_note")
+    if is_two_level:
+        response["two_level"] = True
+        response["inner_grid"] = result.get("inner_grid")
+        response["outer_grid"] = result.get("outer_grid")
+        response["patches_inserted"] = patches_inserted
+        response["boundary_points_um"] = result.get("boundary_points_um")
+        response["two_level_reason"] = result.get("two_level_reason")
     return json.dumps(response)
 
 
@@ -1305,7 +1359,10 @@ def _tool_route_inspect(args):
         raise ValueError(
             "route_inspect: 'pad_layer' is required (layer spec for bonding "
             "pads). No default is assumed.")
-    tolerance_um = float(args.get("tolerance_um", 5.0))
+    # Default tolerance aligned with evaluate_design connectivity/route_endpoints
+    # (both default 15.0). A stricter 5.0 here made route_inspect report
+    # from_contact/to_pad=null on routes that connectivity scored 1.0.
+    tolerance_um = float(args.get("tolerance_um", 15.0))
 
     # Issue #34: optional labeled-crossings PNG. Default path uses an
     # epoch timestamp so successive calls don't clobber prior output.
@@ -1702,6 +1759,60 @@ def _tool_evaluate_design(args):
     global _layout, _layout_view, _top_cell
     _ensure_valid_handles()
 
+    # ---- evaluate_design check registry (single source of truth in the .lym;
+    # a CI test keeps _known_primitives set-equal to evaluate_worker.PRIMITIVES) ----
+    _known_primitives = ["component_overlap", "component_containment",
+                         "bulk_containment", "arm_material_class",
+                         "material_overlap_report",
+                         "contact_isolation", "route_material_compat",
+                         "connectivity", "route_endpoints",
+                         "adjacency", "solidity", "spacing"]
+    _required_args = {
+        "component_overlap": ["component", "region"],
+        "component_containment": ["component", "region"],
+        "bulk_containment": ["component"],
+        "arm_material_class": ["component", "classes"],
+        "material_overlap_report": ["materials"],
+        "contact_isolation": [],
+        "route_material_compat": [],
+        "connectivity": [],
+        "route_endpoints": [],
+        "adjacency": ["component_a", "component_b"],
+        "solidity": ["component"],
+        "spacing": ["component_a"],
+    }
+    # Required + optional arg keys per primitive. Unknown keys are rejected so a
+    # misspelled arg surfaces an actionable error instead of being silently
+    # ignored (and then often producing a confusing 0.0).
+    _allowed_args = {
+        "component_overlap": ["component", "region", "region_op"],
+        "component_containment": ["component", "region", "region_op"],
+        "bulk_containment": ["component", "bulk_region", "materials", "region_op", "core_bbox"],
+        "arm_material_class": ["component", "classes", "containment_threshold"],
+        "material_overlap_report": ["materials"],
+        "contact_isolation": ["component"],
+        "route_material_compat": ["route_component", "contact_component", "graphene",
+                                  "graphite", "tolerance_area", "attach_buffer"],
+        "connectivity": ["contact_component", "pad_component", "route_component", "tolerance"],
+        "route_endpoints": ["route_component", "target_components", "tolerance"],
+        "adjacency": ["component_a", "component_b", "tolerance"],
+        "solidity": ["component", "threshold", "direction"],
+        "spacing": ["component_a", "component_b", "min_distance"],
+    }
+    # Arg keys whose values name layer_map entries (single key or list of keys).
+    # A typo here used to yield an empty region and a silent 0.0; now it raises.
+    _layer_ref_args = ["materials", "bulk_region", "graphene", "graphite"]
+
+    # describe_checks: return the machine-readable schema and exit early, so an
+    # agent can discover each primitive's required/optional args without guessing.
+    if args.get("describe_checks"):
+        return json.dumps({"status": "ok", "describe_checks": {
+            "primitives": _known_primitives,
+            "required_args": _required_args,
+            "allowed_args": _allowed_args,
+            "layer_ref_args": _layer_ref_args,
+        }})
+
     layer_map = args.get("layer_map", {})
     checks = args.get("checks", None)
     # Defensive coercion: some MCP clients (notably qlaybot's tool-call layer,
@@ -1738,27 +1849,9 @@ def _tool_evaluate_design(args):
     if checks is None or not isinstance(checks, list) or len(checks) == 0:
         raise ValueError("'checks' must be a non-empty list of check objects.")
 
-    # Validate check structure before spawning subprocess
-    _known_primitives = ["component_overlap", "component_containment",
-                         "bulk_containment", "arm_material_class",
-                         "material_overlap_report",
-                         "contact_isolation", "route_material_compat",
-                         "connectivity", "route_endpoints",
-                         "adjacency", "solidity", "spacing"]
-    _required_args = {
-        "component_overlap": ["component", "region"],
-        "component_containment": ["component", "region"],
-        "bulk_containment": ["component"],
-        "arm_material_class": ["component", "classes"],
-        "material_overlap_report": ["materials"],
-        "contact_isolation": [],
-        "route_material_compat": [],
-        "connectivity": [],
-        "route_endpoints": [],
-        "adjacency": ["component_a", "component_b"],
-        "solidity": ["component"],
-        "spacing": ["component_a"],
-    }
+    # Validate check structure before spawning subprocess (registry tables
+    # _known_primitives / _required_args / _allowed_args / _layer_ref_args are
+    # defined at the top of this function so describe_checks can reuse them).
     for i, check in enumerate(checks):
         if not isinstance(check, dict):
             raise ValueError("checks[{}] must be a dict with 'name', 'args', 'weight'. Got: {}".format(i, type(check).__name__))
@@ -1776,6 +1869,13 @@ def _tool_evaluate_design(args):
             if req not in check_args:
                 raise ValueError("checks[{}] ('{}') missing required arg '{}'. Required args: {}".format(
                     i, name, req, _required_args[name]))
+        # Reject unknown arg keys instead of silently ignoring a typo (which
+        # then falls through to a default and often scores a confusing 0.0).
+        _allowed = _allowed_args.get(name, [])
+        for k in check_args.keys():
+            if k not in _allowed:
+                raise ValueError("checks[{}] ('{}') has unknown arg '{}'. Allowed args: {}".format(
+                    i, name, k, _allowed))
         # Validate that component/region args reference keys in layer_map
         _component_keys = ["component", "component_a", "component_b", "contact_component",
                            "pad_component", "route_component"]
@@ -1797,6 +1897,36 @@ def _tool_evaluate_design(args):
                 if t not in layer_map:
                     raise ValueError("checks[{}] ('{}') target_component '{}' not found in layer_map. "
                                      "Available keys: {}".format(i, name, t, list(layer_map.keys())))
+        # Validate material-style args that name layer_map keys (single or list):
+        # materials / bulk_region / graphene / graphite. A typo here previously
+        # resolved to an empty region and a silent 0.0 instead of an error.
+        for key in _layer_ref_args:
+            rv = check_args.get(key)
+            if rv is None:
+                continue
+            rv_list = [rv] if isinstance(rv, str) else rv
+            for v in rv_list:
+                if isinstance(v, str) and v not in layer_map:
+                    raise ValueError("checks[{}] ('{}') arg '{}' references '{}' not found in layer_map. "
+                                     "Available keys: {}".format(i, name, key, v, list(layer_map.keys())))
+        # arm_material_class 'classes': each entry is a key, list of keys, or
+        # a dict {region, ...}; validate every layer_map-referencing value.
+        classes_val = check_args.get("classes")
+        if classes_val is not None:
+            for cls in classes_val:
+                if isinstance(cls, str):
+                    cand = [cls]
+                elif isinstance(cls, list):
+                    cand = cls
+                elif isinstance(cls, dict):
+                    rg = cls.get("region")
+                    cand = [rg] if isinstance(rg, str) else (rg or [])
+                else:
+                    cand = []
+                for v in cand:
+                    if isinstance(v, str) and v not in layer_map:
+                        raise ValueError("checks[{}] ('{}') classes entry references '{}' not found in layer_map. "
+                                         "Available keys: {}".format(i, name, v, list(layer_map.keys())))
 
     # Validate layer_map format
     for lname, lspec in layer_map.items():

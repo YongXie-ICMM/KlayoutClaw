@@ -12,14 +12,14 @@ Transforms all per-material detections into the full_stack coordinate system, pr
 - Conda env `instrMCPdev` with opencv, numpy, shapely (`rank_candidate_pairs.py` uses shapely)
 - Completed align step (warp matrices, footprint mask)
 - Completed detect step (per-material masks/contours, detections.json)
-- All scripts run via `conda run -n instrMCPdev python <script>`
+- All scripts run via `${PYTHON_PATH:-conda run -n instrMCPdev python} <script>`
 
 ## Scripts
 
 ### ecc_register.py — ECC raw-to-LUT translation alignment
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/ecc_register.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_combine/scripts/ecc_register.py \
     --raw <full_stack_raw_image> \
     --lut <full_stack_lut_image> \
     --output-dir <path>
@@ -39,7 +39,7 @@ Computes ECC translation alignment between raw and LUT images. The LUT image typ
 ### transform.py — Coordinate transforms for all materials
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/transform.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_combine/scripts/transform.py \
     --detections <detect/detections.json> \
     --align-dir <align/> \
     --image <full_stack_raw_image> \
@@ -117,7 +117,7 @@ This refusal composes with the alignment-status refusal: `transform.py` already 
 ### overlay.py — Contour overlay visualization
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/overlay.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_combine/scripts/overlay.py \
     --traces <combine/traces.json> \
     --raw <full_stack_raw_image> \
     [--lut <full_stack_lut_image>] \
@@ -150,7 +150,7 @@ For LUT overlay: reads dx, dy from combine_report.json and shifts contours befor
 Ranks every pair across two detected material lists by intersection area. Useful whenever a downstream design step requires a material pair with non-trivial overlap and the rank-0 detections do not always satisfy that constraint. Defaults to `--material-a graphene --material-b graphite` for the vdW-Hall-bar workflow, but any two material keys that exist in `traces.json` will work (e.g. `--material-a top_hBN --material-b bottom_hBN` to rank encapsulation pairs).
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_combine/scripts/rank_candidate_pairs.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_combine/scripts/rank_candidate_pairs.py \
     --traces <combine/traces.json> \
     [--output candidate_ranking.json] \
     [--top-k 5] \

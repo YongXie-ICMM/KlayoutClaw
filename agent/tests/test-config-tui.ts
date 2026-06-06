@@ -35,6 +35,8 @@ import {
   saveMCPConfig,
   saveSettingsConfig,
   resolveModel,
+  applyModelHeaders,
+  DEFAULT_USER_AGENT,
 } from "../src/config.js";
 
 import {
@@ -290,6 +292,40 @@ describe("SCC-A6: resolveModel 5-step fallback", () => {
     emptyCfg.models.providers = {};
 
     expect(() => resolveModel("anything", emptyCfg)).toThrow();
+  });
+});
+
+describe("SCC-A6b: applyModelHeaders default User-Agent + provider override", () => {
+  const baseModel = {
+    id: "claude-sonnet-4-6",
+    name: "Claude Sonnet 4.6",
+    api: "anthropic-messages",
+    provider: "custom-anthropic",
+    baseUrl: "https://bench.physcai.com/api",
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+    cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+    contextWindow: 200000,
+    maxTokens: 65536,
+  };
+
+  it("injects the default neutral User-Agent when no provider headers are set", () => {
+    const result = applyModelHeaders({ ...baseModel });
+    expect(result.headers?.["User-Agent"]).toBe(DEFAULT_USER_AGENT);
+  });
+
+  it("lets a provider headers override win over the default User-Agent", () => {
+    const result = applyModelHeaders({ ...baseModel }, { "User-Agent": "my-custom-agent/1.0", "X-Extra": "1" });
+    expect(result.headers?.["User-Agent"]).toBe("my-custom-agent/1.0");
+    expect(result.headers?.["X-Extra"]).toBe("1");
+  });
+
+  it("does not mutate the input model (non-mutating spread)", () => {
+    const input = { ...baseModel };
+    const result = applyModelHeaders(input);
+    expect(input.headers).toBeUndefined();
+    expect(result).not.toBe(input);
+    expect(result.headers?.["User-Agent"]).toBe(DEFAULT_USER_AGENT);
   });
 });
 
@@ -2075,5 +2111,24 @@ describe("SCC-D20: validateApiKey rejects invalid keys", () => {
     });
     expect(result.valid).toBe(true);
     expect(result.error).toBeUndefined();
+  });
+});
+
+// Issue #17: the client tool-execution timeout must not abort a long route/eval
+// the server is still legitimately running (which surfaces as a spurious
+// "fetch failed"). The client must wait at least as long as the server's
+// LARGEST subprocess clamp (evaluate_design caps at 900s).
+describe("SCC-A17: client tool timeout >= server subprocess cap", () => {
+  const SERVER_MAX_SUBPROCESS_MS = 900_000; // evaluate_design clamp in the .lym
+
+  it("DEFAULT_TOOL_TIMEOUT_MS is at least the server's max subprocess timeout", async () => {
+    const { DEFAULT_TOOL_TIMEOUT_MS } = await import("../src/mcp/klayout-client.js");
+    expect(DEFAULT_TOOL_TIMEOUT_MS).toBeGreaterThanOrEqual(SERVER_MAX_SUBPROCESS_MS);
+  });
+
+  it("default config mcpTimeouts.toolExecutionMs is at least the server cap", () => {
+    // fresh empty config dir -> production defaults from defaultConfig()
+    const cfg = loadConfig(makeTmpDir());
+    expect(cfg.mcpTimeouts.toolExecutionMs).toBeGreaterThanOrEqual(SERVER_MAX_SUBPROCESS_MS);
   });
 });

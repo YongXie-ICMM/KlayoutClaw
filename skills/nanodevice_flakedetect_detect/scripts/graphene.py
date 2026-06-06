@@ -607,9 +607,12 @@ def _bridge_polarity_consistent_ccs(
     # Build per-CC statistics.
     lab_f32 = lab.astype(np.float32)
     seed_abs_rel_L = abs(seed_rel_L_med)
+    # Loop-invariant: median L of the entire grown region (computed once).
+    grown_L_vals = lab_f32[grown > 0, 0]
+    grown_L_med_global = float(np.median(grown_L_vals)) if len(grown_L_vals) > 0 else None
+    del grown_L_vals
     cc_stats: list[dict] = []
     for label_id in range(1, n_labels):
-        px_mask = (labels == label_id).astype(np.uint8) * 255
         px_ys, px_xs = np.where(labels == label_id)
         if len(px_ys) == 0:
             continue
@@ -632,8 +635,7 @@ def _bridge_polarity_consistent_ccs(
         # bulk_mu_ab[0] = a_bg, and we don't have L_bg here.
         # Use the seed_rel_L_med sign: we only need to confirm same polarity.
         # Proxy: median L of this CC vs. median L of entire grown mask.
-        grown_L_vals = lab_f32[grown > 0, 0]
-        grown_L_med = float(np.median(grown_L_vals)) if len(grown_L_vals) > 0 else med_L
+        grown_L_med = grown_L_med_global if grown_L_med_global is not None else med_L
         cc_rel_L = med_L - grown_L_med  # rough rel_L vs current grown region
 
         # Check polarity consistency: same sign direction as seed.
@@ -665,7 +667,6 @@ def _bridge_polarity_consistent_ccs(
         cx = float(np.mean(px_xs))
         cc_stats.append({
             'label_id': label_id,
-            'mask': px_mask,
             'cy': cy,
             'cx': cx,
             'px_ys': px_ys,

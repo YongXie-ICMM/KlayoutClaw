@@ -14,7 +14,7 @@ Register source microscope images to the full_stack target coordinate system.
 
 - Conda env `instrMCPdev` with opencv, numpy, scipy, scikit-learn
 - Source images and full_stack reference image
-- All scripts: `conda run -n instrMCPdev python <script>`
+- All scripts: `${PYTHON_PATH:-conda run -n instrMCPdev python} <script>`
 
 ---
 
@@ -61,7 +61,7 @@ Runs **fully autonomously** except for one mandatory pause: **rotation selection
      **MANDATORY EXECUTION METHOD**: Run refine.py as a FOREGROUND BLOCKING
      command with a long timeout. Use the Bash tool with timeout=1200000
      (20 minutes). Example:
-       Bash(command="conda run -n instrMCPdev python .../refine.py ...", timeout=1200000)
+       Bash(command="${PYTHON_PATH:-conda run -n instrMCPdev python} .../refine.py ...", timeout=1200000)
      Do NOT use run_in_background=true. Do NOT launch it as a background
      process with &. Do NOT poll with sleep loops. Do NOT check for output
      files in a loop. Just run the single blocking command and wait for it
@@ -175,7 +175,7 @@ Max refine.py invocations: 2. Each takes 10-15 min — 3 would consume 45 min.
 ### sift_align.py
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/sift_align.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_align/scripts/sift_align.py \
     --source <image> --target <image> --pixel-size <um/px> --output-dir <path> \
     [--min-inliers 20] [--scalebar-bottom 0.08] [--scalebar-right 0.20]
 ```
@@ -197,7 +197,7 @@ Optional:
 ### source_contour.py
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/source_contour.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_align/scripts/source_contour.py \
     --image <image> [--mirror] [--gray-only] --output-dir <path>
 ```
 
@@ -210,7 +210,7 @@ Optional: `--gray-only` — use grayscale Otsu only, skip saturation intersectio
 SIFT-aligns bottom_part to target, computes LAB diff image, K-means on diff intensity. Isolates the top-placed flake from substrate. Splits disconnected blobs within clusters into sub-clusters before enumeration, so spatially separate flakes sharing the same intensity are treated independently.
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/footprint.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_align/scripts/footprint.py \
     --source <top_part> --target <full_stack_raw> \
     --bottom <bottom_part> [--mirror] \
     [--source-contour <out>/align/source_contour.npy] \
@@ -229,7 +229,7 @@ Optional:
 ### sweep.py
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/sweep.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_align/scripts/sweep.py \
     --source-contour <.npy> --source-mask <.png> \
     --footprint-contour <.npy> --footprint-mask <.png> \
     --target-image <image> --pixel-size <um/px> --output-dir <path>
@@ -242,7 +242,7 @@ conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/swee
 ### refine.py
 
 ```bash
-conda run -n instrMCPdev python skills/nanodevice_flakedetect_align/scripts/refine.py \
+${PYTHON_PATH:-conda run -n instrMCPdev python} skills/nanodevice_flakedetect_align/scripts/refine.py \
     --source-contour <.npy> --source-mask <.png> \
     --footprint-contour <.npy> --footprint-mask <.png> \
     --target-image <image> \

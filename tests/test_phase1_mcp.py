@@ -266,16 +266,6 @@ class TestEvaluateDesignToolListing:
             f"layer_map must be required. Required fields: {required}"
         )
 
-    def test_mode_has_enum_score_drc(self):
-        """mode parameter must have enum values ['score', 'drc']."""
-        result = mcp_call("tools/list")
-        tools = result["result"]["tools"]
-        tool = next(t for t in tools if t["name"] == "evaluate_design")
-        mode_prop = tool["inputSchema"]["properties"]["mode"]
-        assert set(mode_prop.get("enum", [])) == {"score", "drc"}, (
-            f"mode enum must be {{'score', 'drc'}}, got {mode_prop.get('enum')}"
-        )
-
     def test_reference_gds_is_optional(self):
         """reference_gds must be present but NOT in required list."""
         result = mcp_call("tools/list")
@@ -290,216 +280,99 @@ class TestEvaluateDesignToolListing:
 
 
 # ---------------------------------------------------------------------------
-# Test Class: DRC Mode
+# Test Class: evaluate_design current checks/layer_map API.
+# (Rewritten from the removed mode="drc"/"score" API — qb-opus48 feedback #7.
+# The old tests called evaluate_design(mode="drc"/"score") + reference_gds with
+# built-in DRC_CHECK_NAMES; that API no longer exists, so they failed against
+# the current configurable-primitive evaluator. These exercise the real API.)
 # ---------------------------------------------------------------------------
 
-class TestEvaluateDesignDrcMode:
-    """Test evaluate_design in DRC mode with a Hall bar device fixture."""
+HALLBAR_CHECKS = [
+    {"name": "connectivity",
+     "args": {"contact_component": "contact_patch", "pad_component": "bonding_pad",
+              "route_component": "contact_route"}, "weight": 0.25},
+    {"name": "route_endpoints",
+     "args": {"route_component": "contact_route",
+              "target_components": ["contact_patch", "bonding_pad"]}, "weight": 0.25},
+    {"name": "contact_isolation", "args": {"component": "contact_route"}, "weight": 0.2},
+    {"name": "adjacency",
+     "args": {"component_a": "contact_patch", "component_b": "mesa"}, "weight": 0.15},
+    {"name": "component_overlap",
+     "args": {"component": "topgate", "region": "mesa"}, "weight": 0.15},
+]
+
+
+class TestEvaluateDesignChecksApi:
+    """evaluate_design with the current configurable-checks API on a hall bar."""
 
     @pytest.fixture(autouse=True)
     def setup_hallbar(self):
-        """Create a fresh layout with Hall bar device geometry."""
-        tool_call("create_layout", name="TEST_EVALUATE_DRC", dbu=0.001)
+        tool_call("create_layout", name="TEST_EVALUATE_CHECKS", dbu=0.001)
         tool_call_raw("execute_script", code=HALLBAR_DEVICE_PYA)
         yield
 
-    def test_drc_returns_status_ok(self):
-        """DRC mode must return status 'ok' for a valid device."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        assert result["status"] == "ok", (
-            f"Expected status 'ok', got '{result.get('status')}'. "
-            f"Full result: {json.dumps(result, indent=2)[:500]}"
-        )
+    def test_status_ok_and_checks_returned(self):
+        res = tool_call("evaluate_design", **_eval_kwargs(checks=HALLBAR_CHECKS))
+        assert res["status"] == "ok", json.dumps(res, indent=2)[:500]
+        names = [c["name"] for c in res["checks"]]
+        assert names == [c["name"] for c in HALLBAR_CHECKS]
 
-    def test_drc_returns_6_checks(self):
-        """DRC mode must return exactly 6 checks."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        checks = result["checks"]
-        assert len(checks) == 6, (
-            f"Expected 6 DRC checks, got {len(checks)}. "
-            f"Check names: {[c['name'] for c in checks]}"
-        )
+    def test_overall_in_range(self):
+        res = tool_call("evaluate_design", **_eval_kwargs(checks=HALLBAR_CHECKS))
+        assert 0.0 <= res["overall"] <= 1.0
 
-    def test_drc_check_names_are_correct(self):
-        """DRC mode check names must match the expected 6 DRC checks."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        check_names = [c["name"] for c in result["checks"]]
-        assert set(check_names) == set(DRC_CHECK_NAMES), (
-            f"DRC check names mismatch. Expected: {sorted(DRC_CHECK_NAMES)}, "
-            f"got: {sorted(check_names)}"
-        )
+    def test_valid_hallbar_connects(self):
+        """A well-formed hall bar: routes reach pads (connectivity > 0) and
+        route endpoints land on valid targets (> 0)."""
+        res = tool_call("evaluate_design", **_eval_kwargs(checks=HALLBAR_CHECKS))
+        by = {c["name"]: c["score"] for c in res["checks"]}
+        assert by["connectivity"] > 0.0, f"connectivity should be >0: {by}"
+        assert by["route_endpoints"] > 0.0, f"route_endpoints should be >0: {by}"
 
-    def test_drc_overall_in_valid_range(self):
-        """DRC overall score must be between 0.0 and 1.0 inclusive."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        overall = result["overall"]
-        assert isinstance(overall, (int, float)), (
-            f"overall must be numeric, got {type(overall).__name__}"
-        )
-        assert 0.0 <= overall <= 1.0, (
-            f"overall must be in [0.0, 1.0], got {overall}"
-        )
+    def test_solidity_check_reports_raw(self):
+        """Issue #2: a solidity check exposes raw_solidity + raw= in detail."""
+        res = tool_call("evaluate_design",
+                        **_eval_kwargs(checks=[{"name": "solidity",
+                                                "args": {"component": "mesa",
+                                                         "threshold": 0.9,
+                                                         "direction": "below"},
+                                                "weight": 1.0}]))
+        chk = res["checks"][0]
+        assert chk.get("raw_solidity") is not None and "raw=" in chk["detail"]
 
-    def test_drc_mode_field_is_drc(self):
-        """Result mode field must be 'drc' when called with mode='drc'."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        assert result["mode"] == "drc", (
-            f"Expected mode='drc', got '{result.get('mode')}'"
-        )
-
-    def test_drc_check_object_shape(self):
-        """Each DRC check must have keys: name, score, weight, detail."""
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        expected_keys = {"name", "score", "weight", "detail"}
-        for check in result["checks"]:
-            actual_keys = set(check.keys())
-            assert actual_keys == expected_keys, (
-                f"Check '{check.get('name', '?')}' has keys {actual_keys}, "
-                f"expected {expected_keys}"
-            )
-
-    def test_drc_valid_device_has_positive_scores(self):
-        """A valid Hall bar must produce scores > 0 for geometry-aware checks.
-
-        This guards against a stub that returns fixed zero-score JSON.
-        topgate and contact_mesa_adjacency must be > 0 for the test device.
-        """
-        result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        checks_by_name = {c["name"]: c["score"] for c in result["checks"]}
-        # The test device has a topgate overlapping mesa -> topgate score > 0
-        assert checks_by_name["topgate"] > 0, (
-            f"topgate score must be > 0 for valid device, got {checks_by_name['topgate']}"
-        )
-        # Contact patches are adjacent to mesa -> contact_mesa_adjacency > 0
-        assert checks_by_name["contact_mesa_adjacency"] > 0, (
-            f"contact_mesa_adjacency must be > 0 for valid device, "
-            f"got {checks_by_name['contact_mesa_adjacency']}"
-        )
-
-    def test_drc_empty_layout_scores_differ_from_valid_device(self):
-        """An empty layout (no geometry) must produce meaningfully different scores.
-
-        This counterexample proves the tool actually analyzes geometry rather
-        than returning canned/fixed results. With no mesa, contacts, routes,
-        or pads, connectivity and contact_mesa_adjacency must score 0.0
-        (no geometry to evaluate), and overall must be strictly lower than
-        the valid device overall (tested above in test_drc_overall_in_valid_range).
-        """
-        # First, capture the valid device overall for comparison
-        valid_result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        valid_overall = valid_result["overall"]
-        # Create a fresh empty layout — overrides the autouse fixture's Hall bar
-        tool_call("create_layout", name="TEST_EVALUATE_EMPTY", dbu=0.001)
-        empty_result = tool_call("evaluate_design", **_eval_kwargs(mode="drc"))
-        empty_checks = {c["name"]: c["score"] for c in empty_result["checks"]}
-
-        # connectivity requires routes touching contacts — must be 0 with no geometry
-        assert empty_checks["connectivity"] == 0.0, (
-            f"Empty layout connectivity must be 0.0, got {empty_checks['connectivity']}"
-        )
-        # contact_mesa_adjacency requires contacts adjacent to mesa — must be 0
-        assert empty_checks["contact_mesa_adjacency"] == 0.0, (
-            f"Empty layout contact_mesa_adjacency must be 0.0, "
-            f"got {empty_checks['contact_mesa_adjacency']}"
-        )
-        # Empty overall must be strictly less than valid device overall
-        assert empty_result["overall"] < valid_overall, (
-            f"Empty layout overall ({empty_result['overall']}) must be strictly less "
-            f"than valid device overall ({valid_overall})"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test Class: Score Mode
-# ---------------------------------------------------------------------------
-
-class TestEvaluateDesignScoreMode:
-    """Test evaluate_design in score mode with device + reference GDS."""
-
-    @pytest.fixture(autouse=True)
-    def setup_hallbar_with_reference(self):
-        """Create Hall bar device and save reference GDS with material layers."""
-        tool_call("create_layout", name="TEST_EVALUATE_SCORE", dbu=0.001)
-        tool_call_raw("execute_script", code=HALLBAR_DEVICE_PYA)
-        tool_call_raw("execute_script", code=REFERENCE_LAYERS_PYA)
-        yield
-
-    def test_score_returns_8_checks(self):
-        """Score mode must return exactly 8 checks."""
-        result = tool_call("evaluate_design",
-                           **_eval_kwargs(mode="score", reference_gds=REFERENCE_GDS_PATH))
-        checks = result["checks"]
-        assert len(checks) == 8, (
-            f"Expected 8 score checks, got {len(checks)}. "
-            f"Check names: {[c['name'] for c in checks]}"
-        )
-
-    def test_score_check_names_are_correct(self):
-        """Score mode check names must match the expected 8 score checks."""
-        result = tool_call("evaluate_design",
-                           **_eval_kwargs(mode="score", reference_gds=REFERENCE_GDS_PATH))
-        check_names = [c["name"] for c in result["checks"]]
-        assert set(check_names) == set(SCORE_CHECK_NAMES), (
-            f"Score check names mismatch. Expected: {sorted(SCORE_CHECK_NAMES)}, "
-            f"got: {sorted(check_names)}"
-        )
-
-    def test_score_valid_device_has_positive_geometry_scores(self):
-        """A valid device with reference must produce geometry-aware scores > 0.
-
-        mesa_on_overlap must be > 0 because the mesa sits inside the
-        graphene/graphite overlap region. topgate must be > 0 because the
-        topgate overlaps the mesa.
-        """
-        result = tool_call("evaluate_design",
-                           **_eval_kwargs(mode="score", reference_gds=REFERENCE_GDS_PATH))
-        checks_by_name = {c["name"]: c["score"] for c in result["checks"]}
-        assert checks_by_name["mesa_on_overlap"] > 0, (
-            f"mesa_on_overlap must be > 0 (mesa is within graphene/graphite overlap), "
-            f"got {checks_by_name['mesa_on_overlap']}"
-        )
-        assert checks_by_name["topgate"] > 0, (
-            f"topgate must be > 0 for valid device, got {checks_by_name['topgate']}"
-        )
-
-    def test_score_overall_in_valid_range(self):
-        """Score mode overall must be between 0.0 and 1.0 inclusive."""
-        result = tool_call("evaluate_design",
-                           **_eval_kwargs(mode="score", reference_gds=REFERENCE_GDS_PATH))
-        overall = result["overall"]
-        assert isinstance(overall, (int, float)), (
-            f"overall must be numeric, got {type(overall).__name__}"
-        )
-        assert 0.0 <= overall <= 1.0, (
-            f"overall must be in [0.0, 1.0], got {overall}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test Class: Error Handling
-# ---------------------------------------------------------------------------
 
 class TestEvaluateDesignErrorHandling:
-    """Test evaluate_design error paths."""
+    """Current-API error paths (rewritten from the removed mode= API)."""
 
     @pytest.fixture(autouse=True)
     def setup_layout(self):
-        """Create a minimal layout so the tool has something to save."""
         tool_call("create_layout", name="TEST_EVALUATE_ERRORS", dbu=0.001)
         tool_call_raw("execute_script", code=HALLBAR_DEVICE_PYA)
         yield
 
-    def test_score_mode_missing_reference_gds_errors(self):
-        """Score mode without reference_gds must return an error mentioning reference_gds."""
-        with pytest.raises(RuntimeError, match=r"^MCP tool error:.*mode='score' requires reference_gds"):
+    def test_unknown_primitive_errors(self):
+        with pytest.raises(RuntimeError, match=r"unknown primitive"):
             tool_call("evaluate_design",
-                      layer_map=STANDARD_LAYER_MAP,
-                      mode="score")
+                      **_eval_kwargs(checks=[{"name": "no_such_check",
+                                              "args": {"component": "mesa"},
+                                              "weight": 1.0}]))
 
-    def test_invalid_layer_map_errors(self):
-        """A layer_map missing required keys must return an error listing missing keys."""
-        incomplete_map = {"mesa": [20, 0]}  # missing other required keys
-        with pytest.raises(RuntimeError, match=r"^MCP tool error:.*layer_map missing required keys:.*contact_patch.*topgate.*contact_route.*bonding_pad"):
+    def test_unknown_layer_key_errors(self):
+        with pytest.raises(RuntimeError, match=r"not found in layer_map"):
             tool_call("evaluate_design",
-                      layer_map=incomplete_map,
-                      mode="drc")
+                      **_eval_kwargs(checks=[{"name": "solidity",
+                                              "args": {"component": "does_not_exist"},
+                                              "weight": 1.0}]))
+
+    def test_unknown_arg_key_errors(self):
+        """Issue #7: an unknown arg key is rejected, not silently ignored."""
+        with pytest.raises(RuntimeError, match=r"unknown arg"):
+            tool_call("evaluate_design",
+                      **_eval_kwargs(checks=[{"name": "solidity",
+                                              "args": {"component": "mesa",
+                                                       "bogus_key": 1},
+                                              "weight": 1.0}]))
+
+    def test_missing_checks_errors(self):
+        with pytest.raises(RuntimeError, match=r"checks"):
+            tool_call("evaluate_design", **_eval_kwargs())
