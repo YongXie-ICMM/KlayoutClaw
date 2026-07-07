@@ -1,0 +1,11 @@
+# 离线布线路线 (route_easy.py / route_worker.py) 的全部依赖
+# 用法: pip install -r requirements_routing.txt
+numpy
+scipy
+scikit-image
+klayout
+gdstk
+shapely
+matplotlib
+# 跑 tests/ 里的回归测试才需要:
+pytest
