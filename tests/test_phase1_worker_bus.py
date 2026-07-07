@@ -14,7 +14,12 @@ import tempfile
 import gdstk
 import pytest
 
-CONDA_PY = "/Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python"
+# Interpreter for the worker subprocess: override with KLAYOUTCLAW_PY, else
+# the legacy instrMCPdev env if present, else whatever runs pytest.
+_LEGACY_PY = "/Users/andrewwayne/anaconda3/envs/instrMCPdev/bin/python"
+CONDA_PY = os.environ.get(
+    "KLAYOUTCLAW_PY",
+    _LEGACY_PY if os.path.isfile(_LEGACY_PY) else sys.executable)
 WORKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "tools", "route_worker.py")
 

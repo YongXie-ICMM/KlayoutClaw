@@ -43,6 +43,16 @@ Then just ask:
 
 > *"Create a Hall bar with a 100×25 µm graphene channel, 6 side probes, and bonding pads. Save as hallbar.gds."*
 
+**No KLayout / no macOS?** The autorouter also runs fully offline on any platform:
+
+```bash
+pip install numpy scipy scikit-image klayout gdstk shapely matplotlib
+python examples/make_demo_hallbar.py demo.gds
+python tools/route_easy.py demo.gds --pins 102/0 --pads 111/0 --obstacles 1/0 3/0
+```
+
+中文快速上手（新同学从这里开始）: [`docs/route_quickstart_cn.md`](docs/route_quickstart_cn.md)
+
 ## What's Inside
 
 | Layer | Purpose |
@@ -94,6 +104,7 @@ Pass `python_path=` to override the env per-call.
 
 ## Documentation
 
+- [`docs/route_quickstart_cn.md`](docs/route_quickstart_cn.md) — 自动布线快速上手 (offline routing quickstart, Chinese)
 - [`docs/tools.md`](docs/tools.md) — MCP tool reference (all 19)
 - [`docs/skills.md`](docs/skills.md) — skill catalog
 - [`docs/ui-plugin.md`](docs/ui-plugin.md) — UI panel + status bar

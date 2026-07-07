@@ -1420,16 +1420,161 @@ def route_two_level(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI — config validation
+#
+# The validation lives in the CLI layer only. route() itself is untouched so
+# programmatic callers (MCP plugin, tests, route_easy.py) keep their exact
+# behaviour; the checks below protect humans hand-writing config.json.
 # ---------------------------------------------------------------------------
 
+REQUIRED_KEYS = {
+    "gds_path": "path to the input GDS file / 输入 GDS 文件路径",
+    "pin_layer_a": 'device-side pin layer, e.g. "102/0" / 器件端引脚层',
+    "pin_layer_b": 'pad-side pin layer, e.g. "111/0" / 焊盘端引脚层',
+}
+
+KNOWN_KEYS = set(REQUIRED_KEYS) | {
+    "output_path", "cell_name", "dbu", "obstacle_layers",
+    "path_width_um", "obs_safe_distance_um", "path_safe_distance_um",
+    "map_resolution_um", "obs_hardness", "obs_damping_step",
+    "pin_safe_distance_a_um", "pin_safe_distance_b_um",
+    "pin_hardness", "pin_damping_step", "path_hardness", "path_damping_step",
+    "sort_pairs", "sort_pairs_reverse", "dry_run",
+    "per_pair_obstacle_layers", "auto_map_resolution",
+    "bus_pairs", "bus_auto_threshold_um", "pin_pairs_override",
+    "freeze_completed_routes_as_obstacles_with_margin",
+    "routing_strategy", "rescue_unrouted_nets", "routing_bbox",
+    "two_level", "inner_width", "outer_width", "patch_size", "inner_margin",
+    # Written into the config by the MCP plugin; the plugin (not this
+    # worker) inserts result paths on that layer.
+    "output_layer",
+}
+
+# The MCP tool `auto_route` uses these names WITHOUT the `_um` suffix. They
+# are the #1 config mistake: route() would silently ignore them and fall back
+# to defaults, so the CLI rejects them outright.
+MCP_ALIAS_KEYS = {
+    "path_width": "path_width_um",
+    "obs_safe_distance": "obs_safe_distance_um",
+    "path_safe_distance": "path_safe_distance_um",
+    "map_resolution": "map_resolution_um",
+    "pin_safe_distance_a": "pin_safe_distance_a_um",
+    "pin_safe_distance_b": "pin_safe_distance_b_um",
+}
+
+EXAMPLE_CONFIG = {
+    "_comment": "route_worker.py example config. Keys starting with _ are "
+                "ignored. Full reference: docs/route_quickstart_cn.md",
+    "gds_path": "my_device.gds",
+    "output_path": "routes.json",
+    "cell_name": "TOP",
+    "pin_layer_a": "102/0",
+    "pin_layer_b": "111/0",
+    "_comment_pins": "pin_layer_a = device-side markers, pin_layer_b = pad "
+                     "markers. Layer syntax is 'layer/datatype'.",
+    "obstacle_layers": ["1/0", "3/0"],
+    "_comment_obstacles": "layers routes must not cross (mesa, pads, ...)",
+    "path_width_um": 1.0,
+    "obs_safe_distance_um": 5.0,
+    "auto_map_resolution": True,
+    "_comment_units": "worker config keys use the _um suffix; the MCP tool "
+                      "auto_route uses the same names WITHOUT _um. 别互抄。",
+}
+
+
+def validate_config(config):
+    """Return (fatal_errors, warnings) for a hand-written config dict."""
+    fatal, warns = [], []
+    if not isinstance(config, dict):
+        return ["config.json must contain a JSON object (dict) at top level."], []
+    for key, meaning in REQUIRED_KEYS.items():
+        if key not in config:
+            fatal.append(f"missing required key '{key}' — {meaning}")
+    for key in config:
+        if key.startswith("_"):
+            continue  # comment/internal keys
+        if key in MCP_ALIAS_KEYS:
+            fatal.append(
+                f"'{key}' is the MCP auto_route parameter name; the worker "
+                f"config key is '{MCP_ALIAS_KEYS[key]}' (with _um). "
+                f"route() would silently ignore '{key}' and use the default "
+                f"— rename it. / 这是 MCP 参数名，worker config 要用带 _um "
+                f"的 '{MCP_ALIAS_KEYS[key]}'，否则会被静默忽略。")
+        elif key not in KNOWN_KEYS:
+            import difflib
+            close = difflib.get_close_matches(key, KNOWN_KEYS, n=1)
+            hint = f" — did you mean '{close[0]}'?" if close else ""
+            warns.append(f"unknown key '{key}' will be ignored{hint}")
+    gds_path = config.get("gds_path")
+    if isinstance(gds_path, str) and gds_path and not os.path.exists(gds_path):
+        fatal.append(f"gds_path does not exist: {gds_path}")
+    for lk in ("pin_layer_a", "pin_layer_b"):
+        v = config.get(lk)
+        if v is None:
+            continue
+        try:
+            parse_layer(str(v))
+        except (ValueError, IndexError):
+            fatal.append(f"{lk} must look like 'layer/datatype', e.g. "
+                         f"'102/0'; got {v!r}")
+    return fatal, warns
+
+
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <config.json>", file=sys.stderr)
-        sys.exit(1)
-    config_path = sys.argv[1]
-    with open(config_path) as f:
-        config = json.load(f)
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Offline autorouting worker: reads a JSON config, routes "
+                    "pin_layer_a pins to pin_layer_b pins around obstacles, "
+                    "prints/writes a JSON result (coordinates only — it does "
+                    "not modify the GDS). New users: start with "
+                    "tools/route_easy.py or docs/route_quickstart_cn.md.")
+    parser.add_argument("config", help="path to config.json "
+                        "(generate a template with --example)")
+    parser.add_argument("--example", action="store_true",
+                        help="write an example config to the given path and "
+                             "exit (refuses to overwrite)")
+    parser.add_argument("--check", action="store_true",
+                        help="validate the config and exit without routing")
+    args = parser.parse_args()
+
+    if args.example:
+        if os.path.exists(args.config):
+            print(f"ERROR: {args.config} already exists; not overwriting.",
+                  file=sys.stderr)
+            sys.exit(2)
+        with open(args.config, "w") as f:
+            json.dump(EXAMPLE_CONFIG, f, indent=2, ensure_ascii=False)
+        print(f"Example config written to {args.config} — edit gds_path / "
+              f"pin layers, then run:\n  python {sys.argv[0]} {args.config}")
+        return
+
+    try:
+        with open(args.config) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: config file not found: {args.config}\n"
+              f"Generate a template with:  python {sys.argv[0]} "
+              f"my_config.json --example", file=sys.stderr)
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: {args.config} is not valid JSON: {e}\n"
+              f"(common causes: trailing comma, // comments — JSON allows "
+              f"neither)", file=sys.stderr)
+        sys.exit(2)
+
+    fatal, warns = validate_config(config)
+    for w in warns:
+        print(f"WARNING: {w}", file=sys.stderr)
+    if fatal:
+        print("Config errors (nothing was routed):", file=sys.stderr)
+        for msg in fatal:
+            print(f"  - {msg}", file=sys.stderr)
+        sys.exit(2)
+    if args.check:
+        print(f"OK: {args.config} looks valid "
+              f"({len(warns)} warning(s)).")
+        return
+
     result = route(config)
     output_path = config.get("output_path")
     if output_path:
