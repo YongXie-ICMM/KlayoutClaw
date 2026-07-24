@@ -105,6 +105,8 @@ Pass `python_path=` to override the env per-call.
 ## Documentation
 
 - [`docs/route_quickstart_cn.md`](docs/route_quickstart_cn.md) — 自动布线快速上手 (offline routing quickstart, Chinese)
+- [`docs/sample_to_routing_cn.md`](docs/sample_to_routing_cn.md) — 选定样品→布线完整链路 (sample→routing workflow, Chinese)
+- [`docs/windows_routing_cn.md`](docs/windows_routing_cn.md) — Windows 实验室电脑布线指南 (Windows lab-PC guide, Chinese)
 - [`docs/tools.md`](docs/tools.md) — MCP tool reference (all 19)
 - [`docs/skills.md`](docs/skills.md) — skill catalog
 - [`docs/ui-plugin.md`](docs/ui-plugin.md) — UI panel + status bar
