@@ -216,9 +216,16 @@ def main():
               "常见原因: 障碍太密(试试调小 --width-um)、引脚被完全围死。")
     elif status == "success":
         ml = parse_layer(args.metal_layer)
-        print("\n全部布通。下一步(接 InteLitho-Agentic 流水线, G4 Step 2):\n"
-              f"  python3 scanpath/gds_to_mpath.py {out_dir}/routed.gds "
-              f"--layer {ml[0]} --datatype {ml[1]} --zone-aware "
+        print("\n全部布通。")
+        print(f"警告: 不要直接曝光 routed.gds 的导线层 ({ml[0]}/{ml[1]}) "
+              "—— 那只有导线, bonding pads (3/0, 约99%的金属面积) 和触点"
+              "覆盖 (102/0) 都不在里面, 曝出来的器件无法 bonding "
+              "(IntelMarker 审计 IM-AUD-001)。")
+        print("下一步: 用 IntelMarker 生成的合成曝光文件 "
+              "flake_XXXX_exposure.gds (10/0 层, 导线+pads+触点的布尔并, "
+              "连通性已验证):\n"
+              "  python3 scanpath/gds_to_mpath.py flake_XXXX_exposure.gds "
+              "--layer 10 --datatype 0 --zone-aware "
               "--gap-buffer-um 2.0 --out dev01.json")
 
     if status == "error":
