@@ -290,6 +290,14 @@ def find_path_to_existing(cost, start_rc, existing_path_grid):
 # Main routing logic
 # ---------------------------------------------------------------------------
 
+def _rescued_net_ids(paths):
+    """Unique logical net ids among FINAL emitted paths that used rescue
+    (route schema v2, IntelMarker audit IM-AUD-011).  Pure: desk-testable
+    without klayout."""
+    return {int(p["net_id"]) for p in paths
+            if p.get("rescued") and p.get("net_id") is not None}
+
+
 def route(config: dict) -> dict:
     errors: list[str] = []
 
@@ -1100,6 +1108,7 @@ def route(config: dict) -> dict:
 
     result = {
         "status": "success" if (not errors or info_only) else "partial",
+        "route_schema_version": 2,
         "routed_pairs": len(result_paths),
         "total_pins_a": n_a,
         "total_pins_b": n_b,
@@ -1395,8 +1404,23 @@ def route_two_level(config: dict):
     info_only = all(n.startswith("auto_map_resolution") for n in errors)
     status = "success" if (nets_routed == len(pairs) and (not errors or info_only)) else "partial"
 
-    return {
+    # Rescue accounting AFTER orphan filtering (route schema v2, IntelMarker
+    # audit IM-AUD-011): the wrapper used to drop the per-pass rescue counts
+    # entirely, so a rescued two-level route reached the consumer as a clean
+    # success.  Counts are unique FINAL emitted logical nets whose kept path
+    # used rescue in that pass; total is the set union (a net rescued in
+    # both passes counts once); `rescued_nets` stays as the compat alias.
+    inner_rescued = _rescued_net_ids(inner_paths)
+    outer_rescued = _rescued_net_ids(outer_paths)
+    total_rescued = inner_rescued | outer_rescued
+
+    result = {
         "status": status,
+        "route_schema_version": 2,
+        "inner_rescued_nets": len(inner_rescued),
+        "outer_rescued_nets": len(outer_rescued),
+        "total_rescued_nets": len(total_rescued),
+        "rescued_nets": len(total_rescued),
         "two_level": True,
         "two_level_reason": reason if mode == "auto" else "forced on",
         "routed_pairs": nets_routed,
@@ -1417,6 +1441,13 @@ def route_two_level(config: dict):
         "boundary_points_um": [[round(bx * dbu, 4), round(by * dbu, 4)] for bx, by in boundary],
         "errors": errors,
     }
+    if total_rescued:
+        result["rescue_note"] = (
+            "{} fully-emitted logical net(s) used rescue in at least one "
+            "pass (inner {}, outer {}). Verify with route_inspect / "
+            "contact_isolation that no crossings were introduced.".format(
+                len(total_rescued), len(inner_rescued), len(outer_rescued)))
+    return result
 
 
 # ---------------------------------------------------------------------------
